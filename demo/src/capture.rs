@@ -758,6 +758,7 @@ fn get_worker_fn(
         let mut saturation_enabled = true;
         let mut agc_enabled = true;
         let mut exciter_enabled = true;
+        let mut bypass_enabled = false;
         let mut mute_playback = false;
         let mut df_mix = 1.0f32;
         let mut headroom_gain = 0.9f32;
@@ -907,10 +908,17 @@ fn get_worker_fn(
                 }
             }
 
-            let lsnr = df
-                .process(inframe.view(), outframe.view_mut())
-                .expect("Failed to run DeepFilterNet");
-            if env_auto_enabled {
+            let mut lsnr = 0.0;
+            if bypass_enabled {
+                if let (Some(out), Some(inp)) = (outframe.as_slice_mut(), inframe.as_slice()) {
+                    out.copy_from_slice(inp);
+                }
+            } else {
+                lsnr = df
+                    .process(inframe.view(), outframe.view_mut())
+                    .expect("Failed to run DeepFilterNet");
+            }
+            if env_auto_enabled && !bypass_enabled {
                 if let Some(buf) = inframe.as_slice() {
                     let rms = df::rms(buf.iter());
                     let rms_db = 20.0 * rms.max(1e-9).log10();
@@ -1021,7 +1029,7 @@ fn get_worker_fn(
                 }
             }
             // DF dry/wet 混合
-            if df_mix < 0.9999 {
+            if df_mix < 0.9999 && !bypass_enabled {
                 if let (Some(wet), Some(dry)) =
                     (outframe.as_slice_mut(), inframe.as_slice())
                 {
@@ -1030,8 +1038,8 @@ fn get_worker_fn(
                     }
                 }
             }
-            let bypass_post =
-                !dynamic_eq.is_enabled() && !transient_enabled && !saturation_enabled && !agc_enabled;
+            let bypass_post = bypass_enabled
+                || (!dynamic_eq.is_enabled() && !transient_enabled && !saturation_enabled && !agc_enabled);
 
             if !bypass_post {
                 // 自适应峰值保护，防止 DF 输出直接过 0dBFS
@@ -1412,6 +1420,10 @@ fn get_worker_fn(
                         ControlMessage::ExciterMix(value) => {
                             exciter.set_mix(value.clamp(0.0, 0.5));
                             log::info!("谐波激励混合: {:.0}%", value * 100.0);
+                        }
+                        ControlMessage::BypassEnabled(enabled) => {
+                            bypass_enabled = enabled;
+                            log::info!("全链路旁路: {}", if enabled { "开启" } else { "关闭" });
                         }
                     }
                 }

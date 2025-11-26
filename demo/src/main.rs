@@ -233,6 +233,7 @@ struct SpecView {
     sysvol_monitor: Option<capture::SysVolMonitorHandle>,
     exciter_enabled: bool,
     exciter_mix: f32,
+    bypass_enabled: bool,
     user_selected_input: bool,
     user_selected_output: bool,
     env_status_label: String,
@@ -296,6 +297,7 @@ pub enum Message {
     DevicePanelToggled(bool),
     ScenePresetChanged(ScenePreset),
     MutePlaybackChanged(bool),
+    BypassToggled(bool),
     AutoPlayToggled(bool),
     AutoPlayPickRequested,
     AutoPlayFilePicked(Option<PathBuf>),
@@ -673,6 +675,7 @@ impl Application for SpecView {
                 env_auto_enabled: false,
                 exciter_enabled: true,
                 exciter_mix: 0.25,
+                bypass_enabled: false,
                 user_selected_input: false,
                 user_selected_output: false,
                 env_status_label: "环境自适应: 关闭".to_string(),
@@ -906,6 +909,10 @@ impl Application for SpecView {
             Message::MutePlaybackChanged(muted) => {
                 self.mute_playback = muted;
                 self.send_control_message(ControlMessage::MutePlayback(muted));
+            }
+            Message::BypassToggled(enabled) => {
+                self.bypass_enabled = enabled;
+                self.send_control_message(ControlMessage::BypassEnabled(enabled));
             }
             Message::AutoPlayToggled(enabled) => {
                 self.auto_play_enabled = enabled;
@@ -1220,6 +1227,8 @@ impl Application for SpecView {
                 save_cfg_btn,
                 load_cfg_btn,
                 mute_toggle,
+                toggler(String::new(), self.bypass_enabled, Message::BypassToggled),
+                text("全链路旁路").size(16),
                 text(self.env_status_label.clone()).size(18),
                 text(format!("状态: {}", self.status_text))
                     .size(20)
@@ -1378,6 +1387,7 @@ impl SpecView {
         self.send_control_message(ControlMessage::SaturationMix(self.saturation_mix));
         self.send_control_message(ControlMessage::ExciterEnabled(self.exciter_enabled));
         self.send_control_message(ControlMessage::ExciterMix(self.exciter_mix));
+        self.send_control_message(ControlMessage::BypassEnabled(self.bypass_enabled));
         self.send_control_message(ControlMessage::TransientEnabled(self.transient_enabled));
         self.send_control_message(ControlMessage::TransientGain(self.transient_gain));
         self.send_control_message(ControlMessage::TransientSustain(self.transient_sustain));
