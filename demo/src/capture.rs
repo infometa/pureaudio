@@ -51,6 +51,8 @@ pub type SendControl = Sender<ControlMessage>;
 pub type RecvControl = Receiver<ControlMessage>;
 pub type SendEqStatus = Sender<EqStatus>;
 pub type RecvEqStatus = Receiver<EqStatus>;
+pub type SendEnvStatus = Sender<EnvStatus>;
+pub type RecvEnvStatus = Receiver<EnvStatus>;
 
 #[derive(Debug, Clone)]
 pub struct EqStatus {
@@ -151,23 +153,13 @@ impl RecordingState {
 
     fn append_with_limit(&self, buf: &mut Vec<f32>, samples: &[f32], tag: &str) {
         if buf.len() >= self.max_samples {
-            log::warn!(
-                "{} recording buffer is full (>{}s). Dropping samples.",
-                tag,
-                *RECORDING_LIMIT_SECS
-            );
+            // 长时间运行时录音缓冲达到上限，静默丢弃，避免日志刷屏
             return;
         }
         let available = self.max_samples - buf.len();
         let to_copy = available.min(samples.len());
         buf.extend_from_slice(&samples[..to_copy]);
-        if to_copy < samples.len() {
-            log::warn!(
-                "{} recording buffer reached capacity. Dropped {} samples.",
-                tag,
-                samples.len() - to_copy
-            );
-        }
+        // 达到容量后继续静默丢弃，避免日志刷屏
     }
 
     pub fn take_samples(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -256,11 +248,18 @@ pub enum DfControl {
     MaxDfThreshDb,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvStatus {
+    Normal,
+    Soft,
+}
+
 #[derive(Debug, Clone)]
 pub enum ControlMessage {
     DeepFilter(DfControl, f32),
     Eq(EqControl),
     MutePlayback(bool),
+    BypassEnabled(bool),
     HighpassEnabled(bool),
     DfMix(f32),
     HeadroomGain(f32),
@@ -282,6 +281,8 @@ pub enum ControlMessage {
     AgcAttackRelease(f32, f32),
     SysAutoVolumeEnabled(bool),
     EnvAutoEnabled(bool),
+    ExciterEnabled(bool),
+    ExciterMix(f32),
 }
 
 pub fn model_dimensions(model_path: Option<PathBuf>, _channels: usize) -> (usize, usize, usize) {
@@ -698,6 +699,7 @@ pub(crate) struct GuiCom {
     pub s_spec: Option<(SendSpec, SendSpec)>,
     pub r_opt: Option<RecvControl>,
     pub s_eq_status: Option<SendEqStatus>,
+    pub s_env_status: Option<SendEnvStatus>,
 }
 impl GuiCom {
     pub fn into_inner(
@@ -707,8 +709,9 @@ impl GuiCom {
         Option<(SendSpec, SendSpec)>,
         Option<RecvControl>,
         Option<SendEqStatus>,
+        Option<SendEnvStatus>,
     ) {
-        (self.s_lsnr, self.s_spec, self.r_opt, self.s_eq_status)
+        (self.s_lsnr, self.s_spec, self.r_opt, self.s_eq_status, self.s_env_status)
     }
 }
 
@@ -724,10 +727,10 @@ fn get_worker_fn(
     channels: usize,
 ) -> impl FnMut() {
     let (has_init, should_stop) = controls.into_inner();
-    let (s_lsnr, mut s_spec, mut r_opt, s_eq_status) = if let Some(df_com) = df_com {
+    let (s_lsnr, mut s_spec, mut r_opt, s_eq_status, s_env_status) = if let Some(df_com) = df_com {
         df_com.into_inner()
     } else {
-        (None, None, None, None)
+        (None, None, None, None, None)
     };
     let recording = recorder.clone();
     move || {
@@ -754,6 +757,7 @@ fn get_worker_fn(
         let mut transient_enabled = true;
         let mut saturation_enabled = true;
         let mut agc_enabled = true;
+        let mut exciter_enabled = true;
         let mut mute_playback = false;
         let mut df_mix = 1.0f32;
         let mut headroom_gain = 0.9f32;
@@ -772,6 +776,7 @@ fn get_worker_fn(
         let mut target_exciter_mix = exciter.mix();
         // 柔和模式用于外部 ANC/极静环境，降低降噪力度并补高频
         let mut soft_mode = false;
+        let mut last_soft_mode = false;
         // 滞后计数，避免频繁切换
         let mut soft_mode_hold = 0usize;
         const SOFT_MODE_HOLD_FRAMES: usize = 160; // 约 2s（取决于 hop）
@@ -919,82 +924,95 @@ fn get_worker_fn(
                             smooth_value(smoothed_flatness, feats.spectral_flatness, 0.1);
                         smoothed_centroid =
                             smooth_value(smoothed_centroid, feats.spectral_centroid, 0.1);
-
-                        // 检测“极静/外部 ANC”触发柔和模式：极低能量 + 低频谱重心
-                        let soft_candidate = smoothed_energy < -60.0 && smoothed_centroid < -15.0;
-                        if soft_candidate {
-                            soft_mode_hold = soft_mode_hold.saturating_add(1);
-                        } else {
-                            soft_mode_hold = soft_mode_hold.saturating_sub(soft_mode_hold.min(1));
-                        }
-                        if soft_mode_hold > SOFT_MODE_HOLD_FRAMES {
-                            soft_mode = true;
-                        } else if soft_mode_hold == 0 {
-                            soft_mode = false;
-                        }
-
-                        let target_env = classify_env(smoothed_energy, smoothed_flatness, smoothed_centroid);
-                        if target_env != env_class {
-                            env_class = target_env;
-                        }
-
-                        if soft_mode {
-                            // 柔和模式：降低降噪力度、补高频、旁路重处理
-                            target_atten = 24.0;
-                            target_min_thresh = -58.0;
-                            target_max_thresh = 12.0;
-                            target_df_mix = 0.9;
-                            target_hp = 60.0;
-                            target_eq_mix = 0.6;
-                            target_exciter_mix = 0.2;
-                        } else {
-                            match env_class {
-                                EnvClass::Quiet => {
-                                    target_atten = 28.0;
-                                    target_min_thresh = -55.0;
-                                    target_max_thresh = 14.0;
-                                    target_df_mix = 0.9;
-                                    target_hp = 60.0;
-                                    target_eq_mix = 0.8;
-                                    target_exciter_mix = 0.25;
-                                }
-                                EnvClass::Office => {
-                                    target_atten = 40.0;
-                                    target_min_thresh = -52.0;
-                                    target_max_thresh = 12.0;
-                                    target_df_mix = 0.95;
-                                    target_hp = 80.0;
-                                    target_eq_mix = 0.85;
-                                    target_exciter_mix = 0.25;
-                                }
-                                EnvClass::Noisy => {
-                                    target_atten = 55.0;
-                                    target_min_thresh = -48.0;
-                                    target_max_thresh = 10.0;
-                                    target_df_mix = 1.0;
-                                    target_hp = 110.0;
-                                    target_eq_mix = 0.9;
-                                    target_exciter_mix = 0.3;
-                                }
-                            }
-                        }
-
-                        // 平滑应用参数
-                        df_mix = smooth_value(df_mix, target_df_mix, 0.1).clamp(0.0, 1.0);
-                        let current_atten = df.atten_lim.unwrap_or(target_atten);
-                        let new_atten = smooth_value(current_atten, target_atten, 0.1);
-                        df.set_atten_lim(new_atten);
-                        df.min_db_thresh = smooth_value(df.min_db_thresh, target_min_thresh, 0.1);
-                        df.max_db_df_thresh = smooth_value(df.max_db_df_thresh, target_max_thresh, 0.1);
-                        df.max_db_erb_thresh = smooth_value(df.max_db_erb_thresh, target_max_thresh, 0.1);
-                        highpass_cutoff = smooth_value(highpass_cutoff, target_hp, 0.1);
-                        highpass.set_cutoff(highpass_cutoff);
-                        dynamic_eq.set_dry_wet(smooth_value(dynamic_eq.dry_wet(), target_eq_mix, 0.1));
-                        exciter.set_mix(
-                            smooth_value(exciter.mix(), target_exciter_mix, 0.1).clamp(0.0, 0.35),
-                        );
                     }
                 }
+                // 检测“极静/外部 ANC”触发柔和模式：极低能量 + 低频谱重心
+                let soft_candidate = smoothed_energy < -60.0 && smoothed_centroid < -15.0;
+                if soft_candidate {
+                    soft_mode_hold = soft_mode_hold.saturating_add(1);
+                } else {
+                    soft_mode_hold = soft_mode_hold.saturating_sub(soft_mode_hold.min(1));
+                }
+                if soft_mode_hold > SOFT_MODE_HOLD_FRAMES {
+                    soft_mode = true;
+                } else if soft_mode_hold == 0 {
+                    soft_mode = false;
+                }
+                if soft_mode != last_soft_mode {
+                    last_soft_mode = soft_mode;
+                    if soft_mode {
+                        log::info!("环境自适应: 切换到柔和模式 (可能检测到外部 ANC/极静环境)");
+                        if let Some(ref sender) = s_env_status {
+                            let _ = sender.try_send(EnvStatus::Soft);
+                        }
+                    } else {
+                        log::info!("环境自适应: 切换到正常模式");
+                        if let Some(ref sender) = s_env_status {
+                            let _ = sender.try_send(EnvStatus::Normal);
+                        }
+                    }
+                }
+
+                let target_env = classify_env(smoothed_energy, smoothed_flatness, smoothed_centroid);
+                if target_env != env_class {
+                    env_class = target_env;
+                }
+
+                if soft_mode {
+                    // 柔和模式：降低降噪力度、补高频、旁路重处理
+                    target_atten = 24.0;
+                    target_min_thresh = -58.0;
+                    target_max_thresh = 12.0;
+                    target_df_mix = 0.9;
+                    target_hp = 60.0;
+                    target_eq_mix = 0.6;
+                    target_exciter_mix = 0.2;
+                } else {
+                    match env_class {
+                        EnvClass::Quiet => {
+                            target_atten = 28.0;
+                            target_min_thresh = -55.0;
+                            target_max_thresh = 14.0;
+                            target_df_mix = 0.9;
+                            target_hp = 60.0;
+                            target_eq_mix = 0.8;
+                            target_exciter_mix = 0.25;
+                        }
+                        EnvClass::Office => {
+                            target_atten = 40.0;
+                            target_min_thresh = -52.0;
+                            target_max_thresh = 12.0;
+                            target_df_mix = 0.95;
+                            target_hp = 80.0;
+                            target_eq_mix = 0.85;
+                            target_exciter_mix = 0.25;
+                        }
+                        EnvClass::Noisy => {
+                            target_atten = 55.0;
+                            target_min_thresh = -48.0;
+                            target_max_thresh = 10.0;
+                            target_df_mix = 1.0;
+                            target_hp = 110.0;
+                            target_eq_mix = 0.9;
+                            target_exciter_mix = 0.3;
+                        }
+                    }
+                }
+
+                // 平滑应用参数（每帧执行，避免“无效果”）
+                df_mix = smooth_value(df_mix, target_df_mix, 0.1).clamp(0.0, 1.0);
+                let current_atten = df.atten_lim.unwrap_or(target_atten);
+                let new_atten = smooth_value(current_atten, target_atten, 0.1);
+                df.set_atten_lim(new_atten);
+                df.min_db_thresh = smooth_value(df.min_db_thresh, target_min_thresh, 0.1);
+                df.max_db_df_thresh = smooth_value(df.max_db_df_thresh, target_max_thresh, 0.1);
+                df.max_db_erb_thresh = smooth_value(df.max_db_erb_thresh, target_max_thresh, 0.1);
+                highpass_cutoff = smooth_value(highpass_cutoff, target_hp, 0.1);
+                highpass.set_cutoff(highpass_cutoff);
+                dynamic_eq.set_dry_wet(smooth_value(dynamic_eq.dry_wet(), target_eq_mix, 0.1));
+                exciter.set_mix(
+                    smooth_value(exciter.mix(), target_exciter_mix, 0.1).clamp(0.0, 0.35),
+                );
             }
             // 录音降噪输出
             if let Some(ref rec) = recording {
@@ -1051,8 +1069,10 @@ fn get_worker_fn(
                     }
                 }
                 // Add gentle harmonic excitation to restore air/brightness
-                if let Some(buffer) = outframe.as_slice_mut() {
-                    exciter.process(buffer);
+                if exciter_enabled {
+                    if let Some(buffer) = outframe.as_slice_mut() {
+                        exciter.process(buffer);
+                    }
                 }
                 let metrics = {
                     let buffer = outframe.as_slice_mut().expect("Output frame should be contiguous");
@@ -1377,6 +1397,21 @@ fn get_worker_fn(
                         ControlMessage::EnvAutoEnabled(enabled) => {
                             env_auto_enabled = enabled;
                             log::info!("环境自适应: {}", if enabled { "开启" } else { "关闭" });
+                            if !enabled {
+                                soft_mode = false;
+                                last_soft_mode = false;
+                                if let Some(ref sender) = s_env_status {
+                                    let _ = sender.try_send(EnvStatus::Normal);
+                                }
+                            }
+                        }
+                        ControlMessage::ExciterEnabled(enabled) => {
+                            exciter_enabled = enabled;
+                            log::info!("谐波激励: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::ExciterMix(value) => {
+                            exciter.set_mix(value.clamp(0.0, 0.5));
+                            log::info!("谐波激励混合: {:.0}%", value * 100.0);
                         }
                     }
                 }
@@ -1862,7 +1897,7 @@ pub struct DeepFilterCapture {
 
 impl Default for DeepFilterCapture {
     fn default() -> Self {
-        DeepFilterCapture::new(None, None, None, None, None, None, None, None)
+        DeepFilterCapture::new(None, None, None, None, None, None, None, None, None)
             .expect("Error during DeepFilterCapture initialization")
     }
 }
@@ -1874,6 +1909,7 @@ impl DeepFilterCapture {
         s_enh: Option<SendSpec>,
         r_opt: Option<RecvControl>,
         s_eq_status: Option<SendEqStatus>,
+        s_env_status: Option<SendEnvStatus>,
         input_device: Option<String>,
         output_device: Option<String>,
     ) -> Result<Self> {
@@ -1924,6 +1960,7 @@ impl DeepFilterCapture {
             s_spec,
             r_opt,
             s_eq_status,
+            s_env_status,
         };
         let worker_handle = Some(thread::spawn(get_worker_fn(
             in_cons,
@@ -1997,7 +2034,8 @@ pub fn main() -> Result<()> {
     if let Some(p) = model_path.as_ref() {
         log::info!("Running with model '{:?}'", p);
     }
-    let _c = DeepFilterCapture::new(model_path, Some(lsnr_prod), None, None, None, None, None, None);
+    let _c =
+        DeepFilterCapture::new(model_path, Some(lsnr_prod), None, None, None, None, None, None, None);
 
     loop {
         sleep(Duration::from_millis(200));

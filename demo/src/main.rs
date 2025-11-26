@@ -33,6 +33,7 @@ mod scene;
 mod ui;
 use audio::eq::{BandMode, EqControl, EqPresetKind, FilterKind, MAX_EQ_BANDS};
 use capture::*;
+use capture::{EnvStatus, RecvEnvStatus, SendEnvStatus};
 use scene::ScenePreset;
 use ui::tooltips;
 
@@ -182,6 +183,7 @@ struct SpecView {
     r_enh: Option<RecvSpec>,
     s_controls: Option<SendControl>,
     r_eq_status: Option<RecvEqStatus>,
+    r_env_status: Option<RecvEnvStatus>,
     eq_enabled: bool,
     eq_preset: EqPresetKind,
     eq_dry_wet: f32,
@@ -229,6 +231,11 @@ struct SpecView {
     sys_auto_volume: bool,
     env_auto_enabled: bool,
     sysvol_monitor: Option<capture::SysVolMonitorHandle>,
+    exciter_enabled: bool,
+    exciter_mix: f32,
+    user_selected_input: bool,
+    user_selected_output: bool,
+    env_status_label: String,
     noise_show_advanced: bool,
     scene_preset: ScenePreset,
     model_path: Option<PathBuf>,
@@ -315,6 +322,9 @@ pub enum Message {
     AgcToggleAdvanced,
     SysAutoVolumeToggled(bool),
     EnvAutoToggled(bool),
+    ExciterToggled(bool),
+    ExciterMixChanged(f32),
+    EnvStatusUpdated(EnvStatus),
     StartProcessing,
     StopProcessing,
     SaveFinished(Result<(PathBuf, PathBuf, PathBuf), String>),
@@ -613,6 +623,7 @@ impl Application for SpecView {
                 r_enh: None,
                 s_controls: None,
                 r_eq_status: None,
+                r_env_status: None,
                 eq_enabled: true,
                 eq_preset,
                 eq_dry_wet,
@@ -660,6 +671,11 @@ impl Application for SpecView {
                 show_agc_advanced: false,
                 sys_auto_volume: false,
                 env_auto_enabled: false,
+                exciter_enabled: true,
+                exciter_mix: 0.25,
+                user_selected_input: false,
+                user_selected_output: false,
+                env_status_label: "环境自适应: 关闭".to_string(),
                 sysvol_monitor: None,
                 scene_preset: ScenePreset::Broadcast,
                 model_path,
@@ -853,12 +869,14 @@ impl Application for SpecView {
             }
             Message::InputDeviceSelected(name) => {
                 self.selected_input_device = Some(name);
+                self.user_selected_input = true;
                 if self.sys_auto_volume {
                     self.restart_sys_volume_monitor();
                 }
             }
             Message::OutputDeviceSelected(name) => {
                 self.selected_output_device = Some(name);
+                self.user_selected_output = true;
             }
             Message::DevicePanelToggled(show) => {
                 self.show_device_selector = show;
@@ -988,7 +1006,20 @@ impl Application for SpecView {
             }
             Message::EnvAutoToggled(enabled) => {
                 self.env_auto_enabled = enabled;
+                self.env_status_label = if enabled {
+                    "环境自适应: 正常".to_string()
+                } else {
+                    "环境自适应: 关闭".to_string()
+                };
                 self.send_control_message(ControlMessage::EnvAutoEnabled(enabled));
+            }
+            Message::ExciterToggled(enabled) => {
+                self.exciter_enabled = enabled;
+                self.send_control_message(ControlMessage::ExciterEnabled(enabled));
+            }
+            Message::ExciterMixChanged(value) => {
+                self.exciter_mix = value.clamp(0.0, 0.5);
+                self.send_control_message(ControlMessage::ExciterMix(self.exciter_mix));
             }
             Message::Tick => {
                 // 确保后台系统音量监测在未降噪时也保持运行
@@ -1006,7 +1037,16 @@ impl Application for SpecView {
                 if let Some(task) = self.update_eq_status() {
                     commands.push(Command::perform(task, move |message| message));
                 }
+                if let Some(task) = self.update_env_status() {
+                    commands.push(Command::perform(task, move |message| message));
+                }
                 return Command::batch(commands);
+            }
+            Message::EnvStatusUpdated(status) => {
+                self.env_status_label = match status {
+                    EnvStatus::Normal => "环境自适应: 正常".to_string(),
+                    EnvStatus::Soft => "环境自适应: 柔和".to_string(),
+                };
             }
             Message::LsnrChanged(lsnr) => self.lsnr = lsnr,
             Message::NoisyChanged => {
@@ -1180,6 +1220,7 @@ impl Application for SpecView {
                 save_cfg_btn,
                 load_cfg_btn,
                 mute_toggle,
+                text(self.env_status_label.clone()).size(18),
                 text(format!("状态: {}", self.status_text))
                     .size(20)
                     .width(Length::Fill)
@@ -1232,15 +1273,42 @@ impl Application for SpecView {
 }
 
 impl SpecView {
+    fn refresh_devices(&mut self) {
+        let (inputs, outputs, default_in, default_out) = list_audio_devices();
+        self.input_devices = inputs;
+        self.output_devices = outputs;
+        if self
+            .selected_input_device
+            .as_ref()
+            .map(|d| !self.input_devices.contains(d))
+            .unwrap_or(true)
+            || !self.user_selected_input
+        {
+            self.selected_input_device = default_in;
+        }
+        if self
+            .selected_output_device
+            .as_ref()
+            .map(|d| !self.output_devices.contains(d))
+            .unwrap_or(true)
+            || !self.user_selected_output
+        {
+            self.selected_output_device = default_out;
+        }
+    }
+
     fn start_processing(&mut self) -> Command<Message> {
         if self.is_running || self.is_saving {
             return Command::none();
         }
+        // 刷新设备列表，确保使用当前设备
+        self.refresh_devices();
         let (s_lsnr, r_lsnr) = unbounded();
         let (s_noisy, r_noisy) = unbounded();
         let (s_enh, r_enh) = unbounded();
         let (s_controls, r_controls) = unbounded();
         let (s_eq_status, r_eq_status) = unbounded();
+        let (s_env_status, r_env_status) = unbounded();
         let model_path = current_model_path().or_else(|| self.model_path.clone());
         self.model_path = model_path.clone();
         let input_device = self
@@ -1264,6 +1332,7 @@ impl SpecView {
             Some(s_enh),
             Some(r_controls),
             Some(s_eq_status),
+            Some(s_env_status),
             input_device,
             output_device,
         ) {
@@ -1281,6 +1350,7 @@ impl SpecView {
         self.r_noisy = Some(r_noisy);
         self.r_enh = Some(r_enh);
         self.r_eq_status = Some(r_eq_status);
+        self.r_env_status = Some(r_env_status);
         self.s_controls = Some(s_controls);
         self.is_running = true;
         self.status_text = "实时降噪中".to_string();
@@ -1306,6 +1376,8 @@ impl SpecView {
         self.send_control_message(ControlMessage::SaturationDrive(self.saturation_drive));
         self.send_control_message(ControlMessage::SaturationMakeup(self.saturation_makeup));
         self.send_control_message(ControlMessage::SaturationMix(self.saturation_mix));
+        self.send_control_message(ControlMessage::ExciterEnabled(self.exciter_enabled));
+        self.send_control_message(ControlMessage::ExciterMix(self.exciter_mix));
         self.send_control_message(ControlMessage::TransientEnabled(self.transient_enabled));
         self.send_control_message(ControlMessage::TransientGain(self.transient_gain));
         self.send_control_message(ControlMessage::TransientSustain(self.transient_sustain));
@@ -1380,6 +1452,7 @@ impl SpecView {
         self.r_noisy = None;
         self.r_enh = None;
         self.r_eq_status = None;
+        self.r_env_status = None;
         self.eq_status = EqStatus::default();
         let sample_rate = recording.sample_rate() as u32;
         let (noisy, denoised, processed) = recording.take_samples();
@@ -1516,6 +1589,22 @@ impl SpecView {
         })
     }
 
+    fn update_env_status(&mut self) -> Option<impl Future<Output = Message>> {
+        let Some(recv) = self.r_env_status.as_ref().cloned() else {
+            return None;
+        };
+        if recv.is_empty() {
+            return None;
+        }
+        Some(async move {
+            let mut latest = None;
+            while let Ok(status) = recv.try_recv() {
+                latest = Some(status);
+            }
+            latest.map_or(Message::None, Message::EnvStatusUpdated)
+        })
+    }
+
     fn eq_status_label(&self) -> String {
         if !self.eq_enabled {
             "⚪️ 已旁路".to_string()
@@ -1633,6 +1722,8 @@ impl SpecView {
         self.send_control_message(ControlMessage::SaturationDrive(self.saturation_drive));
         self.send_control_message(ControlMessage::SaturationMakeup(self.saturation_makeup));
         self.send_control_message(ControlMessage::SaturationMix(self.saturation_mix));
+        self.send_control_message(ControlMessage::ExciterEnabled(self.exciter_enabled));
+        self.send_control_message(ControlMessage::ExciterMix(self.exciter_mix));
         self.send_control_message(ControlMessage::TransientEnabled(self.transient_enabled));
         self.send_control_message(ControlMessage::TransientGain(self.transient_gain));
         self.send_control_message(ControlMessage::TransientSustain(self.transient_sustain));
@@ -2160,6 +2251,31 @@ impl SpecView {
             widget::Column::new().into()
         };
 
+        let exciter_toggle = row![
+            toggler(String::new(), self.exciter_enabled, Message::ExciterToggled),
+            text("谐波激励").size(14),
+        ]
+        .spacing(10)
+        .align_items(Alignment::Center);
+        let exciter_controls: Element<'_, Message> = if self.exciter_enabled {
+            widget::Column::new()
+                .spacing(8)
+                .push(slider_view(
+                    "激励混合 [%]",
+                    self.exciter_mix * 100.0,
+                    0.0,
+                    50.0,
+                    |v| Message::ExciterMixChanged(v / 100.0),
+                    380,
+                    0,
+                    1.0,
+                    Some("高频补偿，默认 25%"),
+                ))
+                .into()
+        } else {
+            widget::Column::new().into()
+        };
+
         let transient_toggle = apply_tooltip(
             row![
                 toggler(
@@ -2345,6 +2461,8 @@ impl SpecView {
                 highpass_controls,
                 saturation_toggle,
                 saturation_controls,
+                exciter_toggle,
+                exciter_controls,
                 transient_toggle,
                 transient_controls,
                 agc_row,
