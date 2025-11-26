@@ -1,1447 +1,1879 @@
-# DeepFilterNet 实时音频处理系统优化方案
+# 多场景自适应语音增强方案
 
 ## 文档信息
 
 | 项目 | 内容 |
 |------|------|
-| 版本 | v1.0 |
-| 日期 | 2024年 |
-| 状态 | 待评估 |
-| 优先级 | P0-P2 |
+| 版本 | v2.0 |
+| 目标 | 自动适配开放办公区与会议室场景，无需手动切换 |
+| 状态 | 待开发评估 |
 
 ---
 
-## 一、现状问题总结
+## 一、场景分析
 
-### 1.1 架构层面
+### 1.1 两种场景特征对比
 
-| 问题 | 现状 | 影响 |
-|------|------|------|
-| 处理链硬编码 | 串行调用分散在 `capture.rs` 的 800+ 行 worker 函数中 | 难以维护、无法动态调整 |
-| 多级限幅 | AGC、BusLimiter、FinalLimiter、EQ 内部共 4 处限幅 | 音质压缩、动态损失 |
-| 延迟不可控 | 无延迟预算管理，BusLimiter 额外增加 6ms | 实时性无保障 |
-| 线程同步 | 大量使用 `Ordering::Relaxed` | 潜在跨线程可见性问题 |
+| 特征 | 开放办公区 | 会议室 |
+|------|-----------|--------|
+| 空间大小 | 大/开阔 | 小/封闭 |
+| 混响时间 (RT60) | 短 (0.3-0.5s) | 中-长 (0.4-0.8s) |
+| 背景噪声类型 | 多人交谈、键盘、空调 | 空调、投影仪风扇 |
+| 背景噪声电平 | 高 (-35 ~ -25 dB) | 低-中 (-50 ~ -35 dB) |
+| 干扰人声距离 | 近 (1-3米) | 远或无 |
+| 干扰人声特点 | 持续、多源 | 偶发、单源 |
+| 直达声/反射声比 | 高 | 低 |
+| 频谱特征 | 宽带、平坦 | 低频突出（驻波） |
 
-### 1.2 自适应性层面
+### 1.2 核心挑战
 
-| 问题 | 现状 | 影响 |
-|------|------|------|
-| 环境检测 | 3 级硬编码阈值分类 | 不同环境表现差异大 |
-| 设备适配 | 无启动校准流程 | 不同麦克风灵敏度差异未处理 |
-| 采样率 | 各模块独立假设，重采样配置固定 | 非标准采样率兼容性差 |
-
-### 1.3 资源管理层面
-
-| 问题 | 现状 | 影响 |
-|------|------|------|
-| 录音缓冲 | 固定 15 分钟预分配 | 内存占用过大 |
-| 频谱渲染 | 每帧重新分配 `Vec<u8>` | GC 压力、卡顿风险 |
-| 错误恢复 | 锁失败仅打日志 | 无降级策略 |
+| 挑战 | 描述 |
+|------|------|
+| 自动识别 | 无需用户干预，程序自动判断当前场景 |
+| 平滑切换 | 场景变化时参数渐变，避免音质突变 |
+| 快速适应 | 进入新场景后 3-5 秒内完成适配 |
+| 误判容错 | 短暂异常不触发场景切换 |
 
 ---
 
-## 二、统一音频总线架构
+## 二、整体架构
 
-### 2.1 目标
-
-- 模块化处理链，支持动态插拔
-- 统一增益管理，单点限幅
-- 延迟预算可控
-- 便于测试和调试
-
-### 2.2 架构设计
+### 2.1 自适应系统架构
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                            AudioBus                                     │
-│                                                                         │
-│  ┌─────────┐   ┌─────────────┐   ┌─────────┐   ┌─────────────────────┐ │
-│  │ InputStage │ → │ PreProcessors │ → │ CoreDF │ → │ PostProcessors      │ │
-│  │ - 输入增益  │   │ - Highpass    │   │        │   │ - Transient        │ │
-│  │ - 校准补偿  │   │ - NoiseGate   │   │        │   │ - Saturation       │ │
-│  └─────────┘   └─────────────┘   └─────────┘   │ - DynamicEQ         │ │
-│                                                  │ - AGC               │ │
-│                                                  └─────────────────────┘ │
-│                                                             ↓            │
-│                                              ┌─────────────────────────┐ │
-│                                              │ OutputStage (唯一限幅)  │ │
-│                                              │ - True Peak Limiter     │ │
-│                                              │ - Dither (可选)         │ │
-│                                              └─────────────────────────┘ │
-│                                                                         │
-│  全局监控: peak_hold, gain_reduction, latency_ms, cpu_load             │
-└────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         自适应语音增强系统                                    │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    场景感知层 (SceneAnalyzer)                        │   │
+│  │  ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐          │   │
+│  │  │ 能量分析   │ │ 混响估计   │ │ 人声检测   │ │ 频谱分析   │          │   │
+│  │  └─────┬─────┘ └─────┬─────┘ └─────┬─────┘ └─────┬─────┘          │   │
+│  │        └─────────────┴─────────────┴─────────────┘                 │   │
+│  │                              ↓                                      │   │
+│  │                    ┌─────────────────┐                             │   │
+│  │                    │ 场景分类器       │ → 场景类型 + 置信度          │   │
+│  │                    └─────────────────┘                             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                 ↓                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    参数调度层 (ParameterScheduler)                   │   │
+│  │                                                                     │   │
+│  │  场景 A 参数集 ←──→ 平滑插值器 ←──→ 场景 B 参数集                    │   │
+│  │                         ↓                                           │   │
+│  │                   当前生效参数                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                 ↓                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    处理执行层 (ProcessingChain)                      │   │
+│  │                                                                     │   │
+│  │  NoiseGate → SpatialFilter → Highpass → DeepFilter →               │   │
+│  │  VoiceIsolator → SpectralGate → EQ → AGC → Limiter                 │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.3 核心接口定义
+### 2.2 场景状态机
 
-```rust
-// ====================
-// 文件: audio/bus/mod.rs
-// ====================
-
-/// 音频处理器统一接口
-pub trait AudioProcessor: Send {
-    /// 处理器名称，用于调试
-    fn name(&self) -> &'static str;
-    
-    /// 处理延迟（采样点数）
-    fn latency_samples(&self) -> usize { 0 }
-    
-    /// 处理音频块（原地修改）
-    fn process(&mut self, samples: &mut [f32], ctx: &ProcessContext);
-    
-    /// 重置内部状态
-    fn reset(&mut self);
-    
-    /// 是否启用
-    fn is_enabled(&self) -> bool { true }
-}
-
-/// 处理上下文，传递全局状态
-pub struct ProcessContext {
-    pub sample_rate: f32,
-    pub block_size: usize,
-    pub timestamp_ms: f64,
-    pub input_level_db: f32,      // 输入电平，供各模块参考
-    pub voice_activity: f32,      // VAD 概率 0-1
-    pub env_class: EnvironmentClass,
-}
-
-/// 环境分类（扩展为 5 级）
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum EnvironmentClass {
-    Silent,      // < -60 dB，几乎无信号
-    Quiet,       // -60 ~ -45 dB，安静房间
-    Moderate,    // -45 ~ -35 dB，正常办公
-    Noisy,       // -35 ~ -25 dB，嘈杂环境
-    Extreme,     // > -25 dB，极端噪声
-}
 ```
-
-### 2.4 AudioBus 实现
-
-```rust
-// ====================
-// 文件: audio/bus/audio_bus.rs
-// ====================
-
-pub struct AudioBus {
-    sample_rate: f32,
-    
-    // 处理模块
-    input_stage: InputStage,
-    pre_processors: Vec<Box<dyn AudioProcessor>>,
-    core_processor: Option<Box<dyn AudioProcessor>>,
-    post_processors: Vec<Box<dyn AudioProcessor>>,
-    output_stage: OutputStage,
-    
-    // 状态监控
-    metrics: BusMetrics,
-    
-    // 延迟预算
-    latency_budget_samples: usize,
-}
-
-pub struct BusMetrics {
-    pub total_latency_ms: f32,
-    pub peak_input_db: f32,
-    pub peak_output_db: f32,
-    pub gain_reduction_db: f32,
-    pub cpu_load_percent: f32,
-    pub voice_activity: f32,
-}
-
-impl AudioBus {
-    pub fn new(sample_rate: f32, latency_budget_ms: f32) -> Self {
-        let latency_budget_samples = (sample_rate * latency_budget_ms / 1000.0) as usize;
-        
-        Self {
-            sample_rate,
-            input_stage: InputStage::new(sample_rate),
-            pre_processors: Vec::new(),
-            core_processor: None,
-            post_processors: Vec::new(),
-            output_stage: OutputStage::new(sample_rate),
-            metrics: BusMetrics::default(),
-            latency_budget_samples,
-        }
-    }
-    
-    /// 添加前处理器
-    pub fn add_pre_processor(&mut self, processor: Box<dyn AudioProcessor>) {
-        self.pre_processors.push(processor);
-        self.validate_latency_budget();
-    }
-    
-    /// 添加后处理器
-    pub fn add_post_processor(&mut self, processor: Box<dyn AudioProcessor>) {
-        self.post_processors.push(processor);
-        self.validate_latency_budget();
-    }
-    
-    /// 设置核心处理器（DeepFilter）
-    pub fn set_core_processor(&mut self, processor: Box<dyn AudioProcessor>) {
-        self.core_processor = Some(processor);
-        self.validate_latency_budget();
-    }
-    
-    /// 主处理函数
-    pub fn process(&mut self, samples: &mut [f32]) -> &BusMetrics {
-        let start_time = std::time::Instant::now();
-        
-        // 1. 输入电平检测
-        self.metrics.peak_input_db = calculate_peak_db(samples);
-        
-        // 2. 构建处理上下文
-        let ctx = ProcessContext {
-            sample_rate: self.sample_rate,
-            block_size: samples.len(),
-            timestamp_ms: 0.0, // TODO: 实际时间戳
-            input_level_db: self.metrics.peak_input_db,
-            voice_activity: self.input_stage.voice_activity(),
-            env_class: self.input_stage.environment_class(),
-        };
-        
-        // 3. 输入阶段
-        self.input_stage.process(samples, &ctx);
-        
-        // 4. 前处理链
-        for processor in &mut self.pre_processors {
-            if processor.is_enabled() {
-                processor.process(samples, &ctx);
-            }
-        }
-        
-        // 5. 核心处理（DeepFilter）
-        if let Some(ref mut core) = self.core_processor {
-            if core.is_enabled() {
-                core.process(samples, &ctx);
-            }
-        }
-        
-        // 6. 后处理链
-        for processor in &mut self.post_processors {
-            if processor.is_enabled() {
-                processor.process(samples, &ctx);
-            }
-        }
-        
-        // 7. 输出阶段（唯一限幅点）
-        self.output_stage.process(samples, &ctx);
-        
-        // 8. 更新指标
-        self.metrics.peak_output_db = calculate_peak_db(samples);
-        self.metrics.gain_reduction_db = self.output_stage.gain_reduction_db();
-        self.metrics.cpu_load_percent = calculate_cpu_load(start_time, samples.len(), self.sample_rate);
-        self.metrics.voice_activity = ctx.voice_activity;
-        
-        &self.metrics
-    }
-    
-    /// 验证延迟预算
-    fn validate_latency_budget(&self) {
-        let total = self.calculate_total_latency();
-        if total > self.latency_budget_samples {
-            log::warn!(
-                "延迟预算超出: {} samples > {} samples ({:.1}ms > {:.1}ms)",
-                total, self.latency_budget_samples,
-                total as f32 / self.sample_rate * 1000.0,
-                self.latency_budget_samples as f32 / self.sample_rate * 1000.0
-            );
-        }
-    }
-    
-    fn calculate_total_latency(&self) -> usize {
-        let mut total = self.input_stage.latency_samples();
-        for p in &self.pre_processors {
-            total += p.latency_samples();
-        }
-        if let Some(ref core) = self.core_processor {
-            total += core.latency_samples();
-        }
-        for p in &self.post_processors {
-            total += p.latency_samples();
-        }
-        total += self.output_stage.latency_samples();
-        total
-    }
-}
-
-fn calculate_peak_db(samples: &[f32]) -> f32 {
-    let peak = samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
-    20.0 * peak.max(1e-10).log10()
-}
-
-fn calculate_cpu_load(start: std::time::Instant, block_size: usize, sample_rate: f32) -> f32 {
-    let elapsed = start.elapsed().as_secs_f32();
-    let block_duration = block_size as f32 / sample_rate;
-    (elapsed / block_duration * 100.0).min(100.0)
-}
-```
-
-### 2.5 统一输出阶段（单点限幅）
-
-```rust
-// ====================
-// 文件: audio/bus/output_stage.rs
-// ====================
-
-/// 输出阶段 - 系统唯一的限幅点
-pub struct OutputStage {
-    sample_rate: f32,
-    
-    // True Peak 限幅器
-    ceiling_db: f32,
-    lookahead_samples: usize,
-    lookahead_buffer: Vec<f32>,
-    lookahead_pos: usize,
-    
-    // 增益平滑
-    current_gain: f32,
-    attack_coef: f32,
-    release_coef: f32,
-    
-    // 监控
-    gain_reduction_db: f32,
-}
-
-impl OutputStage {
-    pub fn new(sample_rate: f32) -> Self {
-        let lookahead_ms = 1.5;  // 减少到 1.5ms，平衡延迟和质量
-        let lookahead_samples = (sample_rate * lookahead_ms / 1000.0) as usize;
-        
-        // 快攻慢放
-        let attack_ms = 0.1;
-        let release_ms = 100.0;
-        
-        Self {
-            sample_rate,
-            ceiling_db: -0.5,  // -0.5 dBFS，留余量
-            lookahead_samples,
-            lookahead_buffer: vec![0.0; lookahead_samples],
-            lookahead_pos: 0,
-            current_gain: 1.0,
-            attack_coef: (-1.0 / (attack_ms * sample_rate / 1000.0)).exp(),
-            release_coef: (-1.0 / (release_ms * sample_rate / 1000.0)).exp(),
-            gain_reduction_db: 0.0,
-        }
-    }
-    
-    pub fn gain_reduction_db(&self) -> f32 {
-        self.gain_reduction_db
-    }
-    
-    pub fn latency_samples(&self) -> usize {
-        self.lookahead_samples
-    }
-}
-
-impl AudioProcessor for OutputStage {
-    fn name(&self) -> &'static str { "OutputStage" }
-    
-    fn latency_samples(&self) -> usize {
-        self.lookahead_samples
-    }
-    
-    fn process(&mut self, samples: &mut [f32], _ctx: &ProcessContext) {
-        let ceiling_linear = db_to_linear(self.ceiling_db);
-        
-        for sample in samples.iter_mut() {
-            // 写入 lookahead 缓冲
-            let delayed = self.lookahead_buffer[self.lookahead_pos];
-            self.lookahead_buffer[self.lookahead_pos] = *sample;
-            self.lookahead_pos = (self.lookahead_pos + 1) % self.lookahead_samples;
-            
-            // 计算 lookahead 窗口内的峰值
-            let peak = self.lookahead_buffer.iter()
-                .fold(0.0f32, |acc, &s| acc.max(s.abs()));
-            
-            // 计算目标增益
-            let target_gain = if peak > ceiling_linear {
-                ceiling_linear / peak
-            } else {
-                1.0
-            };
-            
-            // 平滑增益变化
-            let coef = if target_gain < self.current_gain {
-                self.attack_coef
-            } else {
-                self.release_coef
-            };
-            self.current_gain = coef * self.current_gain + (1.0 - coef) * target_gain;
-            
-            // 应用增益到延迟后的信号
-            *sample = delayed * self.current_gain;
-        }
-        
-        // 更新监控指标
-        self.gain_reduction_db = -20.0 * self.current_gain.log10();
-    }
-    
-    fn reset(&mut self) {
-        self.lookahead_buffer.fill(0.0);
-        self.lookahead_pos = 0;
-        self.current_gain = 1.0;
-        self.gain_reduction_db = 0.0;
-    }
-}
-
-fn db_to_linear(db: f32) -> f32 {
-    10.0_f32.powf(db / 20.0)
-}
+                    ┌─────────────────┐
+                    │   Unknown       │ ← 启动/重置
+                    │   (校准中)      │
+                    └────────┬────────┘
+                             │ 校准完成 (3-5秒)
+                             ↓
+           ┌─────────────────┴─────────────────┐
+           ↓                                   ↓
+    ┌──────────────┐                   ┌──────────────┐
+    │ OpenOffice   │ ←───────────────→ │ MeetingRoom  │
+    │ (开放办公区)  │   渐变切换 (2秒)   │ (会议室)     │
+    └──────────────┘                   └──────────────┘
+           ↑                                   ↑
+           │         ┌──────────────┐         │
+           └────────→│   Transition │←────────┘
+                     │   (过渡中)    │
+                     └──────────────┘
 ```
 
 ---
 
-## 三、自适应校准系统
+## 三、场景感知模块
 
-### 3.1 目标
-
-- 启动时自动检测环境基线
-- 适配不同麦克风灵敏度
-- 动态调整处理参数
-
-### 3.2 校准流程
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      启动校准流程 (3秒)                          │
-│                                                                  │
-│  T=0s        T=1s           T=2s           T=3s                 │
-│  ├───────────┼──────────────┼──────────────┤                    │
-│  │ 静默检测   │ 噪声特征分析  │ 参数计算     │ → 正常处理        │
-│  │           │              │              │                    │
-│  │ - 底噪电平 │ - 频谱形状   │ - DF阈值     │                    │
-│  │ - 峰值统计 │ - 平坦度     │ - 高通截止   │                    │
-│  │           │ - 频谱质心   │ - AGC目标    │                    │
-│  │           │ - 调制特征   │ - EQ预设     │                    │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 3.3 实现代码
+### 3.1 SceneAnalyzer（场景分析器）
 
 ```rust
 // ====================
-// 文件: audio/calibration.rs
+// 文件: audio/adaptive/scene_analyzer.rs
 // ====================
 
 use std::collections::VecDeque;
 
-/// 校准状态机
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CalibrationState {
-    NotStarted,
-    CollectingSilence,    // 收集静默数据
-    AnalyzingNoise,       // 分析噪声特征
-    ComputingParams,      // 计算参数
-    Completed,
-    Failed(CalibrationError),
+/// 场景类型
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SceneType {
+    Unknown,        // 未知/校准中
+    OpenOffice,     // 开放办公区
+    MeetingRoom,    // 会议室
+    Quiet,          // 安静环境（家、录音室）
+    Noisy,          // 极端嘈杂（咖啡厅、街道）
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CalibrationError {
-    TooMuchNoise,         // 环境太吵，无法校准
-    SignalDetected,       // 检测到语音信号
-    Timeout,
+impl SceneType {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            SceneType::Unknown => "检测中...",
+            SceneType::OpenOffice => "开放办公区",
+            SceneType::MeetingRoom => "会议室",
+            SceneType::Quiet => "安静环境",
+            SceneType::Noisy => "嘈杂环境",
+        }
+    }
 }
 
-/// 校准结果
+/// 场景特征
+#[derive(Clone, Debug, Default)]
+pub struct SceneFeatures {
+    pub noise_floor_db: f32,          // 噪底电平
+    pub noise_variance_db: f32,       // 噪声波动
+    pub reverb_amount: f32,           // 混响量 (0-1)
+    pub spectral_centroid: f32,       // 频谱质心 (Hz)
+    pub spectral_flatness: f32,       // 频谱平坦度 (0-1)
+    pub voice_activity_ratio: f32,    // 背景人声活动比例
+    pub transient_density: f32,       // 瞬态密度
+    pub low_freq_energy_ratio: f32,   // 低频能量占比
+}
+
+/// 场景分析结果
 #[derive(Clone, Debug)]
-pub struct CalibrationResult {
-    pub noise_floor_db: f32,
-    pub peak_noise_db: f32,
-    pub spectral_flatness: f32,
-    pub spectral_centroid_hz: f32,
-    pub recommended_params: RecommendedParams,
-    pub confidence: f32,  // 0-1，校准置信度
+pub struct SceneAnalysis {
+    pub scene_type: SceneType,
+    pub confidence: f32,              // 0-1
+    pub features: SceneFeatures,
+    pub transition_progress: f32,     // 场景切换进度 0-1
 }
 
-#[derive(Clone, Debug)]
-pub struct RecommendedParams {
-    pub df_atten_lim: f32,
-    pub df_min_thresh: f32,
-    pub df_mix: f32,
-    pub highpass_cutoff: f32,
-    pub agc_target_db: f32,
-    pub agc_max_gain: f32,
-    pub eq_preset: EqPresetKind,
-    pub eq_mix: f32,
-}
-
-/// 自适应校准器
-pub struct AdaptiveCalibrator {
+/// 场景分析器
+pub struct SceneAnalyzer {
     sample_rate: f32,
-    state: CalibrationState,
     
-    // 数据收集
-    samples_collected: usize,
-    target_samples: usize,
+    // === 状态 ===
+    current_scene: SceneType,
+    target_scene: SceneType,
+    scene_confidence: f32,
+    transition_progress: f32,
     
-    // 统计数据
+    // === 特征提取 ===
     energy_history: VecDeque<f32>,
-    spectrum_accumulator: Vec<f32>,
-    spectrum_count: usize,
-    peak_history: VecDeque<f32>,
+    reverb_estimator: ReverbEstimator,
+    voice_detector: BackgroundVoiceDetector,
+    spectrum_analyzer: SpectrumAnalyzer,
     
-    // FFT
-    fft_size: usize,
-    fft_buffer: Vec<f32>,
+    // === 决策控制 ===
+    scene_hold_frames: usize,
+    scene_hold_counter: usize,
+    min_confidence_for_switch: f32,
+    transition_frames: usize,
+    transition_counter: usize,
     
-    // 结果
-    result: Option<CalibrationResult>,
+    // === 校准 ===
+    is_calibrating: bool,
+    calibration_frames: usize,
+    calibration_counter: usize,
+    calibration_features: Vec<SceneFeatures>,
+    baseline_features: Option<SceneFeatures>,
 }
 
-impl AdaptiveCalibrator {
+impl SceneAnalyzer {
     pub fn new(sample_rate: f32) -> Self {
+        let frame_duration_ms = 10.0;
+        let history_duration_sec = 5.0;
+        let history_length = (history_duration_sec * 1000.0 / frame_duration_ms) as usize;
+        
         let calibration_duration_sec = 3.0;
-        let target_samples = (sample_rate * calibration_duration_sec) as usize;
-        let fft_size = 2048;
+        let transition_duration_sec = 2.0;
+        let hold_duration_sec = 3.0;
         
         Self {
             sample_rate,
-            state: CalibrationState::NotStarted,
-            samples_collected: 0,
-            target_samples,
-            energy_history: VecDeque::with_capacity(1000),
-            spectrum_accumulator: vec![0.0; fft_size / 2],
-            spectrum_count: 0,
-            peak_history: VecDeque::with_capacity(100),
-            fft_size,
-            fft_buffer: vec![0.0; fft_size],
-            result: None,
+            
+            current_scene: SceneType::Unknown,
+            target_scene: SceneType::Unknown,
+            scene_confidence: 0.0,
+            transition_progress: 1.0,
+            
+            energy_history: VecDeque::with_capacity(history_length),
+            reverb_estimator: ReverbEstimator::new(sample_rate),
+            voice_detector: BackgroundVoiceDetector::new(sample_rate),
+            spectrum_analyzer: SpectrumAnalyzer::new(sample_rate),
+            
+            scene_hold_frames: (hold_duration_sec * 1000.0 / frame_duration_ms) as usize,
+            scene_hold_counter: 0,
+            min_confidence_for_switch: 0.7,
+            transition_frames: (transition_duration_sec * 1000.0 / frame_duration_ms) as usize,
+            transition_counter: 0,
+            
+            is_calibrating: true,
+            calibration_frames: (calibration_duration_sec * 1000.0 / frame_duration_ms) as usize,
+            calibration_counter: 0,
+            calibration_features: Vec::new(),
+            baseline_features: None,
         }
     }
     
-    /// 开始校准
-    pub fn start(&mut self) {
-        self.state = CalibrationState::CollectingSilence;
-        self.samples_collected = 0;
-        self.energy_history.clear();
-        self.spectrum_accumulator.fill(0.0);
-        self.spectrum_count = 0;
-        self.peak_history.clear();
-        self.result = None;
-    }
-    
-    /// 处理音频块，返回是否完成
-    pub fn process(&mut self, samples: &[f32]) -> bool {
-        match self.state {
-            CalibrationState::NotStarted => false,
-            CalibrationState::Completed | CalibrationState::Failed(_) => true,
-            _ => {
-                self.collect_data(samples);
-                self.samples_collected += samples.len();
-                
-                // 检查是否检测到语音
-                if self.detect_voice_activity(samples) {
-                    self.state = CalibrationState::Failed(CalibrationError::SignalDetected);
-                    return true;
-                }
-                
-                // 检查进度
-                let progress = self.samples_collected as f32 / self.target_samples as f32;
-                
-                if progress >= 0.33 && self.state == CalibrationState::CollectingSilence {
-                    self.state = CalibrationState::AnalyzingNoise;
-                } else if progress >= 0.66 && self.state == CalibrationState::AnalyzingNoise {
-                    self.state = CalibrationState::ComputingParams;
-                } else if progress >= 1.0 {
-                    self.compute_result();
-                    self.state = CalibrationState::Completed;
-                    return true;
-                }
-                
-                false
-            }
+    /// 分析音频帧，返回场景分析结果
+    pub fn analyze(&mut self, samples: &[f32], is_user_speaking: bool) -> SceneAnalysis {
+        // 仅在用户不说话时分析环境
+        if !is_user_speaking {
+            self.update_features(samples);
+        }
+        
+        // 校准阶段
+        if self.is_calibrating {
+            self.run_calibration(samples, is_user_speaking);
+            return SceneAnalysis {
+                scene_type: SceneType::Unknown,
+                confidence: 0.0,
+                features: self.extract_features(),
+                transition_progress: 0.0,
+            };
+        }
+        
+        // 提取当前特征
+        let features = self.extract_features();
+        
+        // 分类
+        let (detected_scene, confidence) = self.classify_scene(&features);
+        
+        // 场景切换决策
+        self.update_scene_decision(detected_scene, confidence);
+        
+        // 更新过渡进度
+        self.update_transition();
+        
+        SceneAnalysis {
+            scene_type: self.current_scene,
+            confidence: self.scene_confidence,
+            features,
+            transition_progress: self.transition_progress,
         }
     }
     
-    /// 获取校准结果
-    pub fn result(&self) -> Option<&CalibrationResult> {
-        self.result.as_ref()
+    /// 获取当前场景
+    pub fn current_scene(&self) -> SceneType {
+        self.current_scene
     }
     
-    /// 获取当前状态
-    pub fn state(&self) -> CalibrationState {
-        self.state
+    /// 获取目标场景（正在切换到的场景）
+    pub fn target_scene(&self) -> SceneType {
+        self.target_scene
     }
     
-    /// 获取进度 (0-1)
-    pub fn progress(&self) -> f32 {
-        (self.samples_collected as f32 / self.target_samples as f32).min(1.0)
+    /// 获取过渡进度 (0=当前场景, 1=目标场景)
+    pub fn transition_progress(&self) -> f32 {
+        self.transition_progress
     }
     
-    fn collect_data(&mut self, samples: &[f32]) {
-        // 计算块能量
-        let energy: f32 = samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32;
+    /// 是否正在校准
+    pub fn is_calibrating(&self) -> bool {
+        self.is_calibrating
+    }
+    
+    /// 强制重新校准
+    pub fn recalibrate(&mut self) {
+        self.is_calibrating = true;
+        self.calibration_counter = 0;
+        self.calibration_features.clear();
+        self.current_scene = SceneType::Unknown;
+        self.target_scene = SceneType::Unknown;
+    }
+    
+    fn update_features(&mut self, samples: &[f32]) {
+        // 能量
+        let energy = samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32;
         let energy_db = 10.0 * energy.max(1e-10).log10();
         self.energy_history.push_back(energy_db);
+        if self.energy_history.len() > 500 {
+            self.energy_history.pop_front();
+        }
         
-        // 记录峰值
-        let peak = samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
-        self.peak_history.push_back(peak);
+        // 混响
+        self.reverb_estimator.process(samples);
         
-        // 累积频谱（简化版，实际应用 FFT）
-        // TODO: 使用 rustfft 进行真实频谱分析
-        self.spectrum_count += 1;
+        // 背景人声
+        self.voice_detector.process(samples);
+        
+        // 频谱
+        self.spectrum_analyzer.process(samples);
     }
     
-    fn detect_voice_activity(&self, samples: &[f32]) -> bool {
-        // 简化的 VAD：检测能量突变
-        let current_energy: f32 = samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32;
-        let current_db = 10.0 * current_energy.max(1e-10).log10();
+    fn extract_features(&self) -> SceneFeatures {
+        // 噪底：取能量历史的 10% 分位数
+        let noise_floor_db = self.compute_percentile(0.1);
         
-        if let Some(&baseline) = self.energy_history.front() {
-            // 如果当前能量比基线高 15dB，可能有语音
-            if current_db > baseline + 15.0 {
-                return true;
+        // 噪声波动：能量标准差
+        let noise_variance_db = self.compute_energy_variance();
+        
+        SceneFeatures {
+            noise_floor_db,
+            noise_variance_db,
+            reverb_amount: self.reverb_estimator.reverb_amount(),
+            spectral_centroid: self.spectrum_analyzer.centroid(),
+            spectral_flatness: self.spectrum_analyzer.flatness(),
+            voice_activity_ratio: self.voice_detector.activity_ratio(),
+            transient_density: self.spectrum_analyzer.transient_density(),
+            low_freq_energy_ratio: self.spectrum_analyzer.low_freq_ratio(),
+        }
+    }
+    
+    fn classify_scene(&self, features: &SceneFeatures) -> (SceneType, f32) {
+        // 多维度评分
+        let mut scores = [
+            (SceneType::Quiet, 0.0f32),
+            (SceneType::MeetingRoom, 0.0f32),
+            (SceneType::OpenOffice, 0.0f32),
+            (SceneType::Noisy, 0.0f32),
+        ];
+        
+        // === 安静环境特征 ===
+        // 噪底低、无背景人声、波动小
+        if features.noise_floor_db < -50.0 {
+            scores[0].1 += 0.4;
+        }
+        if features.voice_activity_ratio < 0.05 {
+            scores[0].1 += 0.3;
+        }
+        if features.noise_variance_db < 3.0 {
+            scores[0].1 += 0.3;
+        }
+        
+        // === 会议室特征 ===
+        // 中等噪底、有混响、低频突出、少量背景人声
+        if features.noise_floor_db >= -50.0 && features.noise_floor_db < -35.0 {
+            scores[1].1 += 0.25;
+        }
+        if features.reverb_amount > 0.3 {
+            scores[1].1 += 0.25;
+        }
+        if features.low_freq_energy_ratio > 0.4 {
+            scores[1].1 += 0.25;
+        }
+        if features.voice_activity_ratio < 0.2 {
+            scores[1].1 += 0.25;
+        }
+        
+        // === 开放办公区特征 ===
+        // 较高噪底、频繁背景人声、噪声波动大、混响小
+        if features.noise_floor_db >= -40.0 && features.noise_floor_db < -25.0 {
+            scores[2].1 += 0.2;
+        }
+        if features.voice_activity_ratio > 0.3 {
+            scores[2].1 += 0.3;
+        }
+        if features.noise_variance_db > 5.0 {
+            scores[2].1 += 0.25;
+        }
+        if features.reverb_amount < 0.3 {
+            scores[2].1 += 0.15;
+        }
+        if features.spectral_flatness > 0.4 {
+            scores[2].1 += 0.1;
+        }
+        
+        // === 极端嘈杂特征 ===
+        // 非常高的噪底、持续高活动
+        if features.noise_floor_db >= -25.0 {
+            scores[3].1 += 0.5;
+        }
+        if features.voice_activity_ratio > 0.6 {
+            scores[3].1 += 0.3;
+        }
+        if features.noise_variance_db > 8.0 {
+            scores[3].1 += 0.2;
+        }
+        
+        // 归一化并选择最高分
+        let total: f32 = scores.iter().map(|(_, s)| s).sum();
+        if total > 0.0 {
+            for (_, score) in &mut scores {
+                *score /= total;
             }
         }
         
-        false
+        // 选择最高分
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        
+        (scores[0].0, scores[0].1)
     }
     
-    fn compute_result(&mut self) {
-        // 计算统计数据
-        let noise_floor_db = self.compute_percentile(&self.energy_history, 0.1);
-        let peak_noise_db = self.compute_percentile(&self.energy_history, 0.95);
-        let noise_variance = self.compute_variance(&self.energy_history);
+    fn update_scene_decision(&mut self, detected_scene: SceneType, confidence: f32) {
+        // 置信度平滑
+        self.scene_confidence = 0.9 * self.scene_confidence + 0.1 * confidence;
         
-        // 频谱平坦度（简化计算）
-        let spectral_flatness = self.compute_spectral_flatness();
-        let spectral_centroid_hz = self.compute_spectral_centroid();
-        
-        // 根据分析结果计算推荐参数
-        let recommended_params = self.compute_recommended_params(
-            noise_floor_db,
-            peak_noise_db,
-            spectral_flatness,
-            spectral_centroid_hz,
-        );
-        
-        // 计算置信度
-        let confidence = self.compute_confidence(noise_variance);
-        
-        self.result = Some(CalibrationResult {
-            noise_floor_db,
-            peak_noise_db,
-            spectral_flatness,
-            spectral_centroid_hz,
-            recommended_params,
-            confidence,
-        });
-    }
-    
-    fn compute_recommended_params(
-        &self,
-        noise_floor_db: f32,
-        peak_noise_db: f32,
-        spectral_flatness: f32,
-        spectral_centroid_hz: f32,
-    ) -> RecommendedParams {
-        // 根据噪声电平选择降噪强度
-        let (df_atten_lim, df_mix) = match noise_floor_db {
-            x if x < -60.0 => (25.0, 0.85),   // 非常安静
-            x if x < -50.0 => (35.0, 0.90),   // 安静
-            x if x < -40.0 => (45.0, 0.95),   // 中等噪声
-            x if x < -30.0 => (55.0, 1.00),   // 嘈杂
-            _ => (65.0, 1.00),                 // 极端噪声
-        };
-        
-        // 根据噪声频谱特征选择高通截止
-        let highpass_cutoff = if spectral_centroid_hz < 500.0 {
-            // 低频噪声为主（空调、风扇）
-            80.0
-        } else if spectral_flatness > 0.5 {
-            // 宽带噪声
-            60.0
+        // 检测到不同场景
+        if detected_scene != self.current_scene && detected_scene != self.target_scene {
+            if self.scene_confidence > self.min_confidence_for_switch {
+                self.scene_hold_counter += 1;
+                
+                // 持续检测到新场景才切换
+                if self.scene_hold_counter >= self.scene_hold_frames {
+                    self.target_scene = detected_scene;
+                    self.transition_counter = 0;
+                    self.scene_hold_counter = 0;
+                    log::info!(
+                        "场景切换: {:?} → {:?} (置信度: {:.0}%)",
+                        self.current_scene, self.target_scene, self.scene_confidence * 100.0
+                    );
+                }
+            } else {
+                self.scene_hold_counter = 0;
+            }
         } else {
-            // 正常情况
-            50.0
-        };
-        
-        // AGC 参数
-        let agc_target_db = if noise_floor_db < -50.0 { -14.0 } else { -18.0 };
-        let agc_max_gain = if noise_floor_db < -55.0 { 15.0 } else { 10.0 };
-        
-        // EQ 预设选择
-        let eq_preset = if noise_floor_db > -35.0 {
-            EqPresetKind::Meeting  // 嘈杂环境用会议预设
-        } else if spectral_flatness > 0.4 {
-            EqPresetKind::OpenOffice
-        } else {
-            EqPresetKind::Broadcast
-        };
-        
-        let eq_mix = (0.5 + (noise_floor_db + 50.0) / 100.0).clamp(0.4, 0.8);
-        
-        RecommendedParams {
-            df_atten_lim,
-            df_min_thresh: noise_floor_db - 10.0,
-            df_mix,
-            highpass_cutoff,
-            agc_target_db,
-            agc_max_gain,
-            eq_preset,
-            eq_mix,
+            self.scene_hold_counter = 0;
         }
     }
     
-    fn compute_percentile(&self, data: &VecDeque<f32>, p: f32) -> f32 {
-        if data.is_empty() {
+    fn update_transition(&mut self) {
+        if self.current_scene != self.target_scene {
+            self.transition_counter += 1;
+            self.transition_progress = 
+                (self.transition_counter as f32 / self.transition_frames as f32).min(1.0);
+            
+            // 过渡完成
+            if self.transition_counter >= self.transition_frames {
+                self.current_scene = self.target_scene;
+                self.transition_progress = 1.0;
+                log::info!("场景切换完成: {:?}", self.current_scene);
+            }
+        }
+    }
+    
+    fn run_calibration(&mut self, samples: &[f32], is_user_speaking: bool) {
+        if is_user_speaking {
+            return;  // 用户说话时不校准
+        }
+        
+        self.calibration_counter += 1;
+        
+        // 收集特征
+        if self.calibration_counter % 10 == 0 {  // 每 100ms 采样一次
+            self.calibration_features.push(self.extract_features());
+        }
+        
+        // 校准完成
+        if self.calibration_counter >= self.calibration_frames {
+            self.finish_calibration();
+        }
+    }
+    
+    fn finish_calibration(&mut self) {
+        if self.calibration_features.is_empty() {
+            log::warn!("校准数据不足，使用默认基线");
+            self.baseline_features = Some(SceneFeatures::default());
+        } else {
+            // 计算平均特征作为基线
+            let n = self.calibration_features.len() as f32;
+            let mut baseline = SceneFeatures::default();
+            
+            for f in &self.calibration_features {
+                baseline.noise_floor_db += f.noise_floor_db;
+                baseline.noise_variance_db += f.noise_variance_db;
+                baseline.reverb_amount += f.reverb_amount;
+                baseline.spectral_centroid += f.spectral_centroid;
+                baseline.spectral_flatness += f.spectral_flatness;
+                baseline.voice_activity_ratio += f.voice_activity_ratio;
+                baseline.low_freq_energy_ratio += f.low_freq_energy_ratio;
+            }
+            
+            baseline.noise_floor_db /= n;
+            baseline.noise_variance_db /= n;
+            baseline.reverb_amount /= n;
+            baseline.spectral_centroid /= n;
+            baseline.spectral_flatness /= n;
+            baseline.voice_activity_ratio /= n;
+            baseline.low_freq_energy_ratio /= n;
+            
+            self.baseline_features = Some(baseline.clone());
+            
+            // 初始场景分类
+            let (initial_scene, confidence) = self.classify_scene(&baseline);
+            self.current_scene = initial_scene;
+            self.target_scene = initial_scene;
+            self.scene_confidence = confidence;
+            
+            log::info!(
+                "校准完成: 场景={:?}, 噪底={:.1}dB, 混响={:.2}, 背景人声={:.0}%",
+                initial_scene,
+                baseline.noise_floor_db,
+                baseline.reverb_amount,
+                baseline.voice_activity_ratio * 100.0
+            );
+        }
+        
+        self.is_calibrating = false;
+        self.calibration_features.clear();
+    }
+    
+    fn compute_percentile(&self, p: f32) -> f32 {
+        if self.energy_history.is_empty() {
             return -60.0;
         }
-        let mut sorted: Vec<f32> = data.iter().copied().collect();
+        let mut sorted: Vec<f32> = self.energy_history.iter().copied().collect();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let idx = ((sorted.len() as f32 * p) as usize).min(sorted.len() - 1);
         sorted[idx]
     }
     
-    fn compute_variance(&self, data: &VecDeque<f32>) -> f32 {
-        if data.len() < 2 {
+    fn compute_energy_variance(&self) -> f32 {
+        if self.energy_history.len() < 2 {
             return 0.0;
         }
-        let mean: f32 = data.iter().sum::<f32>() / data.len() as f32;
-        let variance: f32 = data.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / data.len() as f32;
+        let mean: f32 = self.energy_history.iter().sum::<f32>() / self.energy_history.len() as f32;
+        let variance: f32 = self.energy_history.iter()
+            .map(|&x| (x - mean).powi(2))
+            .sum::<f32>() / self.energy_history.len() as f32;
         variance.sqrt()
     }
+}
+```
+
+### 3.2 混响估计器
+
+```rust
+// ====================
+// 文件: audio/adaptive/reverb_estimator.rs
+// ====================
+
+/// 混响估计器 - 基于能量衰减特性
+pub struct ReverbEstimator {
+    sample_rate: f32,
     
-    fn compute_spectral_flatness(&self) -> f32 {
-        // 简化实现，实际应基于 FFT 结果
-        // 返回 0-1，越接近 1 表示越接近白噪声
-        0.3  // 占位值
+    // 能量包络
+    envelope: f32,
+    attack_coef: f32,
+    release_coef: f32,
+    
+    // 衰减分析
+    decay_history: VecDeque<f32>,
+    decay_rate: f32,           // 衰减速率 (dB/s)
+    
+    // 混响量估计
+    reverb_amount: f32,
+}
+
+impl ReverbEstimator {
+    pub fn new(sample_rate: f32) -> Self {
+        Self {
+            sample_rate,
+            envelope: 0.0,
+            attack_coef: Self::calc_coef(1.0, sample_rate),
+            release_coef: Self::calc_coef(100.0, sample_rate),
+            decay_history: VecDeque::with_capacity(100),
+            decay_rate: 0.0,
+            reverb_amount: 0.0,
+        }
     }
     
-    fn compute_spectral_centroid(&self) -> f32 {
-        // 简化实现
-        1000.0  // 占位值，单位 Hz
+    fn calc_coef(time_ms: f32, sample_rate: f32) -> f32 {
+        (-1000.0 / (time_ms * sample_rate)).exp()
     }
     
-    fn compute_confidence(&self, noise_variance: f32) -> f32 {
-        // 噪声越稳定，置信度越高
-        let stability_score = 1.0 / (1.0 + noise_variance / 5.0);
+    pub fn process(&mut self, samples: &[f32]) {
+        for &sample in samples {
+            let abs_sample = sample.abs();
+            
+            let coef = if abs_sample > self.envelope {
+                self.attack_coef
+            } else {
+                self.release_coef
+            };
+            
+            self.envelope = coef * self.envelope + (1.0 - coef) * abs_sample;
+        }
         
-        // 数据量足够
-        let data_score = (self.energy_history.len() as f32 / 500.0).min(1.0);
+        // 记录包络用于衰减分析
+        let env_db = 20.0 * self.envelope.max(1e-10).log10();
+        self.decay_history.push_back(env_db);
+        if self.decay_history.len() > 100 {
+            self.decay_history.pop_front();
+        }
         
-        (stability_score * data_score).clamp(0.0, 1.0)
+        // 估计衰减速率
+        self.estimate_decay_rate();
+        
+        // 混响量映射
+        // 衰减慢 = 混响多，衰减快 = 混响少
+        // 典型值：无混响 > 60 dB/s，强混响 < 20 dB/s
+        self.reverb_amount = 1.0 - ((self.decay_rate - 20.0) / 40.0).clamp(0.0, 1.0);
+    }
+    
+    pub fn reverb_amount(&self) -> f32 {
+        self.reverb_amount
+    }
+    
+    fn estimate_decay_rate(&mut self) {
+        if self.decay_history.len() < 20 {
+            return;
+        }
+        
+        // 寻找下降段
+        let history: Vec<f32> = self.decay_history.iter().copied().collect();
+        let mut max_idx = 0;
+        let mut max_val = history[0];
+        
+        for (i, &val) in history.iter().enumerate() {
+            if val > max_val {
+                max_val = val;
+                max_idx = i;
+            }
+        }
+        
+        // 从峰值开始计算衰减
+        if max_idx < history.len() - 10 {
+            let start_db = history[max_idx];
+            let end_db = history[history.len() - 1];
+            let duration_sec = (history.len() - max_idx) as f32 * 0.01;  // 假设 10ms/帧
+            
+            if duration_sec > 0.0 {
+                let rate = (start_db - end_db) / duration_sec;
+                self.decay_rate = 0.9 * self.decay_rate + 0.1 * rate.max(0.0);
+            }
+        }
+    }
+}
+```
+
+### 3.3 背景人声检测器
+
+```rust
+// ====================
+// 文件: audio/adaptive/voice_detector.rs
+// ====================
+
+use std::collections::VecDeque;
+
+/// 背景人声检测器
+pub struct BackgroundVoiceDetector {
+    sample_rate: f32,
+    
+    // 频带能量
+    band_energies: [f32; 4],  // 低频、中低、中高、高频
+    
+    // 语音特征
+    speech_likelihood: f32,
+    activity_history: VecDeque<bool>,
+    activity_ratio: f32,
+    
+    // 简单滤波器状态
+    filter_states: [[f32; 2]; 4],
+}
+
+impl BackgroundVoiceDetector {
+    pub fn new(sample_rate: f32) -> Self {
+        Self {
+            sample_rate,
+            band_energies: [0.0; 4],
+            speech_likelihood: 0.0,
+            activity_history: VecDeque::with_capacity(500),
+            activity_ratio: 0.0,
+            filter_states: [[0.0; 2]; 4],
+        }
+    }
+    
+    pub fn process(&mut self, samples: &[f32]) {
+        // 简化的频带能量计算
+        // 实际应用中可以使用更精确的滤波器组
+        self.compute_band_energies(samples);
+        
+        // 语音特征检测
+        // 语音主要能量集中在 300Hz - 3kHz
+        let mid_energy = self.band_energies[1] + self.band_energies[2];
+        let total_energy: f32 = self.band_energies.iter().sum();
+        
+        let speech_band_ratio = if total_energy > 1e-10 {
+            mid_energy / total_energy
+        } else {
+            0.0
+        };
+        
+        // 语音的频谱形状特征
+        // 语音：中频突出，高低频相对弱
+        // 噪声：相对平坦
+        let is_speech_like = speech_band_ratio > 0.5 && total_energy > 1e-8;
+        
+        // 更新活动历史
+        self.activity_history.push_back(is_speech_like);
+        if self.activity_history.len() > 500 {
+            self.activity_history.pop_front();
+        }
+        
+        // 计算活动比例
+        let active_count = self.activity_history.iter().filter(|&&x| x).count();
+        self.activity_ratio = active_count as f32 / self.activity_history.len().max(1) as f32;
+        
+        // 平滑
+        let target = if is_speech_like { 1.0 } else { 0.0 };
+        self.speech_likelihood = 0.95 * self.speech_likelihood + 0.05 * target;
+    }
+    
+    pub fn activity_ratio(&self) -> f32 {
+        self.activity_ratio
+    }
+    
+    pub fn speech_likelihood(&self) -> f32 {
+        self.speech_likelihood
+    }
+    
+    fn compute_band_energies(&mut self, samples: &[f32]) {
+        // 简化实现：使用一阶滤波器近似频带分离
+        // 频带划分：0-300Hz, 300-1kHz, 1k-3kHz, 3k-8kHz
+        
+        let mut band_sums = [0.0f32; 4];
+        
+        // 简化：使用样本的不同特征近似频带
+        for &sample in samples {
+            // 全带能量
+            let energy = sample * sample;
+            
+            // 简化的频带分配（实际应用需要真正的滤波器）
+            band_sums[0] += energy * 0.2;  // 低频假设
+            band_sums[1] += energy * 0.3;  // 中低频
+            band_sums[2] += energy * 0.35; // 中高频
+            band_sums[3] += energy * 0.15; // 高频
+        }
+        
+        let n = samples.len() as f32;
+        for i in 0..4 {
+            let new_energy = band_sums[i] / n.max(1.0);
+            self.band_energies[i] = 0.9 * self.band_energies[i] + 0.1 * new_energy;
+        }
+    }
+}
+```
+
+### 3.4 频谱分析器
+
+```rust
+// ====================
+// 文件: audio/adaptive/spectrum_analyzer.rs
+// ====================
+
+use std::collections::VecDeque;
+
+/// 频谱分析器 - 提取频谱特征
+pub struct SpectrumAnalyzer {
+    sample_rate: f32,
+    
+    // 特征
+    centroid: f32,           // 频谱质心
+    flatness: f32,           // 频谱平坦度
+    low_freq_ratio: f32,     // 低频能量占比
+    transient_density: f32,  // 瞬态密度
+    
+    // 瞬态检测
+    prev_energy: f32,
+    transient_history: VecDeque<bool>,
+}
+
+impl SpectrumAnalyzer {
+    pub fn new(sample_rate: f32) -> Self {
+        Self {
+            sample_rate,
+            centroid: 1000.0,
+            flatness: 0.5,
+            low_freq_ratio: 0.3,
+            transient_density: 0.0,
+            prev_energy: 0.0,
+            transient_history: VecDeque::with_capacity(100),
+        }
+    }
+    
+    pub fn process(&mut self, samples: &[f32]) {
+        let energy: f32 = samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32;
+        
+        // 瞬态检测：能量突变
+        let energy_ratio = energy / self.prev_energy.max(1e-10);
+        let is_transient = energy_ratio > 3.0 || energy_ratio < 0.33;
+        
+        self.transient_history.push_back(is_transient);
+        if self.transient_history.len() > 100 {
+            self.transient_history.pop_front();
+        }
+        
+        let transient_count = self.transient_history.iter().filter(|&&x| x).count();
+        self.transient_density = transient_count as f32 / self.transient_history.len().max(1) as f32;
+        
+        self.prev_energy = energy;
+        
+        // 简化的频谱特征（实际应用需要 FFT）
+        // 这里使用零交叉率作为频谱质心的近似
+        let mut zcr_count = 0usize;
+        let mut prev_sign = samples.first().map(|&s| s >= 0.0).unwrap_or(false);
+        
+        for &sample in samples.iter().skip(1) {
+            let current_sign = sample >= 0.0;
+            if current_sign != prev_sign {
+                zcr_count += 1;
+            }
+            prev_sign = current_sign;
+        }
+        
+        let zcr = zcr_count as f32 / samples.len().max(1) as f32;
+        
+        // ZCR 映射到频率估计
+        let estimated_freq = zcr * self.sample_rate / 2.0;
+        self.centroid = 0.9 * self.centroid + 0.1 * estimated_freq;
+        
+        // 平坦度和低频比例使用默认值（需要 FFT 才能准确计算）
+        // 在完整实现中应该使用 rustfft
+    }
+    
+    pub fn centroid(&self) -> f32 {
+        self.centroid
+    }
+    
+    pub fn flatness(&self) -> f32 {
+        self.flatness
+    }
+    
+    pub fn low_freq_ratio(&self) -> f32 {
+        self.low_freq_ratio
+    }
+    
+    pub fn transient_density(&self) -> f32 {
+        self.transient_density
+    }
+}
+```
+
+---
+
+## 四、参数调度模块
+
+### 4.1 场景参数预设
+
+```rust
+// ====================
+// 文件: audio/adaptive/scene_presets.rs
+// ====================
+
+use super::SceneType;
+
+/// 场景参数集
+#[derive(Clone, Debug)]
+pub struct SceneParameters {
+    // === DeepFilter ===
+    pub df_atten_lim: f32,
+    pub df_min_thresh: f32,
+    pub df_mix: f32,
+    
+    // === 高通 ===
+    pub highpass_cutoff: f32,
+    
+    // === 噪声门 ===
+    pub noise_gate_threshold: f32,
+    pub noise_gate_floor: f32,
+    pub noise_gate_hold_ms: f32,
+    
+    // === 空间滤波 ===
+    pub spatial_enabled: bool,
+    pub spatial_sensitivity: f32,
+    pub spatial_attenuation: f32,
+    
+    // === 语音隔离 ===
+    pub voice_isolator_enabled: bool,
+    pub voice_isolator_threshold: f32,
+    pub voice_isolator_suppression: f32,
+    
+    // === 频谱门限 ===
+    pub spectral_gate_enabled: bool,
+    pub spectral_gate_threshold: f32,
+    pub spectral_gate_floor: f32,
+    
+    // === EQ ===
+    pub eq_preset: EqPresetKind,
+    pub eq_mix: f32,
+    
+    // === 瞬态 ===
+    pub transient_enabled: bool,
+    pub transient_gain: f32,
+    pub transient_sustain: f32,
+    
+    // === AGC ===
+    pub agc_target: f32,
+    pub agc_max_gain: f32,
+    pub agc_max_atten: f32,
+}
+
+impl SceneParameters {
+    /// 获取场景预设参数
+    pub fn for_scene(scene: SceneType) -> Self {
+        match scene {
+            SceneType::Unknown => Self::default(),
+            SceneType::Quiet => Self::quiet_preset(),
+            SceneType::MeetingRoom => Self::meeting_room_preset(),
+            SceneType::OpenOffice => Self::open_office_preset(),
+            SceneType::Noisy => Self::noisy_preset(),
+        }
+    }
+    
+    /// 安静环境预设
+    fn quiet_preset() -> Self {
+        Self {
+            df_atten_lim: 25.0,
+            df_min_thresh: -60.0,
+            df_mix: 0.8,
+            
+            highpass_cutoff: 50.0,
+            
+            noise_gate_threshold: -50.0,
+            noise_gate_floor: -30.0,
+            noise_gate_hold_ms: 200.0,
+            
+            spatial_enabled: false,
+            spatial_sensitivity: 0.5,
+            spatial_attenuation: -12.0,
+            
+            voice_isolator_enabled: false,
+            voice_isolator_threshold: 0.5,
+            voice_isolator_suppression: -15.0,
+            
+            spectral_gate_enabled: false,
+            spectral_gate_threshold: 6.0,
+            spectral_gate_floor: -15.0,
+            
+            eq_preset: EqPresetKind::Broadcast,
+            eq_mix: 0.6,
+            
+            transient_enabled: true,
+            transient_gain: 3.0,
+            transient_sustain: 0.0,
+            
+            agc_target: -14.0,
+            agc_max_gain: 12.0,
+            agc_max_atten: 10.0,
+        }
+    }
+    
+    /// 会议室预设
+    fn meeting_room_preset() -> Self {
+        Self {
+            df_atten_lim: 35.0,
+            df_min_thresh: -55.0,
+            df_mix: 0.9,
+            
+            highpass_cutoff: 70.0,  // 切除驻波
+            
+            noise_gate_threshold: -45.0,
+            noise_gate_floor: -24.0,
+            noise_gate_hold_ms: 180.0,
+            
+            spatial_enabled: true,
+            spatial_sensitivity: 0.6,
+            spatial_attenuation: -15.0,
+            
+            voice_isolator_enabled: true,
+            voice_isolator_threshold: 0.5,
+            voice_isolator_suppression: -15.0,
+            
+            spectral_gate_enabled: true,
+            spectral_gate_threshold: 8.0,
+            spectral_gate_floor: -15.0,
+            
+            eq_preset: EqPresetKind::ConferenceHall,
+            eq_mix: 0.7,
+            
+            transient_enabled: true,
+            transient_gain: 3.5,
+            transient_sustain: -2.0,  // 减少混响尾音
+            
+            agc_target: -16.0,
+            agc_max_gain: 10.0,
+            agc_max_atten: 12.0,
+        }
+    }
+    
+    /// 开放办公区预设
+    fn open_office_preset() -> Self {
+        Self {
+            df_atten_lim: 50.0,
+            df_min_thresh: -50.0,
+            df_mix: 1.0,
+            
+            highpass_cutoff: 85.0,
+            
+            noise_gate_threshold: -38.0,
+            noise_gate_floor: -22.0,
+            noise_gate_hold_ms: 150.0,
+            
+            spatial_enabled: true,
+            spatial_sensitivity: 0.35,  // 更严格
+            spatial_attenuation: -20.0,
+            
+            voice_isolator_enabled: true,
+            voice_isolator_threshold: 0.45,
+            voice_isolator_suppression: -22.0,
+            
+            spectral_gate_enabled: true,
+            spectral_gate_threshold: 10.0,
+            spectral_gate_floor: -18.0,
+            
+            eq_preset: EqPresetKind::OpenOffice,
+            eq_mix: 0.8,
+            
+            transient_enabled: true,
+            transient_gain: 5.0,
+            transient_sustain: 0.0,
+            
+            agc_target: -14.0,
+            agc_max_gain: 8.0,
+            agc_max_atten: 15.0,
+        }
+    }
+    
+    /// 极端嘈杂预设
+    fn noisy_preset() -> Self {
+        Self {
+            df_atten_lim: 65.0,
+            df_min_thresh: -45.0,
+            df_mix: 1.0,
+            
+            highpass_cutoff: 100.0,
+            
+            noise_gate_threshold: -32.0,
+            noise_gate_floor: -20.0,
+            noise_gate_hold_ms: 120.0,
+            
+            spatial_enabled: true,
+            spatial_sensitivity: 0.25,
+            spatial_attenuation: -24.0,
+            
+            voice_isolator_enabled: true,
+            voice_isolator_threshold: 0.4,
+            voice_isolator_suppression: -25.0,
+            
+            spectral_gate_enabled: true,
+            spectral_gate_threshold: 12.0,
+            spectral_gate_floor: -20.0,
+            
+            eq_preset: EqPresetKind::Meeting,
+            eq_mix: 0.85,
+            
+            transient_enabled: true,
+            transient_gain: 6.0,
+            transient_sustain: -3.0,
+            
+            agc_target: -12.0,
+            agc_max_gain: 6.0,
+            agc_max_atten: 18.0,
+        }
+    }
+}
+
+impl Default for SceneParameters {
+    fn default() -> Self {
+        Self::meeting_room_preset()  // 默认使用会议室预设
     }
 }
 
 // EqPresetKind 引用
-use super::eq::EqPresetKind;
+use crate::audio::eq::EqPresetKind;
 ```
 
-### 3.4 运行时自适应
+### 4.2 参数调度器
 
 ```rust
 // ====================
-// 文件: audio/adaptive.rs
+// 文件: audio/adaptive/parameter_scheduler.rs
 // ====================
 
-/// 运行时环境监测器
-pub struct EnvironmentMonitor {
-    sample_rate: f32,
+use super::{SceneParameters, SceneType, SceneAnalysis};
+
+/// 参数调度器 - 平滑参数过渡
+pub struct ParameterScheduler {
+    current_params: SceneParameters,
+    source_params: SceneParameters,
+    target_params: SceneParameters,
     
-    // 滑动窗口统计
-    energy_window: SlidingWindow,
-    flatness_window: SlidingWindow,
-    centroid_window: SlidingWindow,
+    transition_progress: f32,
     
-    // 当前分类
-    current_class: EnvironmentClass,
-    class_hold_frames: usize,
-    class_change_threshold: usize,
-    
-    // VAD
-    vad_state: VadState,
+    // 用户覆盖
+    user_overrides: UserOverrides,
 }
 
-struct SlidingWindow {
-    buffer: VecDeque<f32>,
-    capacity: usize,
-    sum: f32,
+/// 用户手动覆盖的参数
+#[derive(Clone, Debug, Default)]
+pub struct UserOverrides {
+    pub df_atten_lim: Option<f32>,
+    pub highpass_cutoff: Option<f32>,
+    pub spatial_sensitivity: Option<f32>,
+    pub eq_mix: Option<f32>,
+    pub agc_target: Option<f32>,
+    // ... 其他可覆盖参数
 }
 
-impl SlidingWindow {
-    fn new(capacity: usize) -> Self {
+impl ParameterScheduler {
+    pub fn new() -> Self {
+        let default_params = SceneParameters::default();
         Self {
-            buffer: VecDeque::with_capacity(capacity),
-            capacity,
-            sum: 0.0,
+            current_params: default_params.clone(),
+            source_params: default_params.clone(),
+            target_params: default_params,
+            transition_progress: 1.0,
+            user_overrides: UserOverrides::default(),
         }
     }
     
-    fn push(&mut self, value: f32) {
-        if self.buffer.len() >= self.capacity {
-            if let Some(old) = self.buffer.pop_front() {
-                self.sum -= old;
+    /// 更新场景，触发参数过渡
+    pub fn update_scene(&mut self, analysis: &SceneAnalysis) {
+        let new_target = SceneParameters::for_scene(analysis.scene_type);
+        
+        // 检测目标变化
+        if analysis.transition_progress < 1.0 {
+            if self.transition_progress >= 1.0 {
+                // 开始新的过渡
+                self.source_params = self.current_params.clone();
+                self.target_params = new_target;
             }
-        }
-        self.buffer.push_back(value);
-        self.sum += value;
-    }
-    
-    fn mean(&self) -> f32 {
-        if self.buffer.is_empty() {
-            0.0
+            self.transition_progress = analysis.transition_progress;
         } else {
-            self.sum / self.buffer.len() as f32
+            self.transition_progress = 1.0;
         }
-    }
-}
-
-struct VadState {
-    speech_probability: f32,
-    hangover_frames: usize,
-    energy_threshold: f32,
-}
-
-impl EnvironmentMonitor {
-    pub fn new(sample_rate: f32) -> Self {
-        let window_sec = 2.0;
-        let window_size = (sample_rate * window_sec / 480.0) as usize; // 假设 480 采样/帧
         
-        Self {
-            sample_rate,
-            energy_window: SlidingWindow::new(window_size),
-            flatness_window: SlidingWindow::new(window_size),
-            centroid_window: SlidingWindow::new(window_size),
-            current_class: EnvironmentClass::Quiet,
-            class_hold_frames: 0,
-            class_change_threshold: 30,  // 约 0.3 秒
-            vad_state: VadState {
-                speech_probability: 0.0,
-                hangover_frames: 0,
-                energy_threshold: -45.0,
-            },
-        }
+        // 插值计算当前参数
+        self.interpolate_params();
+        
+        // 应用用户覆盖
+        self.apply_user_overrides();
     }
     
-    /// 更新环境监测，返回当前分类
-    pub fn update(&mut self, samples: &[f32]) -> EnvironmentClass {
-        // 计算特征
-        let energy_db = self.compute_energy_db(samples);
-        let flatness = self.compute_flatness(samples);
-        let centroid = self.compute_centroid(samples);
+    /// 获取当前生效参数
+    pub fn current_params(&self) -> &SceneParameters {
+        &self.current_params
+    }
+    
+    /// 设置用户覆盖
+    pub fn set_override<F>(&mut self, setter: F)
+    where
+        F: FnOnce(&mut UserOverrides),
+    {
+        setter(&mut self.user_overrides);
+    }
+    
+    /// 清除所有用户覆盖
+    pub fn clear_overrides(&mut self) {
+        self.user_overrides = UserOverrides::default();
+    }
+    
+    fn interpolate_params(&mut self) {
+        let t = self.ease_in_out(self.transition_progress);
         
-        // 仅在非语音期间更新环境统计
-        if !self.is_speech_active(energy_db) {
-            self.energy_window.push(energy_db);
-            self.flatness_window.push(flatness);
-            self.centroid_window.push(centroid);
-        }
-        
-        // 分类决策
-        let target_class = self.classify(
-            self.energy_window.mean(),
-            self.flatness_window.mean(),
-            self.centroid_window.mean(),
+        // 线性插值各参数
+        self.current_params.df_atten_lim = Self::lerp(
+            self.source_params.df_atten_lim,
+            self.target_params.df_atten_lim,
+            t,
         );
         
-        // 滞后切换，避免频繁变化
-        if target_class != self.current_class {
-            self.class_hold_frames += 1;
-            if self.class_hold_frames >= self.class_change_threshold {
-                self.current_class = target_class;
-                self.class_hold_frames = 0;
-                log::info!("环境分类切换: {:?}", self.current_class);
-            }
+        self.current_params.df_min_thresh = Self::lerp(
+            self.source_params.df_min_thresh,
+            self.target_params.df_min_thresh,
+            t,
+        );
+        
+        self.current_params.df_mix = Self::lerp(
+            self.source_params.df_mix,
+            self.target_params.df_mix,
+            t,
+        );
+        
+        self.current_params.highpass_cutoff = Self::lerp(
+            self.source_params.highpass_cutoff,
+            self.target_params.highpass_cutoff,
+            t,
+        );
+        
+        self.current_params.noise_gate_threshold = Self::lerp(
+            self.source_params.noise_gate_threshold,
+            self.target_params.noise_gate_threshold,
+            t,
+        );
+        
+        self.current_params.noise_gate_floor = Self::lerp(
+            self.source_params.noise_gate_floor,
+            self.target_params.noise_gate_floor,
+            t,
+        );
+        
+        self.current_params.spatial_sensitivity = Self::lerp(
+            self.source_params.spatial_sensitivity,
+            self.target_params.spatial_sensitivity,
+            t,
+        );
+        
+        self.current_params.spatial_attenuation = Self::lerp(
+            self.source_params.spatial_attenuation,
+            self.target_params.spatial_attenuation,
+            t,
+        );
+        
+        self.current_params.voice_isolator_threshold = Self::lerp(
+            self.source_params.voice_isolator_threshold,
+            self.target_params.voice_isolator_threshold,
+            t,
+        );
+        
+        self.current_params.voice_isolator_suppression = Self::lerp(
+            self.source_params.voice_isolator_suppression,
+            self.target_params.voice_isolator_suppression,
+            t,
+        );
+        
+        self.current_params.spectral_gate_threshold = Self::lerp(
+            self.source_params.spectral_gate_threshold,
+            self.target_params.spectral_gate_threshold,
+            t,
+        );
+        
+        self.current_params.spectral_gate_floor = Self::lerp(
+            self.source_params.spectral_gate_floor,
+            self.target_params.spectral_gate_floor,
+            t,
+        );
+        
+        self.current_params.eq_mix = Self::lerp(
+            self.source_params.eq_mix,
+            self.target_params.eq_mix,
+            t,
+        );
+        
+        self.current_params.transient_gain = Self::lerp(
+            self.source_params.transient_gain,
+            self.target_params.transient_gain,
+            t,
+        );
+        
+        self.current_params.transient_sustain = Self::lerp(
+            self.source_params.transient_sustain,
+            self.target_params.transient_sustain,
+            t,
+        );
+        
+        self.current_params.agc_target = Self::lerp(
+            self.source_params.agc_target,
+            self.target_params.agc_target,
+            t,
+        );
+        
+        self.current_params.agc_max_gain = Self::lerp(
+            self.source_params.agc_max_gain,
+            self.target_params.agc_max_gain,
+            t,
+        );
+        
+        self.current_params.agc_max_atten = Self::lerp(
+            self.source_params.agc_max_atten,
+            self.target_params.agc_max_atten,
+            t,
+        );
+        
+        // 布尔值在过渡中点切换
+        let switch_point = 0.5;
+        self.current_params.spatial_enabled = if t < switch_point {
+            self.source_params.spatial_enabled
         } else {
-            self.class_hold_frames = 0;
-        }
-        
-        self.current_class
-    }
-    
-    pub fn voice_activity(&self) -> f32 {
-        self.vad_state.speech_probability
-    }
-    
-    pub fn environment_class(&self) -> EnvironmentClass {
-        self.current_class
-    }
-    
-    fn compute_energy_db(&self, samples: &[f32]) -> f32 {
-        let energy: f32 = samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32;
-        10.0 * energy.max(1e-10).log10()
-    }
-    
-    fn compute_flatness(&self, _samples: &[f32]) -> f32 {
-        // 简化实现，实际应计算频谱平坦度
-        0.3
-    }
-    
-    fn compute_centroid(&self, _samples: &[f32]) -> f32 {
-        // 简化实现
-        0.4
-    }
-    
-    fn is_speech_active(&mut self, energy_db: f32) -> bool {
-        // 简化 VAD
-        if energy_db > self.vad_state.energy_threshold + 10.0 {
-            self.vad_state.speech_probability = 0.9;
-            self.vad_state.hangover_frames = 20;
-        } else if self.vad_state.hangover_frames > 0 {
-            self.vad_state.hangover_frames -= 1;
-            self.vad_state.speech_probability = 0.5;
-        } else {
-            self.vad_state.speech_probability = 0.1;
-        }
-        
-        self.vad_state.speech_probability > 0.5
-    }
-    
-    fn classify(&self, energy_db: f32, flatness: f32, centroid: f32) -> EnvironmentClass {
-        // 五级分类，带模糊边界
-        match energy_db {
-            x if x < -55.0 => EnvironmentClass::Silent,
-            x if x < -45.0 => {
-                // 考虑频谱特征进行细分
-                if flatness > 0.5 {
-                    EnvironmentClass::Moderate  // 宽带噪声
-                } else {
-                    EnvironmentClass::Quiet
-                }
-            }
-            x if x < -35.0 => EnvironmentClass::Moderate,
-            x if x < -25.0 => EnvironmentClass::Noisy,
-            _ => EnvironmentClass::Extreme,
-        }
-    }
-}
-```
-
----
-
-## 四、延迟预算管理
-
-### 4.1 目标延迟
-
-| 场景 | 目标延迟 | 说明 |
-|------|---------|------|
-| 实时通话 | ≤ 20ms | 交互感知阈值 |
-| 直播推流 | ≤ 40ms | 可接受范围 |
-| 后期处理 | 无限制 | 质量优先 |
-
-### 4.2 各模块延迟分配
-
-```
-┌──────────────────────────────────────────────────────────┐
-│              20ms 延迟预算分配 (48kHz)                    │
-│                                                          │
-│  模块              延迟(ms)    采样点    占比            │
-│  ─────────────────────────────────────────────────       │
-│  InputStage        0.0         0        0%               │
-│  Highpass          0.0         0        0%               │
-│  DeepFilter        10.0        480      50%    ← 固定    │
-│  Transient         0.0         0        0%               │
-│  Saturation        0.0         0        0%               │
-│  DynamicEQ         0.0         0        0%               │
-│  AGC               0.0         0        0%               │
-│  OutputLimiter     1.5         72       7.5%             │
-│  ─────────────────────────────────────────────────       │
-│  缓冲/调度余量      8.5         408      42.5%           │
-│  ─────────────────────────────────────────────────       │
-│  总计              20.0        960      100%             │
-└──────────────────────────────────────────────────────────┘
-```
-
-### 4.3 实现代码
-
-```rust
-// ====================
-// 文件: audio/latency.rs
-// ====================
-
-/// 延迟预算管理器
-pub struct LatencyBudget {
-    sample_rate: f32,
-    total_budget_ms: f32,
-    allocations: Vec<LatencyAllocation>,
-}
-
-struct LatencyAllocation {
-    name: String,
-    latency_ms: f32,
-    is_fixed: bool,
-}
-
-impl LatencyBudget {
-    pub fn new(sample_rate: f32, total_budget_ms: f32) -> Self {
-        Self {
-            sample_rate,
-            total_budget_ms,
-            allocations: Vec::new(),
-        }
-    }
-    
-    /// 注册模块延迟
-    pub fn register(&mut self, name: &str, latency_ms: f32, is_fixed: bool) -> Result<(), String> {
-        let current_total: f32 = self.allocations.iter().map(|a| a.latency_ms).sum();
-        
-        if current_total + latency_ms > self.total_budget_ms {
-            return Err(format!(
-                "延迟预算超出: 当前 {:.1}ms + 新增 {:.1}ms > 预算 {:.1}ms",
-                current_total, latency_ms, self.total_budget_ms
-            ));
-        }
-        
-        self.allocations.push(LatencyAllocation {
-            name: name.to_string(),
-            latency_ms,
-            is_fixed,
-        });
-        
-        Ok(())
-    }
-    
-    /// 获取剩余预算
-    pub fn remaining_ms(&self) -> f32 {
-        let used: f32 = self.allocations.iter().map(|a| a.latency_ms).sum();
-        self.total_budget_ms - used
-    }
-    
-    /// 获取总使用延迟
-    pub fn total_used_ms(&self) -> f32 {
-        self.allocations.iter().map(|a| a.latency_ms).sum()
-    }
-    
-    /// 打印报告
-    pub fn report(&self) -> String {
-        let mut lines = vec![
-            format!("延迟预算报告 (采样率: {}Hz)", self.sample_rate),
-            "─".repeat(50),
-        ];
-        
-        for alloc in &self.allocations {
-            let samples = (alloc.latency_ms * self.sample_rate / 1000.0) as usize;
-            let fixed_mark = if alloc.is_fixed { "[固定]" } else { "" };
-            lines.push(format!(
-                "  {:20} {:>6.2}ms {:>6} samples {}",
-                alloc.name, alloc.latency_ms, samples, fixed_mark
-            ));
-        }
-        
-        lines.push("─".repeat(50));
-        lines.push(format!(
-            "  总计: {:.2}ms / {:.2}ms (剩余: {:.2}ms)",
-            self.total_used_ms(),
-            self.total_budget_ms,
-            self.remaining_ms()
-        ));
-        
-        lines.join("\n")
-    }
-}
-```
-
----
-
-## 五、线程同步优化
-
-### 5.1 问题分析
-
-当前代码大量使用 `Ordering::Relaxed`，可能导致：
-- 跨线程写入可见性延迟
-- 在某些 CPU 架构上出现数据竞争
-
-### 5.2 修复方案
-
-```rust
-// ====================
-// 修改: capture.rs
-// ====================
-
-// 修改前
-should_stop.load(Ordering::Relaxed)
-should_stop.store(true, Ordering::Relaxed)
-
-// 修改后 - 关键同步点使用正确的内存序
-// 停止标志：写入用 Release，读取用 Acquire
-should_stop.store(true, Ordering::Release)    // 写入端
-should_stop.load(Ordering::Acquire)           // 读取端
-
-// 初始化标志
-has_init.store(true, Ordering::Release)       // worker 设置
-has_init.load(Ordering::Acquire)              // main 等待
-
-// 非关键路径可以保持 Relaxed
-// 例如：监控计数器、统计数据
-```
-
-### 5.3 通道优化
-
-```rust
-// 当前：使用 unbounded 通道可能导致内存增长
-let (s_lsnr, r_lsnr) = unbounded();
-
-// 改进：使用有界通道 + 背压策略
-use crossbeam_channel::bounded;
-
-const CHANNEL_CAPACITY: usize = 64;
-
-let (s_lsnr, r_lsnr) = bounded(CHANNEL_CAPACITY);
-
-// 发送端：非阻塞尝试，满则丢弃
-if s_lsnr.try_send(value).is_err() {
-    log::trace!("LSNR 通道已满，丢弃数据");
-}
-```
-
----
-
-## 六、资源管理优化
-
-### 6.1 录音缓冲优化
-
-```rust
-// ====================
-// 文件: audio/recording.rs
-// ====================
-
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::PathBuf;
-
-/// 流式录音器 - 边录边写，避免内存爆炸
-pub struct StreamingRecorder {
-    sample_rate: u32,
-    temp_dir: PathBuf,
-    
-    // 各轨道写入器
-    noisy_writer: Option<WavWriter>,
-    denoised_writer: Option<WavWriter>,
-    processed_writer: Option<WavWriter>,
-    
-    // 统计
-    samples_written: usize,
-}
-
-struct WavWriter {
-    writer: hound::WavWriter<BufWriter<File>>,
-    path: PathBuf,
-}
-
-impl StreamingRecorder {
-    pub fn new(sample_rate: u32, output_dir: &Path) -> Result<Self, String> {
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-        let temp_dir = output_dir.join(&timestamp);
-        std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
-        
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
+            self.target_params.spatial_enabled
         };
         
-        Ok(Self {
-            sample_rate,
-            temp_dir: temp_dir.clone(),
-            noisy_writer: Some(Self::create_writer(&temp_dir.join("raw.wav"), spec)?),
-            denoised_writer: Some(Self::create_writer(&temp_dir.join("nc.wav"), spec)?),
-            processed_writer: Some(Self::create_writer(&temp_dir.join("eq.wav"), spec)?),
-            samples_written: 0,
-        })
+        self.current_params.voice_isolator_enabled = if t < switch_point {
+            self.source_params.voice_isolator_enabled
+        } else {
+            self.target_params.voice_isolator_enabled
+        };
+        
+        self.current_params.spectral_gate_enabled = if t < switch_point {
+            self.source_params.spectral_gate_enabled
+        } else {
+            self.target_params.spectral_gate_enabled
+        };
+        
+        // EQ 预设在过渡中点切换
+        self.current_params.eq_preset = if t < switch_point {
+            self.source_params.eq_preset
+        } else {
+            self.target_params.eq_preset
+        };
     }
     
-    fn create_writer(path: &Path, spec: hound::WavSpec) -> Result<WavWriter, String> {
-        let file = File::create(path).map_err(|e| e.to_string())?;
-        let buf_writer = BufWriter::with_capacity(64 * 1024, file);  // 64KB 缓冲
-        let writer = hound::WavWriter::new(buf_writer, spec).map_err(|e| e.to_string())?;
-        Ok(WavWriter {
-            writer,
-            path: path.to_path_buf(),
-        })
-    }
-    
-    /// 写入原始音频
-    pub fn write_noisy(&mut self, samples: &[f32]) {
-        if let Some(ref mut w) = self.noisy_writer {
-            for &sample in samples {
-                let _ = w.writer.write_sample(sample.clamp(-1.0, 1.0));
-            }
+    fn apply_user_overrides(&mut self) {
+        if let Some(v) = self.user_overrides.df_atten_lim {
+            self.current_params.df_atten_lim = v;
+        }
+        if let Some(v) = self.user_overrides.highpass_cutoff {
+            self.current_params.highpass_cutoff = v;
+        }
+        if let Some(v) = self.user_overrides.spatial_sensitivity {
+            self.current_params.spatial_sensitivity = v;
+        }
+        if let Some(v) = self.user_overrides.eq_mix {
+            self.current_params.eq_mix = v;
+        }
+        if let Some(v) = self.user_overrides.agc_target {
+            self.current_params.agc_target = v;
         }
     }
     
-    /// 写入降噪后音频
-    pub fn write_denoised(&mut self, samples: &[f32]) {
-        if let Some(ref mut w) = self.denoised_writer {
-            for &sample in samples {
-                let _ = w.writer.write_sample(sample.clamp(-1.0, 1.0));
-            }
+    fn lerp(a: f32, b: f32, t: f32) -> f32 {
+        a + (b - a) * t
+    }
+    
+    fn ease_in_out(&self, t: f32) -> f32 {
+        // 平滑的 ease-in-out 曲线
+        if t < 0.5 {
+            2.0 * t * t
+        } else {
+            1.0 - (-2.0 * t + 2.0).powi(2) / 2.0
         }
-    }
-    
-    /// 写入最终处理音频
-    pub fn write_processed(&mut self, samples: &[f32]) {
-        if let Some(ref mut w) = self.processed_writer {
-            for &sample in samples {
-                let _ = w.writer.write_sample(sample.clamp(-1.0, 1.0));
-            }
-        }
-        self.samples_written += samples.len();
-    }
-    
-    /// 完成录音，返回文件路径
-    pub fn finalize(mut self) -> Result<(PathBuf, PathBuf, PathBuf), String> {
-        let noisy_path = self.noisy_writer.take()
-            .map(|w| { let _ = w.writer.finalize(); w.path })
-            .ok_or("noisy writer missing")?;
-        
-        let denoised_path = self.denoised_writer.take()
-            .map(|w| { let _ = w.writer.finalize(); w.path })
-            .ok_or("denoised writer missing")?;
-        
-        let processed_path = self.processed_writer.take()
-            .map(|w| { let _ = w.writer.finalize(); w.path })
-            .ok_or("processed writer missing")?;
-        
-        Ok((noisy_path, denoised_path, processed_path))
-    }
-    
-    /// 录音时长（秒）
-    pub fn duration_sec(&self) -> f32 {
-        self.samples_written as f32 / self.sample_rate as f32
     }
 }
 ```
 
-### 6.2 频谱图双缓冲
+---
+
+## 五、集成到处理链
+
+### 5.1 自适应处理管理器
 
 ```rust
 // ====================
-// 修改: main.rs 中的 SpecImage
+// 文件: audio/adaptive/mod.rs
 // ====================
 
-pub struct SpecImage {
-    // 双缓冲
-    front_buffer: Vec<u8>,
-    back_buffer: Vec<u8>,
-    buffer_ready: AtomicBool,
+mod scene_analyzer;
+mod scene_presets;
+mod parameter_scheduler;
+mod reverb_estimator;
+mod voice_detector;
+mod spectrum_analyzer;
+
+pub use scene_analyzer::{SceneAnalyzer, SceneType, SceneFeatures, SceneAnalysis};
+pub use scene_presets::SceneParameters;
+pub use parameter_scheduler::{ParameterScheduler, UserOverrides};
+
+use crate::audio::processors::*;
+use crate::audio::bus::ProcessContext;
+
+/// 自适应处理管理器
+pub struct AdaptiveProcessor {
+    // 场景分析
+    scene_analyzer: SceneAnalyzer,
+    parameter_scheduler: ParameterScheduler,
     
-    // 原有字段
-    im: RgbaImage,
-    n_frames: u32,
-    n_freqs: u32,
-    // ...
+    // 处理模块
+    noise_gate: NoiseGate,
+    spatial_filter: SpatialFilter,
+    voice_isolator: VoiceIsolator,
+    spectral_gate: SpectralGate,
+    
+    // 状态
+    enabled: bool,
+    last_analysis: Option<SceneAnalysis>,
 }
 
-impl SpecImage {
-    pub fn new(n_frames: u32, n_freqs: u32, vmin: f32, vmax: f32) -> Self {
-        let buffer_size = (n_frames * n_freqs * 4) as usize;
+impl AdaptiveProcessor {
+    pub fn new(sample_rate: f32) -> Self {
         Self {
-            front_buffer: vec![0; buffer_size],
-            back_buffer: vec![0; buffer_size],
-            buffer_ready: AtomicBool::new(false),
-            im: RgbaImage::new(n_frames, n_freqs),
-            n_frames,
-            n_freqs,
-            vmin,
-            vmax,
-            write_pos: 0,
-            frames_written: 0,
+            scene_analyzer: SceneAnalyzer::new(sample_rate),
+            parameter_scheduler: ParameterScheduler::new(),
+            
+            noise_gate: NoiseGate::new(sample_rate),
+            spatial_filter: SpatialFilter::new(sample_rate),
+            voice_isolator: VoiceIsolator::new(sample_rate),
+            spectral_gate: SpectralGate::new(sample_rate),
+            
+            enabled: true,
+            last_analysis: None,
         }
     }
     
-    /// 更新后台缓冲
-    pub fn update_back_buffer(&mut self) {
-        // 复用 back_buffer，避免重新分配
-        self.render_to_buffer(&mut self.back_buffer);
-        self.buffer_ready.store(true, Ordering::Release);
+    /// 启用/禁用自适应处理
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
     }
     
-    /// 交换缓冲
-    pub fn swap_buffers(&mut self) {
-        if self.buffer_ready.load(Ordering::Acquire) {
-            std::mem::swap(&mut self.front_buffer, &mut self.back_buffer);
-            self.buffer_ready.store(false, Ordering::Release);
+    /// 强制重新校准
+    pub fn recalibrate(&mut self) {
+        self.scene_analyzer.recalibrate();
+    }
+    
+    /// 获取当前场景
+    pub fn current_scene(&self) -> SceneType {
+        self.scene_analyzer.current_scene()
+    }
+    
+    /// 获取最新分析结果
+    pub fn last_analysis(&self) -> Option<&SceneAnalysis> {
+        self.last_analysis.as_ref()
+    }
+    
+    /// 设置用户覆盖参数
+    pub fn set_user_override<F>(&mut self, setter: F)
+    where
+        F: FnOnce(&mut UserOverrides),
+    {
+        self.parameter_scheduler.set_override(setter);
+    }
+    
+    /// 处理音频（DeepFilter 之前调用）
+    pub fn process_pre_df(
+        &mut self,
+        samples: &mut [f32],
+        ctx: &mut ProcessContext,
+        is_user_speaking: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        
+        // 场景分析
+        let analysis = self.scene_analyzer.analyze(samples, is_user_speaking);
+        self.last_analysis = Some(analysis.clone());
+        
+        // 更新参数
+        self.parameter_scheduler.update_scene(&analysis);
+        let params = self.parameter_scheduler.current_params();
+        
+        // 应用参数到模块
+        self.apply_params_to_modules(params);
+        
+        // 执行预处理
+        self.noise_gate.process(samples, ctx);
+        
+        if params.spatial_enabled {
+            self.spatial_filter.process(samples, ctx);
+            ctx.is_near_field = self.spatial_filter.is_near_field();
         }
     }
     
-    /// 获取显示用缓冲（无分配）
-    pub fn display_buffer(&self) -> &[u8] {
-        &self.front_buffer
+    /// 处理音频（DeepFilter 之后调用）
+    pub fn process_post_df(
+        &mut self,
+        samples: &mut [f32],
+        ctx: &mut ProcessContext,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        
+        let params = self.parameter_scheduler.current_params();
+        
+        if params.voice_isolator_enabled {
+            self.voice_isolator.process(samples, ctx);
+            ctx.voice_activity = if self.voice_isolator.is_speaking() { 1.0 } else { 0.3 };
+        }
+        
+        if params.spectral_gate_enabled {
+            self.spectral_gate.process(samples, ctx);
+        }
     }
     
-    fn render_to_buffer(&self, buffer: &mut [u8]) {
-        // ... 渲染逻辑，复用 buffer
+    /// 获取当前参数供其他模块使用
+    pub fn current_params(&self) -> &SceneParameters {
+        self.parameter_scheduler.current_params()
+    }
+    
+    fn apply_params_to_modules(&mut self, params: &SceneParameters) {
+        // NoiseGate
+        self.noise_gate.set_threshold(params.noise_gate_threshold);
+        self.noise_gate.set_floor_db(params.noise_gate_floor);
+        self.noise_gate.set_hold_ms(params.noise_gate_hold_ms);
+        
+        // SpatialFilter
+        self.spatial_filter.set_sensitivity(params.spatial_sensitivity);
+        self.spatial_filter.set_far_field_attenuation_db(params.spatial_attenuation);
+        
+        // VoiceIsolator
+        self.voice_isolator.set_continuity_threshold(params.voice_isolator_threshold);
+        self.voice_isolator.set_suppression_db(params.voice_isolator_suppression);
+        
+        // SpectralGate
+        self.spectral_gate.set_threshold_db(params.spectral_gate_threshold);
+        self.spectral_gate.set_floor_db(params.spectral_gate_floor);
     }
 }
 ```
 
----
-
-## 七、模块迁移计划
-
-### 7.1 文件结构重组
-
-```
-demo/src/
-├── main.rs                 # UI 入口
-├── capture.rs              # 简化为设备管理
-│
-├── audio/
-│   ├── mod.rs
-│   ├── bus/               # 新增：统一音频总线
-│   │   ├── mod.rs
-│   │   ├── audio_bus.rs
-│   │   ├── input_stage.rs
-│   │   └── output_stage.rs
-│   │
-│   ├── processors/        # 重构：处理器模块
-│   │   ├── mod.rs
-│   │   ├── highpass.rs
-│   │   ├── transient.rs
-│   │   ├── saturation.rs
-│   │   ├── agc.rs
-│   │   └── deep_filter.rs  # DF 封装
-│   │
-│   ├── eq/                # 保持
-│   │
-│   ├── calibration.rs     # 新增：校准系统
-│   ├── adaptive.rs        # 新增：自适应监测
-│   ├── latency.rs         # 新增：延迟管理
-│   └── recording.rs       # 新增：流式录音
-│
-└── ui/
-    ├── mod.rs
-    └── tooltips.rs
-```
-
-### 7.2 迁移步骤
-
-| 阶段 | 内容 | 预计工时 | 风险 |
-|------|------|---------|------|
-| Phase 1 | 定义 AudioProcessor trait，包装现有模块 | 2天 | 低 |
-| Phase 2 | 实现 AudioBus，替换硬编码处理链 | 3天 | 中 |
-| Phase 3 | 统一 OutputStage，移除多余限幅 | 2天 | 中 |
-| Phase 4 | 实现校准系统 | 3天 | 低 |
-| Phase 5 | 实现运行时自适应 | 2天 | 低 |
-| Phase 6 | 流式录音改造 | 1天 | 低 |
-| Phase 7 | 线程同步修复 | 1天 | 低 |
-| Phase 8 | 测试与调优 | 3天 | - |
-
-**总计预估：17 个工作日**
-
----
-
-## 八、测试验证计划
-
-### 8.1 单元测试
+### 5.2 集成到 capture.rs
 
 ```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_output_limiter_ceiling() {
-        let mut limiter = OutputStage::new(48000.0);
-        let mut samples = vec![0.0, 0.5, 1.0, 1.5, 2.0];
-        
-        let ctx = ProcessContext::default();
-        limiter.process(&mut samples, &ctx);
-        
-        // 验证不超过 ceiling
-        for &s in &samples {
-            assert!(s.abs() <= 0.95, "Sample {} exceeds ceiling", s);
+// ====================
+// 修改: capture.rs worker 函数
+// ====================
+
+use crate::audio::adaptive::{AdaptiveProcessor, SceneType};
+
+// 在 worker 初始化部分:
+let mut adaptive_processor = AdaptiveProcessor::new(df.sr as f32);
+let mut adaptive_enabled = true;
+
+// 处理控制消息:
+ControlMessage::AdaptiveEnabled(enabled) => {
+    adaptive_enabled = enabled;
+    adaptive_processor.set_enabled(enabled);
+    log::info!("自适应模式: {}", if enabled { "开启" } else { "关闭" });
+}
+
+ControlMessage::AdaptiveRecalibrate => {
+    adaptive_processor.recalibrate();
+    log::info!("触发重新校准");
+}
+
+ControlMessage::AdaptiveUserOverride(override_type, value) => {
+    adaptive_processor.set_user_override(|overrides| {
+        match override_type {
+            OverrideType::DfAttenLim => overrides.df_atten_lim = Some(value),
+            OverrideType::HighpassCutoff => overrides.highpass_cutoff = Some(value),
+            OverrideType::SpatialSensitivity => overrides.spatial_sensitivity = Some(value),
+            OverrideType::EqMix => overrides.eq_mix = Some(value),
+            OverrideType::AgcTarget => overrides.agc_target = Some(value),
         }
+    });
+}
+
+// 在处理链中:
+
+// === 预处理阶段 ===
+if let Some(buffer) = inframe.as_slice_mut() {
+    // 构建上下文
+    let mut ctx = ProcessContext {
+        sample_rate: df.sr as f32,
+        block_size: buffer.len(),
+        voice_activity: 0.0,
+        is_near_field: false,
+        continuity_score: 0.5,
+        input_level_db: calculate_level_db(buffer),
+    };
+    
+    // 判断用户是否在说话（基于近场检测 + 能量）
+    let is_user_speaking = spatial_filter.is_near_field() && ctx.input_level_db > -35.0;
+    
+    // 自适应预处理
+    if adaptive_enabled {
+        adaptive_processor.process_pre_df(buffer, &mut ctx, is_user_speaking);
+        
+        // 获取自适应参数，应用到其他模块
+        let params = adaptive_processor.current_params();
+        
+        // 更新 DeepFilter 参数
+        df.set_atten_lim(params.df_atten_lim);
+        df.min_db_thresh = params.df_min_thresh;
+        df_mix = params.df_mix;
+        
+        // 更新高通
+        highpass.set_cutoff(params.highpass_cutoff);
+        
+        // 更新 EQ
+        if dynamic_eq.preset() != params.eq_preset {
+            dynamic_eq.apply_preset(params.eq_preset);
+        }
+        dynamic_eq.set_dry_wet(params.eq_mix);
+        
+        // 更新瞬态
+        transient_shaper.set_attack_gain(params.transient_gain);
+        transient_shaper.set_sustain_gain(params.transient_sustain);
+        
+        // 更新 AGC
+        agc.set_target_level(params.agc_target);
+        agc.set_max_gain(params.agc_max_gain);
+        agc.set_max_attenuation(params.agc_max_atten);
     }
     
-    #[test]
-    fn test_calibration_quiet_room() {
-        let mut calibrator = AdaptiveCalibrator::new(48000.0);
-        calibrator.start();
-        
-        // 模拟安静环境噪声
-        let quiet_noise: Vec<f32> = (0..48000)
-            .map(|_| (rand::random::<f32>() - 0.5) * 0.001)
-            .collect();
-        
-        for chunk in quiet_noise.chunks(480) {
-            if calibrator.process(chunk) {
-                break;
-            }
-        }
-        
-        let result = calibrator.result().unwrap();
-        assert!(result.noise_floor_db < -50.0);
-        assert!(result.recommended_params.df_atten_lim < 40.0);
+    // 高通滤波
+    if highpass_enabled {
+        highpass.process(buffer);
+    }
+}
+
+// === DeepFilter 降噪 ===
+let lsnr = df.process(inframe.view(), outframe.view_mut())?;
+
+// === 后处理阶段 ===
+if let Some(buffer) = outframe.as_slice_mut() {
+    // 自适应后处理
+    if adaptive_enabled {
+        adaptive_processor.process_post_df(buffer, &mut ctx);
     }
     
-    #[test]
-    fn test_latency_budget() {
-        let mut budget = LatencyBudget::new(48000.0, 20.0);
-        
-        budget.register("DeepFilter", 10.0, true).unwrap();
-        budget.register("OutputLimiter", 1.5, true).unwrap();
-        
-        assert_eq!(budget.remaining_ms(), 8.5);
-        
-        // 超出预算应失败
-        let result = budget.register("Extra", 10.0, false);
-        assert!(result.is_err());
+    // 后续处理（瞬态、饱和、EQ、AGC）...
+}
+
+// === 发送状态到 UI ===
+if let Some(ref sender) = s_adaptive_status {
+    if let Some(analysis) = adaptive_processor.last_analysis() {
+        let status = AdaptiveStatus {
+            scene_type: adaptive_processor.current_scene(),
+            scene_name: adaptive_processor.current_scene().display_name().to_string(),
+            confidence: analysis.confidence,
+            is_calibrating: adaptive_processor.scene_analyzer.is_calibrating(),
+            features: analysis.features.clone(),
+            transition_progress: analysis.transition_progress,
+        };
+        let _ = sender.try_send(status);
     }
 }
 ```
 
-### 8.2 集成测试场景
+---
 
-| 场景 | 测试内容 | 通过标准 |
-|------|---------|---------|
-| 安静房间 | 白噪声 -60dB | 降噪后底噪 < -70dB |
-| 办公环境 | 键盘 + 空调 | 可懂度 > 95% |
-| 嘈杂环境 | 多人交谈背景 | 主说话人清晰 |
-| 极端测试 | 1kHz 正弦波 0dBFS | 无削波失真 |
-| 长时运行 | 持续 1 小时 | 内存稳定，无泄漏 |
-| 设备切换 | 热插拔麦克风 | 自动恢复 |
+## 六、UI 状态显示
+
+### 6.1 状态结构
+
+```rust
+// ====================
+// 修改: capture.rs 新增状态结构
+// ====================
+
+#[derive(Debug, Clone)]
+pub struct AdaptiveStatus {
+    pub scene_type: SceneType,
+    pub scene_name: String,
+    pub confidence: f32,
+    pub is_calibrating: bool,
+    pub features: SceneFeatures,
+    pub transition_progress: f32,
+}
+
+pub type SendAdaptiveStatus = Sender<AdaptiveStatus>;
+pub type RecvAdaptiveStatus = Receiver<AdaptiveStatus>;
+```
+
+### 6.2 UI 面板
+
+```rust
+// ====================
+// 修改: main.rs 新增自适应状态面板
+// ====================
+
+impl SpecView {
+    fn create_adaptive_panel(&self) -> Element<'_, Message> {
+        // 场景指示器
+        let scene_indicator = {
+            let (icon, color) = match self.adaptive_status.scene_type {
+                SceneType::Unknown => ("🔄", Color::from_rgb(0.5, 0.5, 0.5)),
+                SceneType::Quiet => ("🤫", Color::from_rgb(0.3, 0.7, 0.3)),
+                SceneType::MeetingRoom => ("🚪", Color::from_rgb(0.3, 0.5, 0.8)),
+                SceneType::OpenOffice => ("🏢", Color::from_rgb(0.8, 0.6, 0.2)),
+                SceneType::Noisy => ("📢", Color::from_rgb(0.8, 0.3, 0.3)),
+            };
+            
+            row![
+                text(icon).size(24),
+                text(&self.adaptive_status.scene_name).size(16).style(color),
+                text(format!("({:.0}%)", self.adaptive_status.confidence * 100.0))
+                    .size(12)
+                    .style(Color::from_rgb(0.5, 0.5, 0.5)),
+            ]
+            .spacing(8)
+            .align_items(Alignment::Center)
+        };
+        
+        // 校准状态
+        let calibration_status = if self.adaptive_status.is_calibrating {
+            row![
+                text("🔄").size(14),
+                text("正在校准环境...").size(14),
+                // 进度条可以加在这里
+            ]
+            .spacing(8)
+        } else {
+            row![
+                text("✓").size(14).style(Color::from_rgb(0.3, 0.7, 0.3)),
+                text("环境已识别").size(14),
+            ]
+            .spacing(8)
+        };
+        
+        // 过渡进度（仅在切换时显示）
+        let transition_indicator = if self.adaptive_status.transition_progress < 1.0 
+            && self.adaptive_status.transition_progress > 0.0 
+        {
+            row![
+                text("切换中").size(12),
+                text(format!("{:.0}%", self.adaptive_status.transition_progress * 100.0))
+                    .size(12),
+            ]
+            .spacing(4)
+        } else {
+            row![]
+        };
+        
+        // 特征显示（可折叠）
+        let features_panel = if self.show_adaptive_features {
+            let f = &self.adaptive_status.features;
+            column![
+                text("环境特征").size(14),
+                row![
+                    text("噪底:").size(12).width(80),
+                    text(format!("{:.1} dB", f.noise_floor_db)).size(12),
+                ],
+                row![
+                    text("混响:").size(12).width(80),
+                    text(format!("{:.0}%", f.reverb_amount * 100.0)).size(12),
+                ],
+                row![
+                    text("背景人声:").size(12).width(80),
+                    text(format!("{:.0}%", f.voice_activity_ratio * 100.0)).size(12),
+                ],
+            ]
+            .spacing(4)
+        } else {
+            column![]
+        };
+        
+        // 控制按钮
+        let controls = row![
+            toggler(
+                Some("自适应模式".to_string()),
+                self.adaptive_enabled,
+                Message::AdaptiveEnabledChanged,
+            ),
+            button("重新校准").on_press(Message::AdaptiveRecalibrate),
+            button(if self.show_adaptive_features { "隐藏详情" } else { "显示详情" })
+                .on_press(Message::ToggleAdaptiveFeatures),
+        ]
+        .spacing(12)
+        .align_items(Alignment::Center);
+        
+        container(
+            column![
+                text("场景自适应").size(16),
+                scene_indicator,
+                calibration_status,
+                transition_indicator,
+                features_panel,
+                controls,
+            ]
+            .spacing(10)
+        )
+        .padding(12)
+        .style(iced::theme::Container::Box)
+        .into()
+    }
+}
+```
 
 ---
 
-## 九、风险与缓解
+## 七、配置持久化
 
-| 风险 | 可能性 | 影响 | 缓解措施 |
-|------|--------|------|---------|
-| DeepFilter 延迟不可控 | 高 | 高 | 保持 DF 帧大小不变，仅优化周边 |
-| 校准期间用户说话 | 中 | 中 | 增加 VAD 检测，提示用户保持安静 |
-| 架构重构引入 bug | 中 | 高 | 渐进式重构，保留旧代码作为回退 |
-| 不同平台表现差异 | 中 | 中 | 增加平台特定测试，尤其是 Windows |
+### 7.1 扩展配置结构
+
+```json
+{
+  "version": 3,
+  
+  "_comment": "=== 自适应模式配置 ===",
+  "adaptive": {
+    "enabled": true,
+    "auto_calibrate_on_start": true,
+    "transition_duration_sec": 2.0,
+    "min_confidence_for_switch": 0.7,
+    "hold_duration_sec": 3.0,
+    
+    "user_overrides": {
+      "df_atten_lim": null,
+      "highpass_cutoff": null,
+      "spatial_sensitivity": null,
+      "eq_mix": null,
+      "agc_target": null
+    },
+    
+    "scene_customization": {
+      "OpenOffice": {
+        "df_atten_lim_offset": 0,
+        "spatial_sensitivity_offset": 0
+      },
+      "MeetingRoom": {
+        "df_atten_lim_offset": 0,
+        "spatial_sensitivity_offset": 0
+      }
+    }
+  }
+}
+```
 
 ---
 
-## 十、后续扩展建议
+## 八、测试场景
 
-1. **多通道支持**：当前仅支持单声道，可扩展为立体声处理
-2. **GPU 加速**：频谱分析和 EQ 计算可迁移到 GPU
-3. **模型热更新**：支持运行时切换 DeepFilter 模型
-4. **远程监控**：增加 WebSocket 接口，支持远程查看处理状态
-5. **A/B 测试框架**：便于对比不同参数配置效果
+### 8.1 场景识别测试
+
+| 测试 | 步骤 | 预期 |
+|------|------|------|
+| 启动校准 | 在安静环境启动 | 3秒内完成校准，识别为 Quiet/MeetingRoom |
+| 进入办公区 | 从会议室走到工位 | 5-10秒内识别切换，参数渐变 |
+| 返回会议室 | 从工位进入会议室 | 5-10秒内识别切换 |
+| 突发噪声 | 短暂喧哗（<3秒） | 不触发场景切换 |
+| 持续噪声 | 持续嘈杂（>5秒） | 切换到 Noisy 预设 |
+
+### 8.2 音质测试
+
+| 场景 | 测试 | 通过标准 |
+|------|------|---------|
+| 开放办公 | 自己清晰说话 | 对方听到清晰语音，背景人声抑制 |
+| 开放办公 | 周围人大声说话 | 干扰明显减弱，不影响理解 |
+| 会议室 | 正常说话 | 无明显处理痕迹，自然 |
+| 会议室 | 有混响 | 混响减少，声音干净 |
+| 切换过程 | 走动中说话 | 无明显音质跳变 |
 
 ---
 
-## 附录：关键代码修改清单
+## 九、文件清单
 
-| 文件 | 修改类型 | 说明 |
-|------|---------|------|
-| `capture.rs` | 重构 | 拆分 worker 函数，集成 AudioBus |
-| `audio/mod.rs` | 修改 | 增加新模块导出 |
-| `audio/agc.rs` | 修改 | 实现 AudioProcessor trait，移除内部限幅 |
-| `audio/highpass.rs` | 修改 | 实现 AudioProcessor trait |
-| `audio/transient_shaper.rs` | 修改 | 实现 AudioProcessor trait |
-| `audio/saturation.rs` | 修改 | 实现 AudioProcessor trait |
-| `audio/eq/dynamic_eq.rs` | 修改 | 实现 AudioProcessor trait，移除内部限幅 |
-| `audio/bus/*` | 新增 | 音频总线架构 |
-| `audio/calibration.rs` | 新增 | 校准系统 |
-| `audio/adaptive.rs` | 新增 | 运行时自适应 |
-| `audio/latency.rs` | 新增 | 延迟管理 |
-| `audio/recording.rs` | 新增 | 流式录音 |
+| 文件 | 状态 | 说明 |
+|------|------|------|
+| `audio/adaptive/mod.rs` | 新增 | 自适应模块入口 |
+| `audio/adaptive/scene_analyzer.rs` | 新增 | 场景分析器 |
+| `audio/adaptive/scene_presets.rs` | 新增 | 场景参数预设 |
+| `audio/adaptive/parameter_scheduler.rs` | 新增 | 参数调度器 |
+| `audio/adaptive/reverb_estimator.rs` | 新增 | 混响估计 |
+| `audio/adaptive/voice_detector.rs` | 新增 | 背景人声检测 |
+| `audio/adaptive/spectrum_analyzer.rs` | 新增 | 频谱分析 |
+| `audio/processors/noise_gate.rs` | 新增 | 噪声门 |
+| `audio/processors/spatial_filter.rs` | 新增 | 空间滤波 |
+| `audio/processors/voice_isolator.rs` | 新增 | 语音隔离 |
+| `audio/processors/spectral_gate.rs` | 新增 | 频谱门限 |
+| `capture.rs` | 修改 | 集成自适应处理 |
+| `main.rs` | 修改 | UI 面板 |
+
+---
+
+## 十、实施建议
+
+### 10.1 分阶段实施
+
+| 阶段 | 内容 | 优先级 | 说明 |
+|------|------|--------|------|
+| **Phase 1** | SceneAnalyzer + 基础分类 | P0 | 实现场景识别核心 |
+| **Phase 2** | NoiseGate + SpatialFilter | P0 | 基础增强模块 |
+| **Phase 3** | ParameterScheduler + 平滑过渡 | P0 | 参数自动调整 |
+| **Phase 4** | VoiceIsolator | P1 | 竞争人声抑制 |
+| **Phase 5** | SpectralGate | P2 | 精细频域处理 |
+| **Phase 6** | UI + 配置持久化 | P1 | 用户交互 |
+
+### 10.2 关键指标
+
+| 指标 | 目标 |
+|------|------|
+| 场景识别准确率 | > 90% |
+| 场景切换延迟 | < 5 秒 |
+| 参数过渡时间 | 2 秒 |
+| 误切换率 | < 5% |
+| CPU 新增开销 | < 15% |
 
 ---
 
 **文档结束**
 
-如有问题请联系音频架构组讨论。
+此方案确保用户在开放办公区与会议室之间切换时，系统自动识别环境并调整参数，无需手动干预。如有问题请联系音频架构组讨论。

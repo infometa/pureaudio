@@ -758,7 +758,7 @@ fn get_worker_fn(
         let mut df_mix = 1.0f32;
         let mut headroom_gain = 0.9f32;
         let mut post_trim_gain = 1.0f32;
-        // 自适应环境/设备状态
+        // 自适应环境/设备状态（默认关闭，通过 UI 控制开启）
         let mut env_class = EnvClass::Quiet;
         let mut smoothed_energy = -80.0f32;
         let mut smoothed_flatness = 0.0f32;
@@ -769,6 +769,12 @@ fn get_worker_fn(
         let mut target_df_mix = 0.9f32;
         let mut target_hp = 60.0f32;
         let mut target_eq_mix = 0.8f32;
+        let mut target_exciter_mix = exciter.mix();
+        // 柔和模式用于外部 ANC/极静环境，降低降噪力度并补高频
+        let mut soft_mode = false;
+        // 滞后计数，避免频繁切换
+        let mut soft_mode_hold = 0usize;
+        const SOFT_MODE_HOLD_FRAMES: usize = 160; // 约 2s（取决于 hop）
         let mut _auto_gain_scale = 1.0f32;
         has_init.store(true, Ordering::Relaxed);
         log::info!("Worker init");
@@ -903,16 +909,45 @@ fn get_worker_fn(
                 if let Some(buf) = inframe.as_slice() {
                     let rms = df::rms(buf.iter());
                     let rms_db = 20.0 * rms.max(1e-9).log10();
-                    const NOISE_ONLY_DB: f32 = -35.0; // 仅在低语音电平时更新环境
+                    // 仅在低语音电平时更新环境特征
+                    const NOISE_ONLY_DB: f32 = -35.0;
                     if rms_db < NOISE_ONLY_DB {
                         // 环境噪声特征估计与自适应参数
                         let feats = compute_noise_features(df.get_spec_noisy());
                         smoothed_energy = smooth_value(smoothed_energy, feats.energy_db, 0.1);
-                        smoothed_flatness = smooth_value(smoothed_flatness, feats.spectral_flatness, 0.1);
-                        smoothed_centroid = smooth_value(smoothed_centroid, feats.spectral_centroid, 0.1);
+                        smoothed_flatness =
+                            smooth_value(smoothed_flatness, feats.spectral_flatness, 0.1);
+                        smoothed_centroid =
+                            smooth_value(smoothed_centroid, feats.spectral_centroid, 0.1);
+
+                        // 检测“极静/外部 ANC”触发柔和模式：极低能量 + 低频谱重心
+                        let soft_candidate = smoothed_energy < -60.0 && smoothed_centroid < -15.0;
+                        if soft_candidate {
+                            soft_mode_hold = soft_mode_hold.saturating_add(1);
+                        } else {
+                            soft_mode_hold = soft_mode_hold.saturating_sub(soft_mode_hold.min(1));
+                        }
+                        if soft_mode_hold > SOFT_MODE_HOLD_FRAMES {
+                            soft_mode = true;
+                        } else if soft_mode_hold == 0 {
+                            soft_mode = false;
+                        }
+
                         let target_env = classify_env(smoothed_energy, smoothed_flatness, smoothed_centroid);
                         if target_env != env_class {
                             env_class = target_env;
+                        }
+
+                        if soft_mode {
+                            // 柔和模式：降低降噪力度、补高频、旁路重处理
+                            target_atten = 24.0;
+                            target_min_thresh = -58.0;
+                            target_max_thresh = 12.0;
+                            target_df_mix = 0.9;
+                            target_hp = 60.0;
+                            target_eq_mix = 0.6;
+                            target_exciter_mix = 0.2;
+                        } else {
                             match env_class {
                                 EnvClass::Quiet => {
                                     target_atten = 28.0;
@@ -921,14 +956,16 @@ fn get_worker_fn(
                                     target_df_mix = 0.9;
                                     target_hp = 60.0;
                                     target_eq_mix = 0.8;
+                                    target_exciter_mix = 0.25;
                                 }
                                 EnvClass::Office => {
-                                    target_atten = 42.0;
+                                    target_atten = 40.0;
                                     target_min_thresh = -52.0;
                                     target_max_thresh = 12.0;
-                                    target_df_mix = 0.98;
-                                    target_hp = 90.0;
+                                    target_df_mix = 0.95;
+                                    target_hp = 80.0;
                                     target_eq_mix = 0.85;
+                                    target_exciter_mix = 0.25;
                                 }
                                 EnvClass::Noisy => {
                                     target_atten = 55.0;
@@ -937,10 +974,12 @@ fn get_worker_fn(
                                     target_df_mix = 1.0;
                                     target_hp = 110.0;
                                     target_eq_mix = 0.9;
+                                    target_exciter_mix = 0.3;
                                 }
                             }
                         }
-                        // 平滑应用参数（加快收敛）
+
+                        // 平滑应用参数
                         df_mix = smooth_value(df_mix, target_df_mix, 0.1).clamp(0.0, 1.0);
                         let current_atten = df.atten_lim.unwrap_or(target_atten);
                         let new_atten = smooth_value(current_atten, target_atten, 0.1);
@@ -951,6 +990,9 @@ fn get_worker_fn(
                         highpass_cutoff = smooth_value(highpass_cutoff, target_hp, 0.1);
                         highpass.set_cutoff(highpass_cutoff);
                         dynamic_eq.set_dry_wet(smooth_value(dynamic_eq.dry_wet(), target_eq_mix, 0.1));
+                        exciter.set_mix(
+                            smooth_value(exciter.mix(), target_exciter_mix, 0.1).clamp(0.0, 0.35),
+                        );
                     }
                 }
             }
@@ -1159,35 +1201,33 @@ fn get_worker_fn(
             }
         if !mute_playback {
             if let Some((ref mut r, ref mut buf)) = output_resampler.as_mut() {
-                    // 仅首次重采样时清零缓冲，避免未初始化数据脉冲
-                    if !output_resampler_cleared {
-                        for frame in buf.iter_mut() {
-                            for sample in frame.iter_mut() {
-                                *sample = 0.0;
-                            }
-                        }
-                        output_resampler_cleared = true;
-                    }
-                    if let Err(err) = r.process_into_buffer(&[outframe.as_slice().unwrap()], buf, None) {
-                        log::error!("输出重采样失败: {:?}", err);
-                    } else {
-                        if warmup_blocks > 0 {
-                            warmup_blocks = warmup_blocks.saturating_sub(1);
-                        } else {
-                            push_output_block(&should_stop, &mut rb_out, &buf[0][..n_out], n_out);
+                // 仅首次重采样时清零缓冲，避免未初始化数据脉冲
+                if !output_resampler_cleared {
+                    for frame in buf.iter_mut() {
+                        for sample in frame.iter_mut() {
+                            *sample = 0.0;
                         }
                     }
-                } else if let Some(buf) = outframe.as_slice() {
-                    if warmup_blocks > 0 {
-                        warmup_blocks = warmup_blocks.saturating_sub(1);
-                    } else {
-                        let temp = buf[..n_out].to_vec();
-                        push_output_block(&should_stop, &mut rb_out, &temp[..], n_out);
-                    }
-                } else {
-                    log::error!("输出帧内存布局异常，跳过输出");
+                    output_resampler_cleared = true;
                 }
+                if let Err(err) = r.process_into_buffer(&[outframe.as_slice().unwrap()], buf, None) {
+                    log::error!("输出重采样失败: {:?}", err);
+                } else if warmup_blocks > 0 {
+                    warmup_blocks = warmup_blocks.saturating_sub(1);
+                } else {
+                    push_output_block(&should_stop, &mut rb_out, &buf[0][..n_out], n_out);
+                }
+            } else if let Some(buf) = outframe.as_slice() {
+                if warmup_blocks > 0 {
+                    warmup_blocks = warmup_blocks.saturating_sub(1);
+                } else {
+                    let temp = buf[..n_out].to_vec();
+                    push_output_block(&should_stop, &mut rb_out, &temp[..], n_out);
+                }
+            } else {
+                log::error!("输出帧内存布局异常，跳过输出");
             }
+        }
             if let Some(sender) = s_lsnr.as_ref() {
                 if let Err(err) = sender.send(lsnr) {
                     log::warn!("Failed to send LSNR value: {}", err);

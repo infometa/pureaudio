@@ -30,6 +30,10 @@ impl HarmonicExciter {
         self.mix = mix.clamp(0.0, 1.0);
     }
 
+    pub fn mix(&self) -> f32 {
+        self.mix
+    }
+
     pub fn process(&mut self, samples: &mut [f32]) {
         if samples.is_empty() || self.mix <= 0.0 {
             return;

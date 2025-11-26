@@ -15,7 +15,7 @@ use hound;
 use iced::widget::tooltip::{self, Position};
 use iced::widget::{
     self, column, container, image, pick_list, row, scrollable, slider, text, toggler, Container,
-    Image,
+    Image, text_input,
 };
 use iced::{
     alignment, executor, Alignment, Application, Color, Command, ContentFit, Element, Font, Length,
@@ -2607,16 +2607,26 @@ impl SpecView {
         tooltip_text: &'static str,
     ) -> Element<'_, Message>
     where
-        F: 'static + Fn(f32) -> Message,
+        F: 'static + Copy + Fn(f32) -> Message,
         G: Fn(f32) -> String,
     {
+        let on_input = move |s: String| {
+            if let Ok(parsed) = s.parse::<f32>() {
+                let clamped = parsed.clamp(min, max);
+                on_change(clamped)
+            } else {
+                Message::None
+            }
+        };
         let row_element = row![
             text(label).size(13).width(110),
             slider(min..=max, value, on_change).step(step).width(Length::Fill),
-            text(formatter(value))
+            text_input("", &formatter(value))
+                .on_input(on_input)
+                .on_submit(Message::None)
+                .padding(6)
                 .size(13)
-                .width(90)
-                .horizontal_alignment(alignment::Horizontal::Right),
+                .width(90),
         ]
         .spacing(8)
         .align_items(Alignment::Center);
@@ -2630,7 +2640,7 @@ fn slider_view<'a>(
     value: f32,
     min: f32,
     max: f32,
-    message: impl Fn(f32) -> Message + 'a,
+    message: impl Fn(f32) -> Message + Copy + 'a,
     width: u16,
     precision: usize,
     step: f32,
@@ -2642,15 +2652,25 @@ fn slider_view<'a>(
     } else {
         slider_widget.into()
     };
+    let on_input = move |s: String| {
+        if let Ok(parsed) = s.parse::<f32>() {
+            let clamped = parsed.clamp(min, max);
+            message(clamped)
+        } else {
+            Message::None
+        }
+    };
+    let input = text_input("", &format!("{:.precision$}", value))
+        .on_input(on_input)
+        .on_submit(Message::None)
+        .padding(6)
+        .size(16)
+        .width(90);
     column![
         text(title).size(18).width(Length::Fill),
         row![
             container(slider_element).width(Length::Fill),
-            text(format!("{:.precision$}", value))
-                .size(18)
-                .width(100)
-                .horizontal_alignment(alignment::Horizontal::Right)
-                .vertical_alignment(alignment::Vertical::Top),
+            input,
         ]
     ]
     .max_width(width)
@@ -2762,7 +2782,7 @@ fn kill_pid(pid: u32) {
 fn kill_pid(_pid: u32) {}
 
 fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), String> {
-    let mut data: Vec<f32> = samples.to_vec();
+    let data: Vec<f32> = samples.to_vec();
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
