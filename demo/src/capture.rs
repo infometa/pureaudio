@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::audio::agc::AutoGainControl;
 use crate::audio::eq::{DynamicEq, EqControl, EqPresetKind, MAX_EQ_BANDS};
+use crate::audio::exciter::HarmonicExciter;
 use crate::audio::highpass::HighpassFilter;
 use crate::audio::saturation::Saturation;
 use crate::audio::transient_shaper::TransientShaper;
@@ -739,6 +740,7 @@ fn get_worker_fn(
             .expect("Failed to run DeepFilterNet");
         let mut dynamic_eq = DynamicEq::new(df.sr as f32, EqPresetKind::default());
         let mut highpass = HighpassFilter::new(df.sr as f32);
+        let mut exciter = HarmonicExciter::new(df.sr as f32, 7500.0, 1.6, 0.25);
         let mut transient_shaper = TransientShaper::new(df.sr as f32);
         let mut saturation = Saturation::new();
         let mut agc = AutoGainControl::new(df.sr as f32);
@@ -1005,6 +1007,10 @@ fn get_worker_fn(
                     if let Some(buffer) = outframe.as_slice_mut() {
                         saturation.process(buffer);
                     }
+                }
+                // Add gentle harmonic excitation to restore air/brightness
+                if let Some(buffer) = outframe.as_slice_mut() {
+                    exciter.process(buffer);
                 }
                 let metrics = {
                     let buffer = outframe.as_slice_mut().expect("Output frame should be contiguous");

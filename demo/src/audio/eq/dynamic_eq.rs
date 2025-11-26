@@ -1,8 +1,9 @@
 use super::dynamic_band::{BandMode, DynamicBand, FilterKind};
 use super::presets::{EqPresetKind, MAX_EQ_BANDS};
 
-const SOFT_LIMIT_THRESHOLD: f32 = 0.9;
-const SOFT_LIMIT_CEILING: f32 = 0.98;
+// Soft limiter is kept only as a last resort inside EQ; set higher to avoid unnecessary compression
+const SOFT_LIMIT_THRESHOLD: f32 = 0.97;
+const SOFT_LIMIT_CEILING: f32 = 0.995;
 
 #[derive(Debug, Clone)]
 pub enum EqControl {
