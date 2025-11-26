@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BBox 标注查看器</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            background-color: #f0f0f0;
+            display: flex;
+            justify-content: center;
+            padding: 20px;
+        }
+        #container {
+            position: relative;
+            display: inline-block;
+            background-color: white;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        #main-image {
+            display: block;
+            max-width: 100%;
+            height: auto;
+        }
+        .bbox {
+            position: absolute;
+            border: 2px solid red;
+            background-color: rgba(255, 0, 0, 0.1);
+            box-sizing: border-box;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .bbox:hover {
+            border-color: blue;
+            background-color: rgba(0, 0, 255, 0.1);
+            z-index: 10;
+        }
+        .label-tag {
+            position: absolute;
+            top: -18px;
+            left: -2px;
+            background-color: red;
+            color: white;
+            padding: 1px 4px;
+            font-size: 12px;
+            border-radius: 2px;
+            font-weight: bold;
+            white-space: nowrap;
+        }
+        .bbox:hover .label-tag {
+            background-color: blue;
+        }
+        .controls {
+            margin-bottom: 15px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div>
+        <div class="controls">
+            <h3>部件编号标注可视化</h3>
+            <p style="color: #666; font-size: 0.9em;">请确保图片名为 <strong>2.png</strong> 且与此文件在同一目录</p>
+        </div>
+        <div id="container">
+            <img id="main-image" src="2.png" alt="Exploded View Diagram">
+        </div>
+    </div>
+<script>
+    const bboxData = [
+      {"box": [49, 70, 105, 105], "label": "1"},
+      {"box": [17, 152, 40, 173], "label": "2"},
+      {"box": [60, 154, 87, 174], "label": "3"},
+      {"box": [135, 166, 163, 188], "label": "4"},
+      {"box": [180, 162, 203, 182], "label": "5"},
+      {"box": [203, 163, 224, 182], "label": "6"},
+      {"box": [225, 162, 243, 180], "label": "7"},
+      {"box": [245, 161, 263, 180], "label": "8"},
+      {"box": [265, 161, 283, 180], "label": "9"},
+      {"box": [286, 162, 304, 185], "label": "10"},
+      {"box": [307, 162, 325, 185], "label": "11"},
+      {"box": [328, 164, 346, 188], "label": "12"},
+      {"box": [350, 168, 372, 192], "label": "13"},
+      {"box": [367, 180, 387, 204], "label": "14"},
+      {"box": [290, 268, 310, 290], "label": "15"},
+      {"box": [314, 273, 335, 296], "label": "16"},
+      {"box": [339, 275, 360, 298], "label": "17"},
+      {"box": [94, 447, 116, 470], "label": "18"},
+      {"box": [91, 490, 115, 512], "label": "19"},
+      {"box": [556, 103, 577, 125], "label": "20"},
+      {"box": [560, 158, 580, 180], "label": "21"},
+      {"box": [560, 215, 580, 240], "label": "22"},
+      {"box": [560, 260, 580, 283], "label": "23"},
+      {"box": [454, 263, 474, 285], "label": "24"},
+      {"box": [500, 294, 520, 315], "label": "25"},
+      {"box": [515, 363, 535, 385], "label": "26"},
+      {"box": [496, 387, 517, 409], "label": "27"},
+      {"box": [503, 500, 524, 525], "label": "28"},
+      {"box": [472, 525, 493, 547], "label": "29"},
+      {"box": [480, 558, 500, 580], "label": "30"},
+      {"box": [468, 700, 488, 723], "label": "31"},
+      {"box_2d": [436, 804, 456, 827], "label": "label": "32"},
+      {"box": [434, 874, 454, 897], "label": "label": "33"},
+      {"box": [527, 680, 547, 703], "label": "label": "34"},
+      {"box": [564, 695, 584, 718], "label": "label": "35"},
+      {"box": [602, 700, 622, 720], "label": "label": "36"},
+      {"box_2d": [633, 712, 654, 733], "label": "label": "37"},
+      {"box_2d": [676, 702, 696, 722], "label": "label": "38"},
+      {"box_2d": [705, 720, 726, 742], "label": "label": "39"},
+      {"box_2d": [688, 614, 709, 636], "label": "label": "40"},
+      {"box_2d": [780, 633, 800, 655], "label": "label": "41"},
+      {"box_2d": [885, 513, 904, 535], "label": "label": "42"},
+      {"box_2d": [906, 530, 925, 551], "label": "label": "43"},
+      {"box_2d": [937, 530, 957, 550], "label": "label": "44"},
+      {"box_2d": [948, 496, 967, 517], "label": "label": "45"},
+      {"box_2d": [937, 478, 956, 496], "label": "label": "46"},
+      {"box_2d": [894, 462, 912, 482], "label": "label": "47"},
+      {"box_2d": [758, 180, 779, 205], "label": "label": "48"},
+      {"box_2d": [698, 182, 718, 205], "label": "label": "49"},
+      {"box_2d": [658, 266, 679, 290], "label": "label": "50"},
+      {"box_2d": [624, 265, 645, 290], "label": "label": "51"},
+      {"box_2d": [872, 161, 893, 183], "label": "label": "52"}
+    ];
+
+    const container = document.getElementById('container');
+    function renderBBoxes() {
+        bboxData.forEach(item => {
+            const [ymin, xmin, ymax, xmax] = item.box;
+            const div = document.createElement('div');
+            div.className = 'bbox';
+            div.style.top = ymin + 'px';
+            div.style.left = xmin + 'px';
+            div.style.width = (xmax - xmin) + 'px';
+            div.style.height = (ymax - ymin) + 'px';
+            const label = document.createElement('span');
+            label.className = 'label-tag';
+            label.innerText = item.label;
+            div.appendChild(label);
+            container.appendChild(div);
+        });
+    }
+    window.onload = renderBBoxes;
+</script>
+</body>
+</html>
