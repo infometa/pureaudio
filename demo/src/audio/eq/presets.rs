@@ -19,10 +19,11 @@ pub enum EqPresetKind {
     GeneralVoice,
     Podcast,
     Meeting,
+    Restoration,
 }
 
 impl EqPresetKind {
-    pub const fn all() -> [Self; 7] {
+    pub const fn all() -> [Self; 8] {
         [
             Self::Broadcast,
             Self::BroadcastSoft,
@@ -31,6 +32,7 @@ impl EqPresetKind {
             Self::GeneralVoice,
             Self::Podcast,
             Self::Meeting,
+            Self::Restoration,
         ]
     }
 
@@ -43,6 +45,7 @@ impl EqPresetKind {
             EqPresetKind::GeneralVoice => &GENERAL_VOICE,
             EqPresetKind::Podcast => &PODCAST,
             EqPresetKind::Meeting => &MEETING,
+            EqPresetKind::Restoration => &RESTORATION,
         }
     }
 
@@ -63,18 +66,30 @@ impl EqPresetKind {
             EqPresetKind::GeneralVoice => "平衡的参数，适合大多数场景",
             EqPresetKind::Podcast => "更强齿音控制，高频延展更亮，久听不累",
             EqPresetKind::Meeting => "最强齿音控制，语音聚焦，强调可懂度",
+            EqPresetKind::Restoration => "音色还原：补足存在感与空气感，轻削低频浑浊。",
         }
     }
 
     pub fn tooltip_text(self) -> &'static str {
         match self {
-            EqPresetKind::Broadcast => "播音级：80/180 提升厚度，3.5k 与 8k 提升清晰与空气，450Hz 动态去浑浊。",
-            EqPresetKind::BroadcastSoft => "播音级（柔和）：高频/存在提升减半，低频更平衡，长时间聆听更舒适。",
-            EqPresetKind::OpenOffice => "开放办公：100/200 提厚，450 压浑浊，3.5k/8k 提亮，强调隔离。",
-            EqPresetKind::ConferenceHall => "会议室去混响：80/180 提基座，350 强切驻波，8k 提空气，模拟近讲。",
+            EqPresetKind::Broadcast => {
+                "播音级：80/180 提升厚度，3.5k 与 8k 提升清晰与空气，450Hz 动态去浑浊。"
+            }
+            EqPresetKind::BroadcastSoft => {
+                "播音级（柔和）：高频/存在提升减半，低频更平衡，长时间聆听更舒适。"
+            }
+            EqPresetKind::OpenOffice => {
+                "开放办公：100/200 提厚，450 压浑浊，3.5k/8k 提亮，强调隔离。"
+            }
+            EqPresetKind::ConferenceHall => {
+                "会议室去混响：80/180 提基座，350 强切驻波，8k 提空气，模拟近讲。"
+            }
             EqPresetKind::GeneralVoice => "通用语音增强：平衡的参数，适合大多数场景。",
             EqPresetKind::Podcast => "播客优化：更强齿音控制(5.5:1)，高频更亮，长时间收听也不累。",
             EqPresetKind::Meeting => "会议清晰化：最强齿音控制(5.8:1)，语音更聚焦。",
+            EqPresetKind::Restoration => {
+                "音色还原：100 下行收低频、3k/5.5k 上行补存在感，高搁架补 10k+ 空气。"
+            }
         }
     }
 }
@@ -169,6 +184,88 @@ const GENERAL_VOICE: EqPreset = EqPreset {
             filter: FilterKind::HighShelf,
             makeup_db: 0.0,
             static_gain_db: 0.5,
+        },
+    ],
+};
+
+const RESTORATION: EqPreset = EqPreset {
+    name: "音色还原",
+    default_mix: 0.65,
+    bands: [
+        BandSettings {
+            label: "低频控制",
+            frequency_hz: 100.0,
+            q: 0.8,
+            detector_q: 0.6,
+            threshold_db: -34.0,
+            ratio: 3.0,
+            max_gain_db: 10.0,
+            attack_ms: 28.0,
+            release_ms: 240.0,
+            mode: BandMode::Downward,
+            filter: FilterKind::LowShelf,
+            makeup_db: 0.0,
+            static_gain_db: -1.0,
+        },
+        BandSettings {
+            label: "温暖度",
+            frequency_hz: 200.0,
+            q: 1.0,
+            detector_q: 1.0,
+            threshold_db: -40.0,
+            ratio: 1.6,
+            max_gain_db: 6.0,
+            attack_ms: 25.0,
+            release_ms: 200.0,
+            mode: BandMode::Upward,
+            filter: FilterKind::Peak,
+            makeup_db: 0.0,
+            static_gain_db: 1.0,
+        },
+        BandSettings {
+            label: "存在感",
+            frequency_hz: 3000.0,
+            q: 1.0,
+            detector_q: 1.0,
+            threshold_db: -36.0,
+            ratio: 2.0,
+            max_gain_db: 7.0,
+            attack_ms: 18.0,
+            release_ms: 120.0,
+            mode: BandMode::Upward,
+            filter: FilterKind::Peak,
+            makeup_db: 0.0,
+            static_gain_db: 2.5,
+        },
+        BandSettings {
+            label: "清晰度",
+            frequency_hz: 5500.0,
+            q: 1.1,
+            detector_q: 1.2,
+            threshold_db: -32.0,
+            ratio: 2.2,
+            max_gain_db: 6.0,
+            attack_ms: 14.0,
+            release_ms: 100.0,
+            mode: BandMode::Upward,
+            filter: FilterKind::Peak,
+            makeup_db: 0.0,
+            static_gain_db: 2.0,
+        },
+        BandSettings {
+            label: "空气感",
+            frequency_hz: 10000.0,
+            q: 0.7,
+            detector_q: 0.7,
+            threshold_db: -38.0,
+            ratio: 1.8,
+            max_gain_db: 8.0,
+            attack_ms: 35.0,
+            release_ms: 260.0,
+            mode: BandMode::Upward,
+            filter: FilterKind::HighShelf,
+            makeup_db: 0.0,
+            static_gain_db: 3.5,
         },
     ],
 };

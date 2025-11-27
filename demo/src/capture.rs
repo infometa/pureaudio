@@ -2,8 +2,8 @@ use std::env;
 use std::fmt::Display;
 use std::io::{self, stdout, Write};
 use std::mem::MaybeUninit;
-use std::process::Command;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, Once,
@@ -16,6 +16,8 @@ use crate::audio::eq::{DynamicEq, EqControl, EqPresetKind, MAX_EQ_BANDS};
 use crate::audio::exciter::HarmonicExciter;
 use crate::audio::highpass::HighpassFilter;
 use crate::audio::saturation::Saturation;
+use crate::audio::spectral_tilt::SpectralTiltCompensator;
+use crate::audio::stft_eq::StftStaticEq;
 use crate::audio::transient_shaper::TransientShaper;
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -283,6 +285,10 @@ pub enum ControlMessage {
     EnvAutoEnabled(bool),
     ExciterEnabled(bool),
     ExciterMix(f32),
+    StftEqEnabled(bool),
+    StftEqHfGain(f32),
+    StftEqAirGain(f32),
+    StftEqTilt(f32),
 }
 
 pub fn model_dimensions(model_path: Option<PathBuf>, _channels: usize) -> (usize, usize, usize) {
@@ -347,23 +353,22 @@ fn get_stream_config(
         return Err(anyhow!("No suitable audio {} config found", direction));
     }
     let sr = SampleRate(sample_rate);
-    let select_with_format =
-        |format: cpal::SampleFormat| -> Option<StreamSelection> {
-            for c in configs.iter() {
-                if c.sample_format() != format {
-                    continue;
-                }
-                if sr >= c.min_sample_rate() && sr <= c.max_sample_rate() {
-                    let mut cfg: StreamConfig = (*c).with_sample_rate(sr).into();
-                    cfg.buffer_size = BufferSize::Fixed(frame_size as u32);
-                    return Some(StreamSelection {
-                        config: cfg,
-                        format,
-                    });
-                }
+    let select_with_format = |format: cpal::SampleFormat| -> Option<StreamSelection> {
+        for c in configs.iter() {
+            if c.sample_format() != format {
+                continue;
             }
-            None
-        };
+            if sr >= c.min_sample_rate() && sr <= c.max_sample_rate() {
+                let mut cfg: StreamConfig = (*c).with_sample_rate(sr).into();
+                cfg.buffer_size = BufferSize::Fixed(frame_size as u32);
+                return Some(StreamSelection {
+                    config: cfg,
+                    format,
+                });
+            }
+        }
+        None
+    };
     for format in [
         cpal::SampleFormat::F32,
         cpal::SampleFormat::I16,
@@ -598,14 +603,13 @@ impl AudioSource {
                 }
             }
         }
-        let selection =
-            get_stream_config(&device, sample_rate, StreamDirection::Input, frame_size)
-                .with_context(|| {
-                    format!(
-                        "No suitable audio input config found for device {}",
-                        device.name().unwrap_or_else(|_| "unknown".into())
-                    )
-                })?;
+        let selection = get_stream_config(&device, sample_rate, StreamDirection::Input, frame_size)
+            .with_context(|| {
+                format!(
+                    "No suitable audio input config found for device {}",
+                    device.name().unwrap_or_else(|_| "unknown".into())
+                )
+            })?;
 
         Ok(Self {
             stream: None,
@@ -711,7 +715,13 @@ impl GuiCom {
         Option<SendEqStatus>,
         Option<SendEnvStatus>,
     ) {
-        (self.s_lsnr, self.s_spec, self.r_opt, self.s_eq_status, self.s_env_status)
+        (
+            self.s_lsnr,
+            self.s_spec,
+            self.r_opt,
+            self.s_eq_status,
+            self.s_env_status,
+        )
     }
 }
 
@@ -743,9 +753,11 @@ fn get_worker_fn(
             .expect("Failed to run DeepFilterNet");
         let mut dynamic_eq = DynamicEq::new(df.sr as f32, EqPresetKind::default());
         let mut highpass = HighpassFilter::new(df.sr as f32);
+        let mut stft_eq = StftStaticEq::new(df.sr);
         let mut exciter = HarmonicExciter::new(df.sr as f32, 7500.0, 1.6, 0.25);
         let mut transient_shaper = TransientShaper::new(df.sr as f32);
         let mut saturation = Saturation::new();
+        let mut spectral_tilt = SpectralTiltCompensator::new(df.sr as f32);
         let mut agc = AutoGainControl::new(df.sr as f32);
         let mut bus_limiter = BusLimiter::new(df.sr);
         // 更长淡入，避免启动瞬间脉冲
@@ -754,6 +766,11 @@ fn get_worker_fn(
         let mut highpass_enabled = true;
         let mut highpass_cutoff = 60.0f32;
         highpass.set_cutoff(highpass_cutoff);
+        let mut stft_enabled = true;
+        let mut stft_hf_gain = 2.0f32;
+        let mut stft_air_gain = 3.0f32;
+        let mut stft_tilt_gain = 0.0f32;
+        let mut stft_dirty = true;
         let mut transient_enabled = true;
         let mut saturation_enabled = true;
         let mut agc_enabled = true;
@@ -812,9 +829,8 @@ fn get_worker_fn(
         let input_retry_delay = Duration::from_micros(100);
         let input_timeout = Duration::from_millis(20);
         let mut auto_sys_volume = false;
-        let mut last_sys_adjust = Instant::now()
-            .checked_sub(Duration::from_secs(10))
-            .unwrap_or_else(Instant::now);
+        let mut last_sys_adjust =
+            Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now);
         let mut last_sys_restore = last_sys_adjust;
         let mut clip_counter = 0usize;
         let mut low_peak_counter = 0usize;
@@ -907,6 +923,9 @@ fn get_worker_fn(
                     highpass.process(buffer);
                 }
             }
+            if let Some(buffer) = inframe.as_slice() {
+                spectral_tilt.observe_input(buffer);
+            }
 
             let mut lsnr = 0.0;
             if bypass_enabled {
@@ -917,6 +936,20 @@ fn get_worker_fn(
                 lsnr = df
                     .process(inframe.view(), outframe.view_mut())
                     .expect("Failed to run DeepFilterNet");
+            }
+            if !bypass_enabled {
+                if stft_enabled {
+                    if stft_dirty {
+                        stft_eq.set_curve(stft_hf_gain, stft_air_gain, stft_tilt_gain, df.sr);
+                        stft_dirty = false;
+                    }
+                    if let Some(buf) = outframe.as_slice_mut() {
+                        stft_eq.process_block(buf);
+                    }
+                }
+                if let Some(buf) = outframe.as_slice_mut() {
+                    spectral_tilt.compensate(buf);
+                }
             }
             if env_auto_enabled && !bypass_enabled {
                 if let Some(buf) = inframe.as_slice() {
@@ -961,7 +994,8 @@ fn get_worker_fn(
                     }
                 }
 
-                let target_env = classify_env(smoothed_energy, smoothed_flatness, smoothed_centroid);
+                let target_env =
+                    classify_env(smoothed_energy, smoothed_flatness, smoothed_centroid);
                 if target_env != env_class {
                     env_class = target_env;
                 }
@@ -1018,9 +1052,8 @@ fn get_worker_fn(
                 highpass_cutoff = smooth_value(highpass_cutoff, target_hp, 0.1);
                 highpass.set_cutoff(highpass_cutoff);
                 dynamic_eq.set_dry_wet(smooth_value(dynamic_eq.dry_wet(), target_eq_mix, 0.1));
-                exciter.set_mix(
-                    smooth_value(exciter.mix(), target_exciter_mix, 0.1).clamp(0.0, 0.35),
-                );
+                exciter
+                    .set_mix(smooth_value(exciter.mix(), target_exciter_mix, 0.1).clamp(0.0, 0.35));
             }
             // 录音降噪输出
             if let Some(ref rec) = recording {
@@ -1030,16 +1063,17 @@ fn get_worker_fn(
             }
             // DF dry/wet 混合
             if df_mix < 0.9999 && !bypass_enabled {
-                if let (Some(wet), Some(dry)) =
-                    (outframe.as_slice_mut(), inframe.as_slice())
-                {
+                if let (Some(wet), Some(dry)) = (outframe.as_slice_mut(), inframe.as_slice()) {
                     for (w, d) in wet.iter_mut().zip(dry.iter()) {
                         *w = *w * df_mix + *d * (1.0 - df_mix);
                     }
                 }
             }
             let bypass_post = bypass_enabled
-                || (!dynamic_eq.is_enabled() && !transient_enabled && !saturation_enabled && !agc_enabled);
+                || (!dynamic_eq.is_enabled()
+                    && !transient_enabled
+                    && !saturation_enabled
+                    && !agc_enabled);
 
             if !bypass_post {
                 // 自适应峰值保护，防止 DF 输出直接过 0dBFS
@@ -1083,7 +1117,8 @@ fn get_worker_fn(
                     }
                 }
                 let metrics = {
-                    let buffer = outframe.as_slice_mut().expect("Output frame should be contiguous");
+                    let buffer =
+                        outframe.as_slice_mut().expect("Output frame should be contiguous");
                     dynamic_eq.process_block(buffer)
                 };
                 if post_trim_gain < 0.9999 {
@@ -1111,15 +1146,15 @@ fn get_worker_fn(
                     for v in buf.iter() {
                         peak_in = peak_in.max(v.abs());
                     }
-                    const RED_THRESH: f32 = 0.90;   // > -1 dBFS
-                    const DOWN_STEP: i8 = -4;       // 每次下调约4%
+                    const RED_THRESH: f32 = 0.90; // > -1 dBFS
+                    const DOWN_STEP: i8 = -4; // 每次下调约4%
                     const CLIP_FRAMES: usize = 1;
                     const COOLDOWN: Duration = Duration::from_millis(800);
                     const MIN_VOL: u8 = 50;
                     const MAX_VOL: u8 = 90;
-                    const BLUE_THRESH: f32 = 0.05;  // ~-26 dBFS，认为麦克风物理增益偏低
+                    const BLUE_THRESH: f32 = 0.05; // ~-26 dBFS，认为麦克风物理增益偏低
                     const RESTORE_COOLDOWN: Duration = Duration::from_secs(4);
-                    const RESTORE_FLOOR: u8 = 35;   // 不把系统音量降到监听不到的安全下限
+                    const RESTORE_FLOOR: u8 = 35; // 不把系统音量降到监听不到的安全下限
                     if peak_in > RED_THRESH {
                         clip_counter += 1;
                         low_peak_counter = 0;
@@ -1227,35 +1262,37 @@ fn get_worker_fn(
                     rec.append_processed(buffer);
                 }
             }
-        if !mute_playback {
-            if let Some((ref mut r, ref mut buf)) = output_resampler.as_mut() {
-                // 仅首次重采样时清零缓冲，避免未初始化数据脉冲
-                if !output_resampler_cleared {
-                    for frame in buf.iter_mut() {
-                        for sample in frame.iter_mut() {
-                            *sample = 0.0;
+            if !mute_playback {
+                if let Some((ref mut r, ref mut buf)) = output_resampler.as_mut() {
+                    // 仅首次重采样时清零缓冲，避免未初始化数据脉冲
+                    if !output_resampler_cleared {
+                        for frame in buf.iter_mut() {
+                            for sample in frame.iter_mut() {
+                                *sample = 0.0;
+                            }
                         }
+                        output_resampler_cleared = true;
                     }
-                    output_resampler_cleared = true;
-                }
-                if let Err(err) = r.process_into_buffer(&[outframe.as_slice().unwrap()], buf, None) {
-                    log::error!("输出重采样失败: {:?}", err);
-                } else if warmup_blocks > 0 {
-                    warmup_blocks = warmup_blocks.saturating_sub(1);
+                    if let Err(err) =
+                        r.process_into_buffer(&[outframe.as_slice().unwrap()], buf, None)
+                    {
+                        log::error!("输出重采样失败: {:?}", err);
+                    } else if warmup_blocks > 0 {
+                        warmup_blocks = warmup_blocks.saturating_sub(1);
+                    } else {
+                        push_output_block(&should_stop, &mut rb_out, &buf[0][..n_out], n_out);
+                    }
+                } else if let Some(buf) = outframe.as_slice() {
+                    if warmup_blocks > 0 {
+                        warmup_blocks = warmup_blocks.saturating_sub(1);
+                    } else {
+                        let temp = buf[..n_out].to_vec();
+                        push_output_block(&should_stop, &mut rb_out, &temp[..], n_out);
+                    }
                 } else {
-                    push_output_block(&should_stop, &mut rb_out, &buf[0][..n_out], n_out);
+                    log::error!("输出帧内存布局异常，跳过输出");
                 }
-            } else if let Some(buf) = outframe.as_slice() {
-                if warmup_blocks > 0 {
-                    warmup_blocks = warmup_blocks.saturating_sub(1);
-                } else {
-                    let temp = buf[..n_out].to_vec();
-                    push_output_block(&should_stop, &mut rb_out, &temp[..], n_out);
-                }
-            } else {
-                log::error!("输出帧内存布局异常，跳过输出");
             }
-        }
             if let Some(sender) = s_lsnr.as_ref() {
                 if let Err(err) = sender.send(lsnr) {
                     log::warn!("Failed to send LSNR value: {}", err);
@@ -1400,7 +1437,10 @@ fn get_worker_fn(
                         }
                         ControlMessage::SysAutoVolumeEnabled(enabled) => {
                             auto_sys_volume = enabled;
-                            log::info!("自动系统音量保护: {}", if enabled { "开启" } else { "关闭" });
+                            log::info!(
+                                "自动系统音量保护: {}",
+                                if enabled { "开启" } else { "关闭" }
+                            );
                         }
                         ControlMessage::EnvAutoEnabled(enabled) => {
                             env_auto_enabled = enabled;
@@ -1420,6 +1460,25 @@ fn get_worker_fn(
                         ControlMessage::ExciterMix(value) => {
                             exciter.set_mix(value.clamp(0.0, 0.5));
                             log::info!("谐波激励混合: {:.0}%", value * 100.0);
+                        }
+                        ControlMessage::StftEqEnabled(enabled) => {
+                            stft_enabled = enabled;
+                            log::info!("STFT 静态 EQ: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::StftEqHfGain(db) => {
+                            stft_hf_gain = db.clamp(0.0, 8.0);
+                            stft_dirty = true;
+                            log::info!("STFT EQ 高频补偿: {:+.1} dB", stft_hf_gain);
+                        }
+                        ControlMessage::StftEqAirGain(db) => {
+                            stft_air_gain = db.clamp(0.0, 10.0);
+                            stft_dirty = true;
+                            log::info!("STFT EQ 空气感补偿: {:+.1} dB", stft_air_gain);
+                        }
+                        ControlMessage::StftEqTilt(db) => {
+                            stft_tilt_gain = db.clamp(-6.0, 6.0);
+                            stft_dirty = true;
+                            log::info!("STFT EQ 倾斜补偿: {:+.1} dB", stft_tilt_gain);
                         }
                         ControlMessage::BypassEnabled(enabled) => {
                             bypass_enabled = enabled;
@@ -1538,7 +1597,11 @@ impl BusLimiter {
         } else {
             1.0
         };
-        let coef = if target < self.gain { self.attack_coef } else { self.release_coef };
+        let coef = if target < self.gain {
+            self.attack_coef
+        } else {
+            self.release_coef
+        };
         self.gain = coef * self.gain + (1.0 - coef) * target;
         if self.gain < 0.9999 || self.gain > 1.0001 {
             for v in buf.iter_mut() {
@@ -1643,7 +1706,8 @@ pub fn start_sys_volume_monitor(selected_input: Option<String>) -> Option<SysVol
             SampleFormat::I16 => device.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _| {
-                    let frame: Vec<f32> = data.iter().map(|&v| v as f32 / i16::MAX as f32).collect();
+                    let frame: Vec<f32> =
+                        data.iter().map(|&v| v as f32 / i16::MAX as f32).collect();
                     let _ = tx.try_send(frame);
                 },
                 move |err| log::warn!("系统音量监听流错误: {}", err),
@@ -1652,10 +1716,8 @@ pub fn start_sys_volume_monitor(selected_input: Option<String>) -> Option<SysVol
             SampleFormat::U16 => device.build_input_stream(
                 &stream_config,
                 move |data: &[u16], _| {
-                    let frame: Vec<f32> = data
-                        .iter()
-                        .map(|&v| (v as f32 - 32768.0) / 32768.0)
-                        .collect();
+                    let frame: Vec<f32> =
+                        data.iter().map(|&v| (v as f32 - 32768.0) / 32768.0).collect();
                     let _ = tx.try_send(frame);
                 },
                 move |err| log::warn!("系统音量监听流错误: {}", err),
@@ -1682,9 +1744,8 @@ pub fn start_sys_volume_monitor(selected_input: Option<String>) -> Option<SysVol
 
         let _ = ready_tx.send(Ok(()));
         SYS_VOL_MON_ACTIVE.store(true, Ordering::Relaxed);
-        let mut last_adjust = Instant::now()
-            .checked_sub(Duration::from_secs(5))
-            .unwrap_or_else(Instant::now);
+        let mut last_adjust =
+            Instant::now().checked_sub(Duration::from_secs(5)).unwrap_or_else(Instant::now);
         let mut last_restore = last_adjust;
         let mut clip_counter = 0usize;
         let mut low_peak_counter = 0usize;
@@ -1745,7 +1806,8 @@ pub fn start_sys_volume_monitor(selected_input: Option<String>) -> Option<SysVol
                     before
                 );
                 adjust_system_input_volume_async(DOWN_STEP, MIN_VOL, MAX_VOL);
-            } else if low_peak_counter >= low_peak_required && last_restore.elapsed() > RESTORE_COOLDOWN
+            } else if low_peak_counter >= low_peak_required
+                && last_restore.elapsed() > RESTORE_COOLDOWN
             {
                 low_peak_counter = 0;
                 if let Some(current) = get_input_volume() {
@@ -1784,7 +1846,6 @@ pub fn start_sys_volume_monitor(selected_input: Option<String>) -> Option<SysVol
         }
     }
 }
-
 
 #[cfg(target_os = "macos")]
 fn get_input_volume() -> Option<u8> {
@@ -2046,8 +2107,17 @@ pub fn main() -> Result<()> {
     if let Some(p) = model_path.as_ref() {
         log::info!("Running with model '{:?}'", p);
     }
-    let _c =
-        DeepFilterCapture::new(model_path, Some(lsnr_prod), None, None, None, None, None, None, None);
+    let _c = DeepFilterCapture::new(
+        model_path,
+        Some(lsnr_prod),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
 
     loop {
         sleep(Duration::from_millis(200));

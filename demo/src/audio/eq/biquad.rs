@@ -6,6 +6,8 @@ pub enum BiquadType {
     LowShelf,
     HighShelf,
     BandPass,
+    LowPass,
+    HighPass,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +119,24 @@ impl Biquad {
                 let b0 = alpha;
                 let b1 = 0.0;
                 let b2 = -alpha;
+                let a0 = 1.0 + alpha;
+                let a1 = -2.0 * cos_w0;
+                let a2 = 1.0 - alpha;
+                self.normalize(b0, b1, b2, a0, a1, a2);
+            }
+            BiquadType::LowPass => {
+                let b0 = (1.0 - cos_w0) * 0.5;
+                let b1 = 1.0 - cos_w0;
+                let b2 = (1.0 - cos_w0) * 0.5;
+                let a0 = 1.0 + alpha;
+                let a1 = -2.0 * cos_w0;
+                let a2 = 1.0 - alpha;
+                self.normalize(b0, b1, b2, a0, a1, a2);
+            }
+            BiquadType::HighPass => {
+                let b0 = (1.0 + cos_w0) * 0.5;
+                let b1 = -(1.0 + cos_w0);
+                let b2 = (1.0 + cos_w0) * 0.5;
                 let a0 = 1.0 + alpha;
                 let a1 = -2.0 * cos_w0;
                 let a2 = 1.0 - alpha;

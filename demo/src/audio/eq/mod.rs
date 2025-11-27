@@ -4,6 +4,7 @@ mod dynamic_eq;
 mod envelope;
 mod presets;
 
+pub use biquad::{Biquad, BiquadType};
 #[cfg(feature = "ui")]
 #[allow(unused_imports)]
 pub use dynamic_band::{BandMode, FilterKind};

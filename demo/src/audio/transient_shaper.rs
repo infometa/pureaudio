@@ -123,10 +123,8 @@ impl TransientShaper {
         let attack_ms = attack_ms.clamp(0.05, 20.0);
         let release_ms = release_ms.clamp(10.0, 400.0);
         self.hold_ms = hold_ms.clamp(1.0, 40.0);
-        self.attack_coef =
-            (-1000.0 / (attack_ms * self.sample_rate.clamp(1.0, f32::MAX))).exp();
-        self.release_coef =
-            (-1000.0 / (release_ms * self.sample_rate.clamp(1.0, f32::MAX))).exp();
+        self.attack_coef = (-1000.0 / (attack_ms * self.sample_rate.clamp(1.0, f32::MAX))).exp();
+        self.release_coef = (-1000.0 / (release_ms * self.sample_rate.clamp(1.0, f32::MAX))).exp();
         self.hold_samples = ((self.hold_ms * self.sample_rate) / 1000.0).round() as usize;
     }
 }

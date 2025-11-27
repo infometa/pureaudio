@@ -14,8 +14,8 @@ use crossbeam_channel::unbounded;
 use hound;
 use iced::widget::tooltip::{self, Position};
 use iced::widget::{
-    self, column, container, image, pick_list, row, scrollable, slider, text, toggler, Container,
-    Image, text_input,
+    self, column, container, image, pick_list, row, scrollable, slider, text, text_input, toggler,
+    Container, Image,
 };
 use iced::{
     alignment, executor, Alignment, Application, Color, Command, ContentFit, Element, Font, Length,
@@ -33,7 +33,7 @@ mod scene;
 mod ui;
 use audio::eq::{BandMode, EqControl, EqPresetKind, FilterKind, MAX_EQ_BANDS};
 use capture::*;
-use capture::{EnvStatus, RecvEnvStatus, SendEnvStatus};
+use capture::{EnvStatus, RecvEnvStatus};
 use scene::ScenePreset;
 use ui::tooltips;
 
@@ -113,20 +113,31 @@ fn default_false() -> bool {
     false
 }
 
+fn default_stft_hf_gain() -> f32 {
+    2.0
+}
+
+fn default_stft_air_gain() -> f32 {
+    3.0
+}
+
+fn default_stft_tilt() -> f32 {
+    0.0
+}
+
 fn default_auto_play_file() -> Option<PathBuf> {
-    Some(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/audio/kh.wav")))
+    Some(PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/audio/kh.wav"
+    )))
 }
 
 fn list_audio_devices() -> (Vec<String>, Vec<String>, Option<String>, Option<String>) {
     let host = cpal::default_host();
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
-    let mut default_in = host
-        .default_input_device()
-        .and_then(|dev| dev.name().ok());
-    let mut default_out = host
-        .default_output_device()
-        .and_then(|dev| dev.name().ok());
+    let mut default_in = host.default_input_device().and_then(|dev| dev.name().ok());
+    let mut default_out = host.default_output_device().and_then(|dev| dev.name().ok());
 
     match host.input_devices() {
         Ok(devices) => {
@@ -209,6 +220,10 @@ struct SpecView {
     auto_play_pid: Option<u32>,
     highpass_enabled: bool,
     highpass_cutoff: f32,
+    stft_eq_enabled: bool,
+    stft_hf_gain_db: f32,
+    stft_air_gain_db: f32,
+    stft_tilt_db: f32,
     transient_enabled: bool,
     transient_gain: f32,
     transient_sustain: f32,
@@ -304,6 +319,10 @@ pub enum Message {
     PlaybackFinished(Result<(), String>),
     HighpassToggled(bool),
     HighpassCutoffChanged(f32),
+    StftEqToggled(bool),
+    StftEqHfChanged(f32),
+    StftEqAirChanged(f32),
+    StftEqTiltChanged(f32),
     SaturationToggled(bool),
     SaturationDriveChanged(f32),
     SaturationMakeupChanged(f32),
@@ -375,6 +394,14 @@ pub struct UserConfig {
     auto_play_file: Option<PathBuf>,
     highpass_enabled: bool,
     highpass_cutoff: f32,
+    #[serde(default = "default_true")]
+    stft_eq_enabled: bool,
+    #[serde(default = "default_stft_hf_gain")]
+    stft_hf_gain_db: f32,
+    #[serde(default = "default_stft_air_gain")]
+    stft_air_gain_db: f32,
+    #[serde(default = "default_stft_tilt")]
+    stft_tilt_db: f32,
     saturation_enabled: bool,
     saturation_drive: f32,
     saturation_makeup: f32,
@@ -427,10 +454,7 @@ async fn save_config_with_dialog(cfg: UserConfig) -> Result<PathBuf, String> {
 fn load_config_with_dialog(
 ) -> impl Future<Output = Result<UserConfig, String>> + 'static + Send + Sync {
     async move {
-        let Some(path) = FileDialog::new()
-            .add_filter("配置文件", &["json"])
-            .pick_file()
-        else {
+        let Some(path) = FileDialog::new().add_filter("配置文件", &["json"]).pick_file() else {
             return Err("用户取消".to_string());
         };
         read_config_file(&path)
@@ -652,6 +676,10 @@ impl Application for SpecView {
                 auto_play_pid: None,
                 highpass_enabled: true,
                 highpass_cutoff: 60.0,
+                stft_eq_enabled: true,
+                stft_hf_gain_db: default_stft_hf_gain(),
+                stft_air_gain_db: default_stft_air_gain(),
+                stft_tilt_db: default_stft_tilt(),
                 transient_enabled: true,
                 transient_gain: 3.5,
                 transient_sustain: 0.0,
@@ -937,6 +965,22 @@ impl Application for SpecView {
                 self.highpass_cutoff = freq;
                 self.send_control_message(ControlMessage::HighpassCutoff(freq));
             }
+            Message::StftEqToggled(enabled) => {
+                self.stft_eq_enabled = enabled;
+                self.send_control_message(ControlMessage::StftEqEnabled(enabled));
+            }
+            Message::StftEqHfChanged(db) => {
+                self.stft_hf_gain_db = db;
+                self.send_control_message(ControlMessage::StftEqHfGain(db));
+            }
+            Message::StftEqAirChanged(db) => {
+                self.stft_air_gain_db = db;
+                self.send_control_message(ControlMessage::StftEqAirGain(db));
+            }
+            Message::StftEqTiltChanged(db) => {
+                self.stft_tilt_db = db;
+                self.send_control_message(ControlMessage::StftEqTilt(db));
+            }
             Message::SaturationToggled(enabled) => {
                 self.saturation_enabled = enabled;
                 self.send_control_message(ControlMessage::SaturationEnabled(enabled));
@@ -997,11 +1041,17 @@ impl Application for SpecView {
             }
             Message::AgcAttackChanged(value) => {
                 self.agc_attack_ms = value;
-                self.send_control_message(ControlMessage::AgcAttackRelease(value, self.agc_release_ms));
+                self.send_control_message(ControlMessage::AgcAttackRelease(
+                    value,
+                    self.agc_release_ms,
+                ));
             }
             Message::AgcReleaseChanged(value) => {
                 self.agc_release_ms = value;
-                self.send_control_message(ControlMessage::AgcAttackRelease(self.agc_attack_ms, value));
+                self.send_control_message(ControlMessage::AgcAttackRelease(
+                    self.agc_attack_ms,
+                    value,
+                ));
             }
             Message::AgcToggleAdvanced => {
                 self.show_agc_advanced = !self.show_agc_advanced;
@@ -1144,11 +1194,7 @@ impl Application for SpecView {
             .unwrap_or_else(|| "未选择文件".to_string());
         let auto_play_btn = button("选择播放音频").on_press(Message::AutoPlayPickRequested);
         let auto_play_row = row![
-            toggler(
-                None,
-                self.auto_play_enabled,
-                Message::AutoPlayToggled
-            ),
+            toggler(None, self.auto_play_enabled, Message::AutoPlayToggled),
             text("自动播放测试音频").size(14),
             text(auto_play_path).size(12).width(Length::Fill),
             auto_play_btn
@@ -1320,20 +1366,14 @@ impl SpecView {
         let (s_env_status, r_env_status) = unbounded();
         let model_path = current_model_path().or_else(|| self.model_path.clone());
         self.model_path = model_path.clone();
-        let input_device = self
-            .selected_input_device
-            .clone()
-            .or_else(|| {
-                let trimmed = self.input_device_filter.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            });
-        let output_device = self
-            .selected_output_device
-            .clone()
-            .or_else(|| {
-                let trimmed = self.output_device_filter.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            });
+        let input_device = self.selected_input_device.clone().or_else(|| {
+            let trimmed = self.input_device_filter.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+        let output_device = self.selected_output_device.clone().or_else(|| {
+            let trimmed = self.output_device_filter.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
         let df_worker = match DeepFilterCapture::new(
             model_path,
             Some(s_lsnr),
@@ -1368,19 +1408,23 @@ impl SpecView {
         self.eq_status = EqStatus::default();
         self.send_df_control(DfControl::AttenLim, self.atten_lim);
         self.send_df_control(DfControl::PostFilterBeta, self.post_filter_beta);
-                self.send_df_control(DfControl::MinThreshDb, self.min_threshdb);
-                self.send_df_control(DfControl::MaxErbThreshDb, self.max_erbthreshdb);
-                self.send_df_control(DfControl::MaxDfThreshDb, self.max_dfthreshdb);
-                self.send_control_message(ControlMessage::DfMix(self.df_mix));
-                self.send_control_message(ControlMessage::HeadroomGain(self.headroom_gain));
-                self.send_control_message(ControlMessage::PostTrimGain(self.post_trim_gain));
-                self.send_eq_control(EqControl::SetEnabled(self.eq_enabled));
-                self.send_eq_control(EqControl::SetPreset(self.eq_preset));
-                self.send_eq_control(EqControl::SetDryWet(self.eq_dry_wet));
-                self.broadcast_eq_parameters();
-                self.broadcast_eq_band_gains();
+        self.send_df_control(DfControl::MinThreshDb, self.min_threshdb);
+        self.send_df_control(DfControl::MaxErbThreshDb, self.max_erbthreshdb);
+        self.send_df_control(DfControl::MaxDfThreshDb, self.max_dfthreshdb);
+        self.send_control_message(ControlMessage::DfMix(self.df_mix));
+        self.send_control_message(ControlMessage::HeadroomGain(self.headroom_gain));
+        self.send_control_message(ControlMessage::PostTrimGain(self.post_trim_gain));
+        self.send_eq_control(EqControl::SetEnabled(self.eq_enabled));
+        self.send_eq_control(EqControl::SetPreset(self.eq_preset));
+        self.send_eq_control(EqControl::SetDryWet(self.eq_dry_wet));
+        self.broadcast_eq_parameters();
+        self.broadcast_eq_band_gains();
         self.send_control_message(ControlMessage::HighpassEnabled(self.highpass_enabled));
         self.send_control_message(ControlMessage::HighpassCutoff(self.highpass_cutoff));
+        self.send_control_message(ControlMessage::StftEqEnabled(self.stft_eq_enabled));
+        self.send_control_message(ControlMessage::StftEqHfGain(self.stft_hf_gain_db));
+        self.send_control_message(ControlMessage::StftEqAirGain(self.stft_air_gain_db));
+        self.send_control_message(ControlMessage::StftEqTilt(self.stft_tilt_db));
         self.send_control_message(ControlMessage::SaturationEnabled(self.saturation_enabled));
         self.send_control_message(ControlMessage::SaturationDrive(self.saturation_drive));
         self.send_control_message(ControlMessage::SaturationMakeup(self.saturation_makeup));
@@ -1725,6 +1769,10 @@ impl SpecView {
     fn sync_runtime_controls(&self) {
         self.send_control_message(ControlMessage::HighpassEnabled(self.highpass_enabled));
         self.send_control_message(ControlMessage::HighpassCutoff(self.highpass_cutoff));
+        self.send_control_message(ControlMessage::StftEqEnabled(self.stft_eq_enabled));
+        self.send_control_message(ControlMessage::StftEqHfGain(self.stft_hf_gain_db));
+        self.send_control_message(ControlMessage::StftEqAirGain(self.stft_air_gain_db));
+        self.send_control_message(ControlMessage::StftEqTilt(self.stft_tilt_db));
         self.send_control_message(ControlMessage::DfMix(self.df_mix));
         self.send_control_message(ControlMessage::HeadroomGain(self.headroom_gain));
         self.send_control_message(ControlMessage::PostTrimGain(self.post_trim_gain));
@@ -1853,6 +1901,10 @@ impl SpecView {
             auto_play_file: self.auto_play_file.clone(),
             highpass_enabled: self.highpass_enabled,
             highpass_cutoff: self.highpass_cutoff,
+            stft_eq_enabled: self.stft_eq_enabled,
+            stft_hf_gain_db: self.stft_hf_gain_db,
+            stft_air_gain_db: self.stft_air_gain_db,
+            stft_tilt_db: self.stft_tilt_db,
             saturation_enabled: self.saturation_enabled,
             saturation_drive: self.saturation_drive,
             saturation_makeup: self.saturation_makeup,
@@ -1911,6 +1963,10 @@ impl SpecView {
         self.auto_play_pid = None;
         self.highpass_enabled = cfg.highpass_enabled;
         self.highpass_cutoff = cfg.highpass_cutoff;
+        self.stft_eq_enabled = cfg.stft_eq_enabled;
+        self.stft_hf_gain_db = cfg.stft_hf_gain_db;
+        self.stft_air_gain_db = cfg.stft_air_gain_db;
+        self.stft_tilt_db = cfg.stft_tilt_db;
         self.saturation_enabled = cfg.saturation_enabled;
         self.saturation_drive = cfg.saturation_drive;
         self.saturation_makeup = cfg.saturation_makeup;
@@ -2151,9 +2207,13 @@ impl SpecView {
 
         let scene_picker = row![
             text("场景:").size(14).width(60),
-            pick_list(scene_presets, Some(self.scene_preset), Message::ScenePresetChanged)
-                .placeholder("选择场景")
-                .width(Length::Fill),
+            pick_list(
+                scene_presets,
+                Some(self.scene_preset),
+                Message::ScenePresetChanged
+            )
+            .placeholder("选择场景")
+            .width(Length::Fill),
         ]
         .spacing(8)
         .align_items(Alignment::Center);
@@ -2192,6 +2252,53 @@ impl SpecView {
                 1.0,
                 Some(tooltips::HIGHPASS_FILTER),
             )
+        } else {
+            widget::Column::new().into()
+        };
+
+        let stft_toggle = row![
+            toggler(String::new(), self.stft_eq_enabled, Message::StftEqToggled),
+            text("STFT 静态 EQ (高频/空气补偿)").size(14),
+        ]
+        .spacing(10)
+        .align_items(Alignment::Center);
+        let stft_controls: Element<'_, Message> = if self.stft_eq_enabled {
+            widget::Column::new()
+                .spacing(8)
+                .push(slider_view(
+                    "高频恢复 [dB] (6-12k)",
+                    self.stft_hf_gain_db,
+                    0.0,
+                    6.0,
+                    Message::StftEqHfChanged,
+                    380,
+                    1,
+                    0.1,
+                    Some("补偿 DF 高频损失，建议 1~3 dB"),
+                ))
+                .push(slider_view(
+                    "空气感 [dB] (12k+)",
+                    self.stft_air_gain_db,
+                    0.0,
+                    8.0,
+                    Message::StftEqAirChanged,
+                    380,
+                    1,
+                    0.1,
+                    Some("补偿 12k 以上空气感，建议 2~4 dB"),
+                ))
+                .push(slider_view(
+                    "倾斜 [dB]",
+                    self.stft_tilt_db,
+                    -4.0,
+                    4.0,
+                    Message::StftEqTiltChanged,
+                    380,
+                    2,
+                    0.1,
+                    Some("整体明暗倾斜，正值更亮"),
+                ))
+                .into()
         } else {
             widget::Column::new().into()
         };
@@ -2456,7 +2563,11 @@ impl SpecView {
         );
         let env_auto_toggle = apply_tooltip(
             row![
-                toggler(String::new(), self.env_auto_enabled, Message::EnvAutoToggled),
+                toggler(
+                    String::new(),
+                    self.env_auto_enabled,
+                    Message::EnvAutoToggled
+                ),
                 text("自动环境自适应（根据噪声自动调整降噪和高通）").size(14),
             ]
             .spacing(10)
@@ -2469,6 +2580,8 @@ impl SpecView {
                 text("音频增强").size(16),
                 highpass_row,
                 highpass_controls,
+                stft_toggle,
+                stft_controls,
                 saturation_toggle,
                 saturation_controls,
                 exciter_toggle,
@@ -2801,10 +2914,7 @@ fn slider_view<'a>(
         .width(90);
     column![
         text(title).size(18).width(Length::Fill),
-        row![
-            container(slider_element).width(Length::Fill),
-            input,
-        ]
+        row![container(slider_element).width(Length::Fill), input,]
     ]
     .max_width(width)
     .width(Length::Fill)
@@ -2905,10 +3015,7 @@ async fn play_test_audio(_path: PathBuf) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn kill_pid(pid: u32) {
-    let _ = StdCommand::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status();
+    let _ = StdCommand::new("kill").arg("-TERM").arg(pid.to_string()).status();
 }
 
 #[cfg(not(target_os = "macos"))]

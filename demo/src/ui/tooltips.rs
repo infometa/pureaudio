@@ -41,7 +41,8 @@ pub const TRANSIENT_SUSTAIN: &str =
     "释放增益\n对非瞬态部分的增益，可设为负值以削短尾音（会议室去混响）。范围 -12~+6 dB。";
 
 pub const AGC: &str = "自动增益控制\n平衡整体响度到约 -16 dBFS，避免忽大忽小，并带有软限制保护。";
-pub const AGC_TARGET: &str = "目标电平\nAGC 会把输出拉向此响度。推荐 -12~-6 dBFS，主播模式可升至 -3 dBFS。";
+pub const AGC_TARGET: &str =
+    "目标电平\nAGC 会把输出拉向此响度。推荐 -12~-6 dBFS，主播模式可升至 -3 dBFS。";
 pub const AGC_MAX_GAIN: &str = "最大增益\n限制轻声音最多放大多少。范围 6~15 dB。";
 pub const AGC_MAX_ATTEN: &str = "最大衰减\n限制响声音最多衰减多少。范围 3~12 dB。";
 

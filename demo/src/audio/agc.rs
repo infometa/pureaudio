@@ -93,7 +93,8 @@ impl AutoGainControl {
                     (self.current_gain_db - over_db).max(-self.max_attenuation_db);
             }
         }
-        self.current_gain_db = self.current_gain_db.clamp(-self.max_attenuation_db, self.max_gain_db);
+        self.current_gain_db =
+            self.current_gain_db.clamp(-self.max_attenuation_db, self.max_gain_db);
     }
 
     pub fn current_gain_db(&self) -> f32 {
