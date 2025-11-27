@@ -2184,7 +2184,7 @@ impl SpecView {
             slider_view(
                 "截止频率 [Hz]",
                 self.highpass_cutoff,
-                40.0,
+                0.0,
                 90.0,
                 Message::HighpassCutoffChanged,
                 380,
@@ -2388,7 +2388,7 @@ impl SpecView {
                     .push(self.create_slider_row(
                         "最大增益 [dB]",
                         self.agc_max_gain_db,
-                        6.0,
+                        0.0,
                         18.0,
                         0.5,
                         Message::AgcMaxGainChanged,
@@ -2739,7 +2739,12 @@ impl SpecView {
         G: Fn(f32) -> String,
     {
         let on_input = move |s: String| {
-            if let Ok(parsed) = s.parse::<f32>() {
+            // 允许带单位的输入，提取数字部分
+            let cleaned: String = s
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '-' || *c == '+' || *c == '.')
+                .collect();
+            if let Ok(parsed) = cleaned.parse::<f32>() {
                 let clamped = parsed.clamp(min, max);
                 on_change(clamped)
             } else {

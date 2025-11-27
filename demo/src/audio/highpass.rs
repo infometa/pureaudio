@@ -40,11 +40,14 @@ impl HighpassFilter {
     pub fn set_cutoff(&mut self, cutoff_hz: f32) {
         let nyq = (self.sample_rate / 2.0).max(1.0);
         let safe_max = nyq * 0.5;
-        self.cutoff_hz = cutoff_hz.clamp(20.0, safe_max);
+        self.cutoff_hz = cutoff_hz.clamp(0.0, safe_max);
         self.update_coefficients();
     }
 
     pub fn process(&mut self, samples: &mut [f32]) {
+        if self.cutoff_hz <= 0.0 {
+            return;
+        }
         if sanitize_samples("HighpassFilter", samples) {
             return;
         }
@@ -71,6 +74,15 @@ impl HighpassFilter {
     }
 
     fn update_coefficients(&mut self) {
+        if self.cutoff_hz <= 0.0 {
+            // Bypass: unity transfer
+            self.b0 = 1.0;
+            self.b1 = 0.0;
+            self.b2 = 0.0;
+            self.a1 = 0.0;
+            self.a2 = 0.0;
+            return;
+        }
         let omega = 2.0 * std::f32::consts::PI * self.cutoff_hz / self.sample_rate.max(1.0);
         let cos_omega = omega.cos();
         let sin_omega = omega.sin();
