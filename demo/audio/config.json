@@ -1,62 +1,62 @@
 {
   "version": 1,
   "scene_preset": "Broadcast",
-  "atten_lim": 25.0,
+  "atten_lim": 20.0,
   "post_filter_beta": 0.0,
   "min_threshdb": -60.0,
   "max_erbthreshdb": 20.0,
   "max_dfthreshdb": 20.0,
-  "df_mix": 0.85,
+  "df_mix": 1.0,
   "headroom_gain": 0.9,
   "post_trim_gain": 1.0,
   "eq_enabled": true,
   "eq_preset": "Broadcast",
-  "eq_dry_wet": 0.39999998,
+  "eq_dry_wet": 1.0,
   "eq_band_gains": [
-    0.0,
-    -1.0,
-    0.0,
-    0.0,
-    0.5
+    6.0,
+    4.0,
+    1.0,
+    3.0,
+    3.0
   ],
   "eq_band_frequencies": [
     80.0,
-    320.0,
+    180.0,
+    450.0,
     3500.0,
-    7500.0,
-    12000.0
+    8000.0
   ],
   "eq_band_qs": [
+    0.5,
     0.7,
-    1.8,
-    1.1999999,
-    2.0,
-    1.0
+    1.5,
+    1.0,
+    0.6
   ],
   "eq_band_detector_qs": [
-    0.59999996,
+    0.5,
+    0.7,
     1.5,
-    1.2,
-    1.8,
-    0.9
+    1.0,
+    0.6
   ],
   "eq_band_thresholds": [
-    -40.0,
-    -28.0,
-    -28.0,
-    -50.0,
-    -45.0
+    -60.0,
+    -60.0,
+    -60.0,
+    -60.0,
+    -55.0
   ],
   "eq_band_ratios": [
-    1.5,
-    2.5,
-    2.0,
-    3.0,
-    1.5
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    2.0
   ],
   "eq_band_max_gains": [
-    6.0,
-    6.0,
+    12.0,
+    10.0,
     4.0,
     6.0,
     8.0
@@ -66,28 +66,28 @@
     30.0,
     25.0,
     20.0,
-    35.0
+    20.0
   ],
   "eq_band_releases": [
     200.0,
     200.0,
     200.0,
     160.0,
-    220.0
+    200.0
   ],
   "eq_band_makeups": [
     0.0,
     0.0,
     0.0,
-    0.5,
-    1.0
+    0.0,
+    0.0
   ],
   "eq_band_modes": [
     "Upward",
-    "Downward",
     "Upward",
-    "Downward",
-    "Upward"
+    "Upward",
+    "Upward",
+    "Downward"
   ],
   "eq_band_filters": [
     "LowShelf",
@@ -101,13 +101,13 @@
     false,
     false,
     false,
-    true,
+    false,
     false
   ],
   "eq_band_expanded": [
     true,
     true,
-    true,
+    false,
     true,
     true
   ],
@@ -116,7 +116,21 @@
   "auto_play_enabled": true,
   "auto_play_file": "/Users/haifeng/Desktop/code/project/pureaudio/demo/audio/kh.wav",
   "highpass_enabled": true,
-  "highpass_cutoff": 45.0,
+  "highpass_cutoff": 40.0,
+  "stft_eq_enabled": true,
+  "stft_hf_gain_db": 3.0,
+  "stft_air_gain_db": 2.0,
+  "stft_tilt_db": 0.0,
+  "stft_band_offsets": [
+    6.0,
+    5.0,
+    1.0,
+    0.0,
+    2.5,
+    2.5,
+    4.0,
+    2.0
+  ],
   "saturation_enabled": false,
   "saturation_drive": 1.2,
   "saturation_makeup": -0.5,
@@ -128,13 +142,13 @@
   "transient_mix": 100.0,
   "show_transient_advanced": false,
   "agc_enabled": true,
-  "agc_target_db": -18.0,
-  "agc_max_gain_db": 8.0,
-  "agc_max_atten_db": 10.0,
+  "agc_target_db": -20.0,
+  "agc_max_gain_db": 5.0,
+  "agc_max_atten_db": 12.0,
   "agc_window_sec": 0.6,
   "agc_attack_ms": 500.0,
-  "agc_release_ms": 2000.0,
-  "show_agc_advanced": true,
+  "agc_release_ms": 2500.0,
+  "show_agc_advanced": false,
   "sys_auto_volume": false,
   "env_auto_enabled": false
 }

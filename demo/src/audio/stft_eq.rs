@@ -2,8 +2,19 @@ use realfft::num_complex::Complex32;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::sync::Arc;
 
-const DEFAULT_WINDOW: usize = 2048;
-const DEFAULT_HOP: usize = 512;
+// 窗口与 DFN 对齐：单主干、无并行；512/256 Hann
+const DEFAULT_WINDOW: usize = 512;
+const DEFAULT_HOP: usize = DEFAULT_WINDOW / 2;
+const STFT_BANDS: [(f32, f32); 8] = [
+    (60.0, 120.0),
+    (120.0, 250.0),
+    (250.0, 500.0),
+    (500.0, 1500.0),
+    (1500.0, 3000.0),
+    (3000.0, 6000.0),
+    (6000.0, 10000.0),
+    (10000.0, 14000.0),
+];
 
 fn db_to_linear(db: f32) -> f32 {
     10.0f32.powf(db / 20.0)
@@ -31,6 +42,7 @@ pub struct StftStaticEq {
     scratch_b: Vec<Complex32>,
     time_buf: Vec<f32>,
     gain_curve: Vec<f32>,
+    band_offsets: [f32; 8],
     input_buf: Vec<f32>,
     pending_output: Vec<f32>,
     hf_gain_db: f32,
@@ -45,7 +57,8 @@ impl StftStaticEq {
         let c2r = planner.plan_fft_inverse(DEFAULT_WINDOW);
         let window = hann_window(DEFAULT_WINDOW);
         let n_bins = r2c.make_output_vec().len();
-        let gain_curve = build_gain_curve(sample_rate as f32, n_bins, 2.0, 3.0, 0.0);
+        let offsets = [0.0; 8];
+        let gain_curve = build_gain_curve(sample_rate as f32, n_bins, 2.0, 3.0, 0.0, &offsets);
         Self {
             win: DEFAULT_WINDOW,
             hop: DEFAULT_HOP,
@@ -57,6 +70,7 @@ impl StftStaticEq {
             r2c,
             c2r,
             gain_curve,
+            band_offsets: offsets,
             input_buf: Vec::new(),
             pending_output: Vec::new(),
             hf_gain_db: 2.0,
@@ -70,14 +84,22 @@ impl StftStaticEq {
         hf_gain_db: f32,
         air_gain_db: f32,
         tilt_db: f32,
+        band_offsets: &[f32; 8],
         sample_rate: usize,
     ) {
         self.hf_gain_db = hf_gain_db;
         self.air_gain_db = air_gain_db;
         self.tilt_db = tilt_db;
+        self.band_offsets = *band_offsets;
         let n_bins = self.r2c.make_output_vec().len();
-        self.gain_curve =
-            build_gain_curve(sample_rate as f32, n_bins, hf_gain_db, air_gain_db, tilt_db);
+        self.gain_curve = build_gain_curve(
+            sample_rate as f32,
+            n_bins,
+            hf_gain_db,
+            air_gain_db,
+            tilt_db,
+            band_offsets,
+        );
     }
 
     /// In-place 处理一块音频；内部保持流式重叠相加，输出长度与输入相同
@@ -152,19 +174,23 @@ fn build_gain_curve(
     hf_gain_db: f32,
     air_gain_db: f32,
     tilt_db: f32,
+    band_offsets: &[f32; 8],
 ) -> Vec<f32> {
-    // 静态锚点（Hz, dB），描述目标音色基线
+    // 静态锚点（Hz, dB），按 8 段宽 Q 基线定义：低频轻减，高频轻补偿，保证“厚/自然/空气”
     const ANCHORS: &[(f32, f32)] = &[
-        (100.0, 1.2),
-        (180.0, 0.5),
-        (300.0, -0.3),
-        (1500.0, 0.0),
-        (3500.0, 0.8),
-        (6000.0, 1.5),
-        (8000.0, 2.2),
-        (12000.0, 3.0),
-        (16000.0, 3.5),
-        (18000.0, 4.0),
+        (60.0, -1.5),    // rumble/boom 轻减
+        (120.0, -1.0),
+        (200.0, -0.8),   // 胸腔共鸣轻减
+        (350.0, -0.3),   // 厚度控制
+        (700.0, 0.2),    // 中频密度
+        (1500.0, 0.5),   // 主体保持
+        (2500.0, 1.2),   // intelligibility
+        (4000.0, 1.0),   // presence 微调
+        (6000.0, 1.5),   // bright/air 起点
+        (8000.0, 2.0),
+        (10000.0, 2.3),
+        (12500.0, 2.8),
+        (14000.0, 1.5),  // 超高频收尾，避免过尖
     ];
     let mut gains = Vec::with_capacity(bins);
     let bin_hz = sr / (bins.saturating_sub(1) as f32 * 2.0);
@@ -188,6 +214,13 @@ fn build_gain_curve(
             }
             v
         };
+        // 分段偏移（8 段宽 Q）：落在哪个区间加对应偏置
+        for (idx, (low, high)) in STFT_BANDS.iter().enumerate() {
+            if f >= *low && f < *high {
+                db += band_offsets[idx];
+                break;
+            }
+        }
         // UI 旋钮的附加补偿：HF/Air + 倾斜，保持可微调
         if f >= 6000.0 && f < 12000.0 {
             let t = ((f - 6000.0) / 6000.0).clamp(0.0, 1.0);

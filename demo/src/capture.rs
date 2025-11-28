@@ -16,7 +16,6 @@ use crate::audio::eq::{DynamicEq, EqControl, EqPresetKind, MAX_EQ_BANDS};
 use crate::audio::exciter::HarmonicExciter;
 use crate::audio::highpass::HighpassFilter;
 use crate::audio::saturation::Saturation;
-use crate::audio::spectral_tilt::SpectralTiltCompensator;
 use crate::audio::stft_eq::StftStaticEq;
 use crate::audio::transient_shaper::TransientShaper;
 use anyhow::{anyhow, Context, Result};
@@ -289,6 +288,7 @@ pub enum ControlMessage {
     StftEqHfGain(f32),
     StftEqAirGain(f32),
     StftEqTilt(f32),
+    StftEqBand(usize, f32),
 }
 
 pub fn model_dimensions(model_path: Option<PathBuf>, _channels: usize) -> (usize, usize, usize) {
@@ -757,7 +757,6 @@ fn get_worker_fn(
         let mut exciter = HarmonicExciter::new(df.sr as f32, 7500.0, 1.6, 0.25);
         let mut transient_shaper = TransientShaper::new(df.sr as f32);
         let mut saturation = Saturation::new();
-        let mut spectral_tilt = SpectralTiltCompensator::new(df.sr as f32);
         let mut agc = AutoGainControl::new(df.sr as f32);
         let mut bus_limiter = BusLimiter::new(df.sr);
         // 更长淡入，避免启动瞬间脉冲
@@ -765,11 +764,13 @@ fn get_worker_fn(
         let mut fade_progress = 0usize;
         let mut highpass_enabled = true;
         let mut highpass_cutoff = 60.0f32;
+        let mut manual_highpass = highpass_cutoff;
         highpass.set_cutoff(highpass_cutoff);
         let mut stft_enabled = true;
         let mut stft_hf_gain = 2.0f32;
         let mut stft_air_gain = 3.0f32;
         let mut stft_tilt_gain = 0.0f32;
+        let mut stft_band_offsets = [0.0f32; 8];
         let mut stft_dirty = true;
         let mut transient_enabled = true;
         let mut saturation_enabled = true;
@@ -777,22 +778,31 @@ fn get_worker_fn(
         let mut exciter_enabled = true;
         let mut bypass_enabled = false;
         let mut mute_playback = false;
-        let mut df_mix = 1.0f32;
+        let mut _df_mix = 1.0f32;
         let mut headroom_gain = 0.9f32;
         let mut post_trim_gain = 1.0f32;
         // 自适应环境/设备状态（默认关闭，通过 UI 控制开启）
-        let mut env_class = EnvClass::Quiet;
+        let mut env_class = EnvClass::Noisy;
         let mut smoothed_energy = -80.0f32;
         let mut smoothed_flatness = 0.0f32;
         let mut smoothed_centroid = 0.0f32;
-        let mut target_atten = 34.0f32;
-        let mut target_min_thresh = -55.0f32;
-        let mut target_max_thresh = 14.0f32;
-        let mut target_df_mix = 0.9f32;
-        let mut target_hp = 60.0f32;
-        let mut target_eq_mix = 0.8f32;
-        let mut target_exciter_mix = exciter.mix();
-        // 柔和模式用于外部 ANC/极静环境，降低降噪力度并补高频
+        // 噪声地板 & SNR 跟踪
+        let mut noise_floor_db = -60.0f32;
+        let mut snr_db = 10.0f32;
+        let mut target_atten = 45.0f32;
+        let mut target_min_thresh = -60.0f32;
+        let mut target_max_thresh = 10.0f32;
+        let mut target_df_mix = 1.0f32;
+        let mut target_hp = 80.0f32;
+        let mut target_eq_mix = 0.7f32;
+        let mut target_exciter_mix = 0.15f32;
+        let mut manual_atten = df.atten_lim.unwrap_or(target_atten);
+        let mut manual_min_thresh = df.min_db_thresh;
+        let mut manual_max_thresh = df.max_db_df_thresh;
+        // 冲击/键盘保护计数
+        let mut impact_hold = 0usize;
+        const IMPACT_HOLD_FRAMES: usize = 60; // 约 0.6s（取决于 hop）
+                                              // 柔和模式用于外部 ANC/极静环境，降低降噪力度并补高频
         let mut soft_mode = false;
         let mut last_soft_mode = false;
         // 滞后计数，避免频繁切换
@@ -923,10 +933,6 @@ fn get_worker_fn(
                     highpass.process(buffer);
                 }
             }
-            if let Some(buffer) = inframe.as_slice() {
-                spectral_tilt.observe_input(buffer);
-            }
-
             let mut lsnr = 0.0;
             if bypass_enabled {
                 if let (Some(out), Some(inp)) = (outframe.as_slice_mut(), inframe.as_slice()) {
@@ -937,38 +943,42 @@ fn get_worker_fn(
                     .process(inframe.view(), outframe.view_mut())
                     .expect("Failed to run DeepFilterNet");
             }
-            if !bypass_enabled {
-                if stft_enabled {
-                    if stft_dirty {
-                        stft_eq.set_curve(stft_hf_gain, stft_air_gain, stft_tilt_gain, df.sr);
-                        stft_dirty = false;
-                    }
-                    if let Some(buf) = outframe.as_slice_mut() {
-                        stft_eq.process_block(buf);
-                    }
-                }
-                if let Some(buf) = outframe.as_slice_mut() {
-                    spectral_tilt.compensate(buf);
-                }
-            }
             if env_auto_enabled && !bypass_enabled {
-                if let Some(buf) = inframe.as_slice() {
+                // 环境噪声特征估计与自适应参数：噪声地板 + SNR 连续映射
+                let feats = compute_noise_features(df.get_spec_noisy());
+                let (rms_db, update_alpha) = if let Some(buf) = inframe.as_slice() {
                     let rms = df::rms(buf.iter());
-                    let rms_db = 20.0 * rms.max(1e-9).log10();
-                    // 仅在低语音电平时更新环境特征
-                    const NOISE_ONLY_DB: f32 = -35.0;
-                    if rms_db < NOISE_ONLY_DB {
-                        // 环境噪声特征估计与自适应参数
-                        let feats = compute_noise_features(df.get_spec_noisy());
-                        smoothed_energy = smooth_value(smoothed_energy, feats.energy_db, 0.1);
-                        smoothed_flatness =
-                            smooth_value(smoothed_flatness, feats.spectral_flatness, 0.1);
-                        smoothed_centroid =
-                            smooth_value(smoothed_centroid, feats.spectral_centroid, 0.1);
-                    }
+                    let db = 20.0 * rms.max(1e-9).log10();
+                    let alpha = if db < -50.0 {
+                        0.35
+                    } else if db < -30.0 {
+                        0.18
+                    } else if db < -20.0 {
+                        0.10
+                    } else {
+                        0.05
+                    };
+                    (db, alpha)
+                } else {
+                    (-60.0, 0.2)
+                };
+                smoothed_energy = smooth_value(smoothed_energy, feats.energy_db, update_alpha);
+                smoothed_flatness =
+                    smooth_value(smoothed_flatness, feats.spectral_flatness, update_alpha);
+                smoothed_centroid =
+                    smooth_value(smoothed_centroid, feats.spectral_centroid, update_alpha);
+
+                // 噪声地板跟踪：下降快，上升慢
+                if rms_db < noise_floor_db {
+                    noise_floor_db = smooth_value(noise_floor_db, rms_db, 0.4);
+                } else {
+                    noise_floor_db = smooth_value(noise_floor_db, rms_db, 0.02);
                 }
-                // 检测“极静/外部 ANC”触发柔和模式：极低能量 + 低频谱重心
-                let soft_candidate = smoothed_energy < -60.0 && smoothed_centroid < -15.0;
+                snr_db = (rms_db - noise_floor_db).clamp(-5.0, 30.0);
+
+                // 柔和模式：低能量、低平坦度、低重心
+                let soft_candidate =
+                    smoothed_energy < -55.0 && smoothed_flatness < 0.2 && smoothed_centroid < 0.35;
                 if soft_candidate {
                     soft_mode_hold = soft_mode_hold.saturating_add(1);
                 } else {
@@ -976,13 +986,13 @@ fn get_worker_fn(
                 }
                 if soft_mode_hold > SOFT_MODE_HOLD_FRAMES {
                     soft_mode = true;
-                } else if soft_mode_hold == 0 {
+                } else if soft_mode_hold < SOFT_MODE_HOLD_FRAMES / 4 {
                     soft_mode = false;
                 }
                 if soft_mode != last_soft_mode {
                     last_soft_mode = soft_mode;
                     if soft_mode {
-                        log::info!("环境自适应: 切换到柔和模式 (可能检测到外部 ANC/极静环境)");
+                        log::info!("环境自适应: 切换到柔和模式");
                         if let Some(ref sender) = s_env_status {
                             let _ = sender.try_send(EnvStatus::Soft);
                         }
@@ -994,78 +1004,96 @@ fn get_worker_fn(
                     }
                 }
 
+                // 键盘/冲击检测
+                let mut impact = false;
+                if let Some(buf) = inframe.as_slice() {
+                    let rms = df::rms(buf.iter());
+                    let peak = buf.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+                    let crest = if rms > 1e-6 { peak / rms } else { 0.0 };
+                    if crest > 12.0 && rms > 1e-3 {
+                        impact = true;
+                    }
+                }
+                if impact {
+                    impact_hold = (impact_hold + 10).min(IMPACT_HOLD_FRAMES);
+                } else if impact_hold > 0 {
+                    impact_hold = impact_hold.saturating_sub(1);
+                }
+
+                // SNR 连续映射（安静保色，嘈杂保清晰）
+                let mapped = map_snr_to_params(snr_db);
+                target_atten = mapped.atten.min(manual_atten);
+                target_min_thresh = mapped.min_thresh.max(manual_min_thresh);
+                target_max_thresh = mapped.max_thresh.min(manual_max_thresh);
+                target_df_mix = 1.0;
+                target_hp = mapped.hp_cut.max(manual_highpass);
+                target_eq_mix = mapped.eq_mix;
+                target_exciter_mix = mapped.exciter_mix;
+
+                // 档位仅用于日志
                 let target_env =
                     classify_env(smoothed_energy, smoothed_flatness, smoothed_centroid);
                 if target_env != env_class {
+                    log::info!(
+                        "环境自适应: {:?} -> {:?} (energy {:.1} dB, flatness {:.3}, centroid {:.3}, SNR {:.1} dB, floor {:.1} dB)",
+                        env_class, target_env, smoothed_energy, smoothed_flatness, smoothed_centroid, snr_db, noise_floor_db
+                    );
                     env_class = target_env;
                 }
 
                 if soft_mode {
-                    // 柔和模式：降低降噪力度、补高频、旁路重处理
                     target_atten = 24.0;
                     target_min_thresh = -58.0;
                     target_max_thresh = 12.0;
-                    target_df_mix = 0.9;
+                    target_df_mix = 1.0;
                     target_hp = 60.0;
                     target_eq_mix = 0.6;
                     target_exciter_mix = 0.2;
-                } else {
-                    match env_class {
-                        EnvClass::Quiet => {
-                            target_atten = 28.0;
-                            target_min_thresh = -55.0;
-                            target_max_thresh = 14.0;
-                            target_df_mix = 0.9;
-                            target_hp = 60.0;
-                            target_eq_mix = 0.8;
-                            target_exciter_mix = 0.25;
-                        }
-                        EnvClass::Office => {
-                            target_atten = 40.0;
-                            target_min_thresh = -52.0;
-                            target_max_thresh = 12.0;
-                            target_df_mix = 0.95;
-                            target_hp = 80.0;
-                            target_eq_mix = 0.85;
-                            target_exciter_mix = 0.25;
-                        }
-                        EnvClass::Noisy => {
-                            target_atten = 55.0;
-                            target_min_thresh = -48.0;
-                            target_max_thresh = 10.0;
-                            target_df_mix = 1.0;
-                            target_hp = 110.0;
-                            target_eq_mix = 0.9;
-                            target_exciter_mix = 0.3;
-                        }
-                    }
                 }
 
-                // 平滑应用参数（每帧执行，避免“无效果”）
-                df_mix = smooth_value(df_mix, target_df_mix, 0.1).clamp(0.0, 1.0);
+                if impact_hold > 0 {
+                    target_atten = (target_atten + 8.0).min(60.0);
+                    target_df_mix = 1.0;
+                    target_hp = target_hp.max(110.0);
+                    target_eq_mix = (target_eq_mix - 0.1).max(0.5);
+                    target_exciter_mix = 0.0;
+                }
+
+                _df_mix = 1.0;
                 let current_atten = df.atten_lim.unwrap_or(target_atten);
-                let new_atten = smooth_value(current_atten, target_atten, 0.1);
+                let new_atten = smooth_value(current_atten, target_atten, 0.25);
                 df.set_atten_lim(new_atten);
-                df.min_db_thresh = smooth_value(df.min_db_thresh, target_min_thresh, 0.1);
-                df.max_db_df_thresh = smooth_value(df.max_db_df_thresh, target_max_thresh, 0.1);
-                df.max_db_erb_thresh = smooth_value(df.max_db_erb_thresh, target_max_thresh, 0.1);
-                highpass_cutoff = smooth_value(highpass_cutoff, target_hp, 0.1);
+                df.min_db_thresh = smooth_value(df.min_db_thresh, target_min_thresh, 0.25);
+                df.max_db_df_thresh = smooth_value(df.max_db_df_thresh, target_max_thresh, 0.25);
+                df.max_db_erb_thresh = smooth_value(df.max_db_erb_thresh, target_max_thresh, 0.25);
+                highpass_cutoff = smooth_value(highpass_cutoff, target_hp, 0.25);
                 highpass.set_cutoff(highpass_cutoff);
-                dynamic_eq.set_dry_wet(smooth_value(dynamic_eq.dry_wet(), target_eq_mix, 0.1));
+                // 动态 EQ 全湿，避免干/湿并行带来的相位梳状
+                dynamic_eq.set_dry_wet(1.0);
                 exciter
-                    .set_mix(smooth_value(exciter.mix(), target_exciter_mix, 0.1).clamp(0.0, 0.35));
+                    .set_mix(smooth_value(exciter.mix(), target_exciter_mix, 0.25).clamp(0.0, 0.3));
             }
-            // 录音降噪输出
+            // 录音降噪输出（仅 DF + 高通），保证 nc 不受后级 STFT/EQ 影响
             if let Some(ref rec) = recording {
                 if let Some(buffer) = outframe.as_slice() {
                     rec.append_denoised(buffer);
                 }
             }
-            // DF dry/wet 混合
-            if df_mix < 0.9999 && !bypass_enabled {
-                if let (Some(wet), Some(dry)) = (outframe.as_slice_mut(), inframe.as_slice()) {
-                    for (w, d) in wet.iter_mut().zip(dry.iter()) {
-                        *w = *w * df_mix + *d * (1.0 - df_mix);
+
+            if !bypass_enabled {
+                if stft_enabled {
+                    if stft_dirty {
+                        stft_eq.set_curve(
+                            stft_hf_gain,
+                            stft_air_gain,
+                            stft_tilt_gain,
+                            &stft_band_offsets,
+                            df.sr,
+                        );
+                        stft_dirty = false;
+                    }
+                    if let Some(buf) = outframe.as_slice_mut() {
+                        stft_eq.process_block(buf);
                     }
                 }
             }
@@ -1119,6 +1147,8 @@ fn get_worker_fn(
                 let metrics = {
                     let buffer =
                         outframe.as_slice_mut().expect("Output frame should be contiguous");
+                    // 保持全湿，防止并行干声导致的相位波动
+                    dynamic_eq.set_dry_wet(1.0);
                     dynamic_eq.process_block(buffer)
                 };
                 if post_trim_gain < 0.9999 {
@@ -1306,16 +1336,27 @@ fn get_worker_fn(
                 while let Ok(message) = r_opt.try_recv() {
                     match message {
                         ControlMessage::DeepFilter(control, value) => match control {
-                            DfControl::AttenLim => df.set_atten_lim(value),
+                            DfControl::AttenLim => {
+                                manual_atten = value;
+                                df.set_atten_lim(value);
+                            }
                             DfControl::PostFilterBeta => df.set_pf_beta(value),
-                            DfControl::MinThreshDb => df.min_db_thresh = value,
+                            DfControl::MinThreshDb => {
+                                manual_min_thresh = value;
+                                df.min_db_thresh = value;
+                            }
                             DfControl::MaxErbThreshDb => df.max_db_erb_thresh = value,
-                            DfControl::MaxDfThreshDb => df.max_db_df_thresh = value,
+                            DfControl::MaxDfThreshDb => {
+                                manual_max_thresh = value;
+                                df.max_db_df_thresh = value;
+                                df.max_db_erb_thresh = value;
+                            }
                         },
                         ControlMessage::Eq(control) => match control {
                             EqControl::SetEnabled(enabled) => dynamic_eq.set_enabled(enabled),
-                            EqControl::SetPreset(preset) => dynamic_eq.apply_preset(preset),
-                            EqControl::SetDryWet(ratio) => dynamic_eq.set_dry_wet(ratio),
+                        EqControl::SetPreset(preset) => dynamic_eq.apply_preset(preset),
+                        // 干/湿混合固定全湿，避免梳状；忽略外部传入比例
+                        EqControl::SetDryWet(_) => dynamic_eq.set_dry_wet(1.0),
                             EqControl::SetBandGain(idx, gain) => {
                                 dynamic_eq.set_band_gain(idx, gain)
                             }
@@ -1363,12 +1404,15 @@ fn get_worker_fn(
                             log::info!("高通滤波: {}", if enabled { "开启" } else { "关闭" });
                         }
                         ControlMessage::HighpassCutoff(freq) => {
+                            manual_highpass = freq;
+                            highpass_cutoff = freq;
                             highpass.set_cutoff(freq);
                             log::info!("高通截止频率: {:.0} Hz", freq);
                         }
-                        ControlMessage::DfMix(ratio) => {
-                            df_mix = ratio.clamp(0.0, 1.0);
-                            log::info!("DF 混合比例: {:.0}%", df_mix * 100.0);
+                        ControlMessage::DfMix(_) => {
+                            // 固定全湿，忽略外部比例，避免干/湿并行相位问题
+                            _df_mix = 1.0;
+                            log::info!("DF 混合比例固定为 100%");
                         }
                         ControlMessage::HeadroomGain(gain) => {
                             headroom_gain = gain.clamp(0.0, 1.0);
@@ -1479,6 +1523,13 @@ fn get_worker_fn(
                             stft_tilt_gain = db.clamp(-6.0, 6.0);
                             stft_dirty = true;
                             log::info!("STFT EQ 倾斜补偿: {:+.1} dB", stft_tilt_gain);
+                        }
+                        ControlMessage::StftEqBand(idx, db) => {
+                            if idx < stft_band_offsets.len() {
+                                stft_band_offsets[idx] = db.clamp(-6.0, 6.0);
+                                stft_dirty = true;
+                                log::info!("STFT EQ 静态段 {} 调整: {:+.1} dB", idx + 1, db);
+                            }
                         }
                         ControlMessage::BypassEnabled(enabled) => {
                             bypass_enabled = enabled;
@@ -1932,12 +1983,101 @@ fn compute_noise_features(spec: ArrayView2<Complex32>) -> NoiseFeatures {
 }
 
 fn classify_env(energy_db: f32, flatness: f32, centroid: f32) -> EnvClass {
-    if energy_db > -40.0 {
+    // 更敏感的噪声判定，优先进入 Noisy，重度降噪
+    if energy_db > -60.0 {
         EnvClass::Noisy
-    } else if flatness > 0.45 || centroid > 0.5 {
+    } else if flatness > 0.25 || centroid > 0.25 {
         EnvClass::Office
     } else {
         EnvClass::Quiet
+    }
+}
+#[derive(Clone, Copy)]
+struct SnrParams {
+    atten: f32,
+    min_thresh: f32,
+    max_thresh: f32,
+    df_mix: f32,
+    hp_cut: f32,
+    eq_mix: f32,
+    exciter_mix: f32,
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t.clamp(0.0, 1.0)
+}
+
+fn map_snr_to_params(snr_db: f32) -> SnrParams {
+    let points = [
+        (
+            -5.0,
+            SnrParams {
+                atten: 60.0,
+                min_thresh: -55.0,
+                max_thresh: 8.0,
+                df_mix: 1.0,
+                hp_cut: 110.0,
+                eq_mix: 0.5,
+                exciter_mix: 0.05,
+            },
+        ),
+        (
+            5.0,
+            SnrParams {
+                atten: 50.0,
+                min_thresh: -53.0,
+                max_thresh: 10.0,
+                df_mix: 1.0,
+                hp_cut: 90.0,
+                eq_mix: 0.6,
+                exciter_mix: 0.10,
+            },
+        ),
+        (
+            15.0,
+            SnrParams {
+                atten: 32.0,
+                min_thresh: -56.0,
+                max_thresh: 12.0,
+                df_mix: 0.9,
+                hp_cut: 70.0,
+                eq_mix: 0.7,
+                exciter_mix: 0.18,
+            },
+        ),
+        (
+            25.0,
+            SnrParams {
+                atten: 22.0,
+                min_thresh: -58.0,
+                max_thresh: 14.0,
+                df_mix: 0.8,
+                hp_cut: 55.0,
+                eq_mix: 0.8,
+                exciter_mix: 0.22,
+            },
+        ),
+    ];
+    let snr = snr_db.clamp(points[0].0, points[3].0);
+    let mut i = 0;
+    while i + 1 < points.len() && snr > points[i + 1].0 {
+        i += 1;
+    }
+    let (s0, p0) = points[i];
+    let (s1, p1) = points[i + 1];
+    let t = if (s1 - s0).abs() > 1e-6 {
+        (snr - s0) / (s1 - s0)
+    } else {
+        0.0
+    };
+    SnrParams {
+        atten: lerp(p0.atten, p1.atten, t),
+        min_thresh: lerp(p0.min_thresh, p1.min_thresh, t),
+        max_thresh: lerp(p0.max_thresh, p1.max_thresh, t),
+        df_mix: lerp(p0.df_mix, p1.df_mix, t),
+        hp_cut: lerp(p0.hp_cut, p1.hp_cut, t),
+        eq_mix: lerp(p0.eq_mix, p1.eq_mix, t),
+        exciter_mix: lerp(p0.exciter_mix, p1.exciter_mix, t),
     }
 }
 

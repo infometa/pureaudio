@@ -21,6 +21,7 @@ use iced::{
     alignment, executor, Alignment, Application, Color, Command, ContentFit, Element, Font, Length,
     Settings, Subscription, Theme,
 };
+use std::collections::HashMap;
 use image_rs::{Rgba, RgbaImage};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,10 @@ fn default_stft_tilt() -> f32 {
     0.0
 }
 
+fn default_stft_band_offsets() -> [f32; 8] {
+    [0.0; 8]
+}
+
 fn default_auto_play_file() -> Option<PathBuf> {
     Some(PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -224,6 +229,7 @@ struct SpecView {
     stft_hf_gain_db: f32,
     stft_air_gain_db: f32,
     stft_tilt_db: f32,
+    stft_band_offsets: [f32; 8],
     transient_enabled: bool,
     transient_gain: f32,
     transient_sustain: f32,
@@ -260,6 +266,7 @@ struct SpecView {
     is_saving: bool,
     status_text: String,
     last_saved: Option<(PathBuf, PathBuf, PathBuf)>,
+    input_buffers: HashMap<String, String>,
     spec_frames: u32,
     spec_freqs: u32,
     input_device_filter: String,
@@ -269,6 +276,33 @@ struct SpecView {
     selected_input_device: Option<String>,
     selected_output_device: Option<String>,
     show_device_selector: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum SliderTarget {
+    AttenLim,
+    PostFilterBeta,
+    MinThreshDb,
+    MaxErbThreshDb,
+    MaxDfThreshDb,
+    HighpassCutoff,
+    StftHfGain,
+    StftAirGain,
+    StftTilt,
+    StftBand(usize),
+    SaturationDrive,
+    SaturationMakeup,
+    SaturationMix,
+    ExciterMix,
+    TransientGain,
+    TransientSustain,
+    TransientMix,
+    AgcTarget,
+    AgcMaxGain,
+    AgcMaxAtten,
+    AgcWindow,
+    AgcAttack,
+    AgcRelease,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +318,14 @@ pub enum Message {
     MaxErbThreshDbChanged(f32),
     MaxDfThreshDbChanged(f32),
     DfMixChanged(f32),
+    SliderInputChanged {
+        key: String,
+        raw: String,
+        target: SliderTarget,
+        min: f32,
+        max: f32,
+        precision: usize,
+    },
     NoiseAdvancedToggled,
     EqEnabledChanged(bool),
     EqPresetSelected(EqPresetKind),
@@ -323,6 +365,7 @@ pub enum Message {
     StftEqHfChanged(f32),
     StftEqAirChanged(f32),
     StftEqTiltChanged(f32),
+    StftEqBandChanged(usize, f32),
     SaturationToggled(bool),
     SaturationDriveChanged(f32),
     SaturationMakeupChanged(f32),
@@ -402,6 +445,8 @@ pub struct UserConfig {
     stft_air_gain_db: f32,
     #[serde(default = "default_stft_tilt")]
     stft_tilt_db: f32,
+    #[serde(default = "default_stft_band_offsets")]
+    stft_band_offsets: [f32; 8],
     saturation_enabled: bool,
     saturation_drive: f32,
     saturation_makeup: f32,
@@ -593,7 +638,7 @@ impl Application for SpecView {
         let (noisy_spec, noisy_img) = create_spec_storage(spec_frames, spec_freqs);
         let (enh_spec, enh_img) = create_spec_storage(spec_frames, spec_freqs);
         let eq_preset = EqPresetKind::default();
-        let eq_dry_wet = eq_preset.default_mix();
+        let _eq_dry_wet = 1.0;
         let preset_config = eq_preset.preset();
         let mut eq_band_gains = [0.0; MAX_EQ_BANDS];
         let mut eq_band_frequencies = [0.0; MAX_EQ_BANDS];
@@ -637,7 +682,7 @@ impl Application for SpecView {
                 min_threshdb: -60.,
                 max_erbthreshdb: 20.,
                 max_dfthreshdb: 20.,
-                df_mix: 0.9,
+                df_mix: 1.0,
                 headroom_gain: 0.9,
                 post_trim_gain: 1.0,
                 noisy_img,
@@ -652,7 +697,7 @@ impl Application for SpecView {
                 r_env_status: None,
                 eq_enabled: true,
                 eq_preset,
-                eq_dry_wet,
+                eq_dry_wet: 1.0,
                 eq_status: EqStatus::default(),
                 eq_show_advanced: false,
                 noise_show_advanced: false,
@@ -680,6 +725,7 @@ impl Application for SpecView {
                 stft_hf_gain_db: default_stft_hf_gain(),
                 stft_air_gain_db: default_stft_air_gain(),
                 stft_tilt_db: default_stft_tilt(),
+                stft_band_offsets: [0.0; 8],
                 transient_enabled: true,
                 transient_gain: 3.5,
                 transient_sustain: 0.0,
@@ -715,6 +761,7 @@ impl Application for SpecView {
                 is_saving: false,
                 status_text: "待机".to_string(),
                 last_saved: None,
+                input_buffers: HashMap::new(),
                 spec_frames,
                 spec_freqs,
                 input_device_filter: String::new(),
@@ -814,16 +861,17 @@ impl Application for SpecView {
             }
             Message::EqPresetSelected(preset) => {
                 self.eq_preset = preset;
-                self.eq_dry_wet = preset.default_mix();
+                self.eq_dry_wet = 1.0;
                 self.apply_eq_preset_config(preset);
                 self.send_eq_control(EqControl::SetPreset(preset));
                 self.send_eq_control(EqControl::SetDryWet(self.eq_dry_wet));
                 self.broadcast_eq_parameters();
                 self.reset_eq_band_gains();
             }
-            Message::EqDryWetChanged(value) => {
-                self.eq_dry_wet = value;
-                self.send_eq_control(EqControl::SetDryWet(value));
+            Message::EqDryWetChanged(_value) => {
+                // 固定全湿，忽略滑条值，避免并行相位起伏
+                self.eq_dry_wet = 1.0;
+                self.send_eq_control(EqControl::SetDryWet(self.eq_dry_wet));
             }
             Message::EqBandGainChanged(idx, value) => self.set_eq_band_gain(idx, value),
             Message::EqBandFrequencyChanged(idx, value) => {
@@ -981,6 +1029,13 @@ impl Application for SpecView {
                 self.stft_tilt_db = db;
                 self.send_control_message(ControlMessage::StftEqTilt(db));
             }
+            Message::StftEqBandChanged(idx, db) => {
+                if idx < self.stft_band_offsets.len() {
+                    self.stft_band_offsets[idx] = db;
+                    self.set_buffer(&format!("stft_band_{}", idx), format!("{:.1}", db));
+                    self.send_control_message(ControlMessage::StftEqBand(idx, db));
+                }
+            }
             Message::SaturationToggled(enabled) => {
                 self.saturation_enabled = enabled;
                 self.send_control_message(ControlMessage::SaturationEnabled(enabled));
@@ -1133,8 +1188,24 @@ impl Application for SpecView {
                 self.max_dfthreshdb = v;
                 self.send_df_control(DfControl::MaxDfThreshDb, v);
             }
-            Message::DfMixChanged(v) => {
-                self.df_mix = v.clamp(0.0, 1.0);
+            Message::SliderInputChanged {
+                key,
+                raw,
+                target,
+                min,
+                max,
+                precision,
+            } => {
+                self.set_buffer(&key, raw.clone());
+                if let Ok(parsed) = raw.parse::<f32>() {
+                    let clamped = parsed.clamp(min, max);
+                    self.apply_slider_value(target, clamped);
+                    self.set_buffer(&key, format!("{:.precision$}", clamped));
+                }
+            }
+            Message::DfMixChanged(_v) => {
+                // 强制全湿，忽略传入比例，避免干/湿并行带来的相位梳状
+                self.df_mix = 1.0;
                 self.send_control_message(ControlMessage::DfMix(self.df_mix));
             }
             Message::NoiseAdvancedToggled => {
@@ -1425,6 +1496,9 @@ impl SpecView {
         self.send_control_message(ControlMessage::StftEqHfGain(self.stft_hf_gain_db));
         self.send_control_message(ControlMessage::StftEqAirGain(self.stft_air_gain_db));
         self.send_control_message(ControlMessage::StftEqTilt(self.stft_tilt_db));
+        for (idx, offset) in self.stft_band_offsets.iter().enumerate() {
+            self.send_control_message(ControlMessage::StftEqBand(idx, *offset));
+        }
         self.send_control_message(ControlMessage::SaturationEnabled(self.saturation_enabled));
         self.send_control_message(ControlMessage::SaturationDrive(self.saturation_drive));
         self.send_control_message(ControlMessage::SaturationMakeup(self.saturation_makeup));
@@ -1701,7 +1775,7 @@ impl SpecView {
                 self.min_threshdb = -60.0;
                 self.max_erbthreshdb = 20.0;
                 self.max_dfthreshdb = 20.0;
-                self.df_mix = 0.9;
+                self.df_mix = 1.0;
                 self.headroom_gain = 1.0;
                 self.post_trim_gain = 1.0;
                 self.transient_gain = 3.5;
@@ -1717,7 +1791,8 @@ impl SpecView {
                 self.agc_attack_ms = 500.0;
                 self.agc_release_ms = 2000.0;
                 self.eq_preset = EqPresetKind::Broadcast;
-                self.eq_dry_wet = self.eq_preset.default_mix();
+                self.eq_dry_wet = 1.0;
+                self.stft_band_offsets = [0.0; 8];
                 self.apply_eq_preset_config(self.eq_preset);
             }
             ScenePreset::OpenOffice => {
@@ -1738,7 +1813,8 @@ impl SpecView {
                 self.agc_target_db = -3.0;
                 self.agc_max_gain_db = 15.0;
                 self.eq_preset = EqPresetKind::OpenOffice;
-                self.eq_dry_wet = self.eq_preset.default_mix();
+                self.eq_dry_wet = 1.0;
+                self.stft_band_offsets = [0.0; 8];
                 self.apply_eq_preset_config(self.eq_preset);
             }
             ScenePreset::ConferenceHall => {
@@ -1747,7 +1823,7 @@ impl SpecView {
                 self.min_threshdb = -50.0;
                 self.max_erbthreshdb = 20.0;
                 self.max_dfthreshdb = 20.0;
-                self.df_mix = 0.85;
+                self.df_mix = 1.0;
                 self.headroom_gain = 1.0;
                 self.post_trim_gain = 1.0;
                 self.transient_gain = 2.0;
@@ -1759,10 +1835,12 @@ impl SpecView {
                 self.agc_target_db = -3.0;
                 self.agc_max_gain_db = 6.0;
                 self.eq_preset = EqPresetKind::ConferenceHall;
-                self.eq_dry_wet = self.eq_preset.default_mix();
+                self.eq_dry_wet = 1.0;
+                self.stft_band_offsets = [0.0; 8];
                 self.apply_eq_preset_config(self.eq_preset);
             }
         }
+        self.input_buffers.clear();
         self.sync_runtime_controls();
     }
 
@@ -1874,12 +1952,12 @@ impl SpecView {
             min_threshdb: self.min_threshdb,
             max_erbthreshdb: self.max_erbthreshdb,
             max_dfthreshdb: self.max_dfthreshdb,
-            df_mix: self.df_mix,
+            df_mix: 1.0,
             headroom_gain: self.headroom_gain,
             post_trim_gain: self.post_trim_gain,
             eq_enabled: self.eq_enabled,
             eq_preset: self.eq_preset,
-            eq_dry_wet: self.eq_dry_wet,
+            eq_dry_wet: 1.0,
             eq_band_gains: self.eq_band_gains,
             eq_band_frequencies: self.eq_band_frequencies,
             eq_band_qs: self.eq_band_qs,
@@ -1905,6 +1983,7 @@ impl SpecView {
             stft_hf_gain_db: self.stft_hf_gain_db,
             stft_air_gain_db: self.stft_air_gain_db,
             stft_tilt_db: self.stft_tilt_db,
+            stft_band_offsets: self.stft_band_offsets,
             saturation_enabled: self.saturation_enabled,
             saturation_drive: self.saturation_drive,
             saturation_makeup: self.saturation_makeup,
@@ -1935,12 +2014,12 @@ impl SpecView {
         self.min_threshdb = cfg.min_threshdb;
         self.max_erbthreshdb = cfg.max_erbthreshdb;
         self.max_dfthreshdb = cfg.max_dfthreshdb;
-        self.df_mix = cfg.df_mix;
+        self.df_mix = 1.0;
         self.headroom_gain = cfg.headroom_gain;
         self.post_trim_gain = cfg.post_trim_gain;
         self.eq_enabled = cfg.eq_enabled;
         self.eq_preset = cfg.eq_preset;
-        self.eq_dry_wet = cfg.eq_dry_wet;
+        self.eq_dry_wet = 1.0;
         self.eq_band_gains = cfg.eq_band_gains;
         self.eq_band_frequencies = cfg.eq_band_frequencies;
         self.eq_band_qs = cfg.eq_band_qs;
@@ -1956,6 +2035,10 @@ impl SpecView {
         self.eq_show_advanced = cfg.eq_show_advanced;
         self.eq_band_show_advanced = cfg.eq_band_show_advanced;
         self.eq_band_expanded = cfg.eq_band_expanded;
+        self.input_buffers.clear();
+        if !self.eq_band_expanded.is_empty() {
+            self.eq_band_expanded[0] = true;
+        }
         self.noise_show_advanced = cfg.noise_show_advanced;
         self.mute_playback = cfg.mute_playback;
         self.auto_play_enabled = cfg.auto_play_enabled;
@@ -1967,6 +2050,7 @@ impl SpecView {
         self.stft_hf_gain_db = cfg.stft_hf_gain_db;
         self.stft_air_gain_db = cfg.stft_air_gain_db;
         self.stft_tilt_db = cfg.stft_tilt_db;
+        self.stft_band_offsets = cfg.stft_band_offsets;
         self.saturation_enabled = cfg.saturation_enabled;
         self.saturation_drive = cfg.saturation_drive;
         self.saturation_makeup = cfg.saturation_makeup;
@@ -2059,11 +2143,6 @@ impl SpecView {
                 .width(Length::Fill),
             self.eq_preset.tooltip_text(),
         );
-        let mix_slider = apply_tooltip(
-            slider(0.0..=1.0, self.eq_dry_wet, Message::EqDryWetChanged).step(0.01),
-            tooltips::EQ_MIX,
-        );
-
         let mut general = column![
             row![toggle].align_items(Alignment::Center),
             row![text("预设:").size(14).width(60), preset_picker,]
@@ -2072,11 +2151,9 @@ impl SpecView {
             text(self.eq_preset.description()).size(13).width(Length::Fill),
             row![
                 text("混合:").size(14).width(60),
-                container(mix_slider).width(Length::Fill),
-                text(format!("{:.0}%", self.eq_dry_wet * 100.0))
+                text("100% (固定全湿，避免相位梳状)")
                     .size(14)
-                    .width(60)
-                    .horizontal_alignment(alignment::Horizontal::Right),
+                    .width(Length::Fill),
             ]
             .spacing(8)
             .align_items(Alignment::Center),
@@ -2094,11 +2171,13 @@ impl SpecView {
         .spacing(12);
 
         general = general
-            .push(slider_view(
+            .push(self.slider_view(
+                "atten_lim",
                 "噪声抑制 [dB]",
                 self.atten_lim,
                 0.,
                 100.,
+                SliderTarget::AttenLim,
                 Message::AttenLimChanged,
                 420,
                 0,
@@ -2108,25 +2187,19 @@ impl SpecView {
             .push(apply_tooltip(
                 row![
                     text("降噪混合 (%)").size(14).width(120),
-                    slider(0.0..=1.0, self.df_mix, |v| {
-                        Message::DfMixChanged((v * 100.0).round() / 100.0)
-                    })
-                    .step(0.01)
-                    .width(Length::Fill),
-                    text(format!("{:.0}%", self.df_mix * 100.0))
-                        .size(14)
-                        .width(70)
-                        .horizontal_alignment(alignment::Horizontal::Right)
+                    text("100% (固定全湿，避免梳状)").size(14).width(Length::Fill)
                 ]
                 .spacing(8)
                 .align_items(Alignment::Center),
                 tooltips::DF_MIX,
             ))
-            .push(slider_view(
+            .push(self.slider_view(
+                "post_filter_beta",
                 "后滤波 Beta",
                 self.post_filter_beta,
                 0.,
                 1.,
+                SliderTarget::PostFilterBeta,
                 Message::PostFilterChanged,
                 420,
                 3,
@@ -2149,33 +2222,39 @@ impl SpecView {
 
         if self.noise_show_advanced {
             let advanced_thresholds = column![
-                slider_view(
+                self.slider_view(
+                    "min_thresh",
                     "阈值下限 [dB]",
                     self.min_threshdb,
                     -60.,
                     35.,
+                    SliderTarget::MinThreshDb,
                     Message::MinThreshDbChanged,
                     420,
                     0,
                     1.,
                     Some(tooltips::MIN_THRESHOLD),
                 ),
-                slider_view(
+                self.slider_view(
+                    "max_erb",
                     "ERB 阈值上限 [dB]",
                     self.max_erbthreshdb,
                     -15.,
                     35.,
+                    SliderTarget::MaxErbThreshDb,
                     Message::MaxErbThreshDbChanged,
                     420,
                     0,
                     1.,
                     Some(tooltips::MAX_ERB_THRESHOLD),
                 ),
-                slider_view(
+                self.slider_view(
+                    "max_df",
                     "DF 阈值上限 [dB]",
                     self.max_dfthreshdb,
                     -15.,
                     35.,
+                    SliderTarget::MaxDfThreshDb,
                     Message::MaxDfThreshDbChanged,
                     420,
                     0,
@@ -2241,11 +2320,13 @@ impl SpecView {
             tooltips::HIGHPASS_FILTER,
         );
         let highpass_controls: Element<'_, Message> = if self.highpass_enabled {
-            slider_view(
+            self.slider_view(
+                "highpass_cutoff",
                 "截止频率 [Hz]",
                 self.highpass_cutoff,
                 0.0,
                 90.0,
+                SliderTarget::HighpassCutoff,
                 Message::HighpassCutoffChanged,
                 380,
                 0,
@@ -2263,42 +2344,77 @@ impl SpecView {
         .spacing(10)
         .align_items(Alignment::Center);
         let stft_controls: Element<'_, Message> = if self.stft_eq_enabled {
-            widget::Column::new()
-                .spacing(8)
-                .push(slider_view(
-                    "高频恢复 [dB] (6-12k)",
-                    self.stft_hf_gain_db,
-                    0.0,
-                    6.0,
-                    Message::StftEqHfChanged,
-                    380,
-                    1,
-                    0.1,
-                    Some("补偿 DF 高频损失，建议 1~3 dB"),
-                ))
-                .push(slider_view(
-                    "空气感 [dB] (12k+)",
-                    self.stft_air_gain_db,
-                    0.0,
-                    8.0,
-                    Message::StftEqAirChanged,
-                    380,
-                    1,
-                    0.1,
-                    Some("补偿 12k 以上空气感，建议 2~4 dB"),
-                ))
-                .push(slider_view(
-                    "倾斜 [dB]",
-                    self.stft_tilt_db,
-                    -4.0,
-                    4.0,
-                    Message::StftEqTiltChanged,
-                    380,
-                    2,
-                    0.1,
-                    Some("整体明暗倾斜，正值更亮"),
-                ))
-                .into()
+            {
+                let mut col = widget::Column::new().spacing(8);
+                col = col
+                    .push(self.slider_view(
+                        "stft_hf",
+                        "高频恢复 [dB] (6-12k)",
+                        self.stft_hf_gain_db,
+                        0.0,
+                        6.0,
+                        SliderTarget::StftHfGain,
+                        Message::StftEqHfChanged,
+                        380,
+                        1,
+                        0.1,
+                        Some("补偿 DF 高频损失，建议 1~3 dB"),
+                    ))
+                    .push(self.slider_view(
+                        "stft_air",
+                        "空气感 [dB] (12k+)",
+                        self.stft_air_gain_db,
+                        0.0,
+                        8.0,
+                        SliderTarget::StftAirGain,
+                        Message::StftEqAirChanged,
+                        380,
+                        1,
+                        0.1,
+                        Some("补偿 12k 以上空气感，建议 2~4 dB"),
+                    ))
+                    .push(self.slider_view(
+                        "stft_tilt",
+                        "倾斜 [dB]",
+                        self.stft_tilt_db,
+                        -4.0,
+                        4.0,
+                        SliderTarget::StftTilt,
+                        Message::StftEqTiltChanged,
+                        380,
+                        2,
+                        0.1,
+                        Some("整体明暗倾斜，正值更亮"),
+                    ));
+                // 8 段静态 EQ 微调
+                let band_labels = [
+                    "段1 60-120 Hz",
+                    "段2 120-250 Hz",
+                    "段3 250-500 Hz",
+                    "段4 500-1.5k Hz",
+                    "段5 1.5-3k Hz",
+                    "段6 3-6k Hz",
+                    "段7 6-10k Hz",
+                    "段8 10-14k Hz",
+                ];
+                for (i, label) in band_labels.iter().enumerate() {
+                    let idx = i;
+                    col = col.push(self.slider_view(
+                        &format!("stft_band_{}", idx),
+                        &format!("静态 EQ {} [dB]", label),
+                        self.stft_band_offsets[idx],
+                        -3.0,
+                        3.0,
+                        SliderTarget::StftBand(idx),
+                        move |v| Message::StftEqBandChanged(idx, v),
+                        380,
+                        1,
+                        0.1,
+                        Some("微调该频段的静态补偿，-3~+3 dB"),
+                    ));
+                }
+                col.into()
+            }
         } else {
             widget::Column::new().into()
         };
@@ -2329,33 +2445,39 @@ impl SpecView {
             let mut advanced = widget::Column::new();
             if self.show_saturation_advanced {
                 advanced = advanced
-                    .push(slider_view(
+                    .push(self.slider_view(
+                        "saturation_drive",
                         "驱动 (Drive)",
                         self.saturation_drive,
                         0.8,
                         1.8,
+                        SliderTarget::SaturationDrive,
                         Message::SaturationDriveChanged,
                         380,
                         2,
                         0.02,
                         Some(tooltips::SATURATION_DRIVE),
                     ))
-                    .push(slider_view(
+                    .push(self.slider_view(
+                        "saturation_makeup",
                         "补偿增益 [dB]",
                         self.saturation_makeup,
                         -6.0,
                         3.0,
+                        SliderTarget::SaturationMakeup,
                         Message::SaturationMakeupChanged,
                         380,
                         1,
                         0.1,
                         Some(tooltips::SATURATION_MAKEUP),
                     ))
-                    .push(slider_view(
+                    .push(self.slider_view(
+                        "saturation_mix",
                         "混合比例 [%]",
                         self.saturation_mix,
                         0.0,
                         100.0,
+                        SliderTarget::SaturationMix,
                         Message::SaturationMixChanged,
                         380,
                         0,
@@ -2377,11 +2499,13 @@ impl SpecView {
         let exciter_controls: Element<'_, Message> = if self.exciter_enabled {
             widget::Column::new()
                 .spacing(8)
-                .push(slider_view(
+                .push(self.slider_view(
+                    "exciter_mix",
                     "激励混合 [%]",
                     self.exciter_mix * 100.0,
                     0.0,
                     50.0,
+                    SliderTarget::ExciterMix,
                     |v| Message::ExciterMixChanged(v / 100.0),
                     380,
                     0,
@@ -2419,33 +2543,39 @@ impl SpecView {
             let mut advanced = widget::Column::new();
             if self.show_transient_advanced {
                 advanced = advanced
-                    .push(slider_view(
+                    .push(self.slider_view(
+                        "transient_gain",
                         "瞬态增益 [dB]",
                         self.transient_gain,
                         0.,
                         12.,
+                        SliderTarget::TransientGain,
                         Message::TransientGainChanged,
                         380,
                         1,
                         0.5,
                         Some(tooltips::TRANSIENT_GAIN),
                     ))
-                    .push(slider_view(
+                    .push(self.slider_view(
+                        "transient_sustain",
                         "释放增益 [dB]",
                         self.transient_sustain,
                         -12.0,
                         6.0,
+                        SliderTarget::TransientSustain,
                         Message::TransientSustainChanged,
                         380,
                         1,
                         0.5,
                         Some(tooltips::TRANSIENT_SUSTAIN),
                     ))
-                    .push(slider_view(
+                    .push(self.slider_view(
+                        "transient_mix",
                         "混合比例 [%]",
                         self.transient_mix,
                         0.,
                         100.,
+                        SliderTarget::TransientMix,
                         Message::TransientMixChanged,
                         380,
                         0,
@@ -2484,60 +2614,78 @@ impl SpecView {
                 advanced = advanced
                     .push(self.create_slider_row(
                         "目标电平 [dBFS]",
+                        Some("agc_target"),
                         self.agc_target_db,
                         -18.0,
                         -6.0,
                         0.5,
+                        1,
+                        Some(SliderTarget::AgcTarget),
                         Message::AgcTargetChanged,
                         |v| format!("{:.1} dBFS", v),
                         tooltips::AGC_TARGET,
                     ))
                     .push(self.create_slider_row(
                         "最大增益 [dB]",
+                        Some("agc_max_gain"),
                         self.agc_max_gain_db,
                         0.0,
                         18.0,
                         0.5,
+                        1,
+                        Some(SliderTarget::AgcMaxGain),
                         Message::AgcMaxGainChanged,
                         |v| format!("{:+.1} dB", v),
                         tooltips::AGC_MAX_GAIN,
                     ))
                     .push(self.create_slider_row(
                         "最大衰减 [dB]",
+                        Some("agc_max_atten"),
                         self.agc_max_atten_db,
                         3.0,
                         18.0,
                         0.5,
+                        1,
+                        Some(SliderTarget::AgcMaxAtten),
                         Message::AgcMaxAttenChanged,
                         |v| format!("-{:.1} dB", v),
                         tooltips::AGC_MAX_ATTEN,
                     ))
                     .push(self.create_slider_row(
                         "检测窗长 [s]",
+                        Some("agc_window"),
                         self.agc_window_sec,
                         0.2,
                         2.0,
                         0.05,
+                        2,
+                        Some(SliderTarget::AgcWindow),
                         Message::AgcWindowChanged,
                         |v| format!("{:.2} s", v),
                         "AGC RMS 窗长，越短越快响，越长越平滑。",
                     ))
                     .push(self.create_slider_row(
                         "攻击时间 [ms]",
+                        Some("agc_attack"),
                         self.agc_attack_ms,
                         5.0,
                         800.0,
                         5.0,
+                        0,
+                        Some(SliderTarget::AgcAttack),
                         Message::AgcAttackChanged,
                         |v| format!("{:.0} ms", v),
                         "AGC 降增益速度，越短越快压制尖峰。",
                     ))
                     .push(self.create_slider_row(
                         "释放时间 [ms]",
+                        Some("agc_release"),
                         self.agc_release_ms,
                         100.0,
                         2500.0,
                         10.0,
+                        0,
+                        Some(SliderTarget::AgcRelease),
                         Message::AgcReleaseChanged,
                         |v| format!("{:.0} ms", v),
                         "AGC 提升增益速度，越长越自然。",
@@ -2665,10 +2813,13 @@ impl SpecView {
         if !is_expanded {
             let gain_slider = self.create_slider_row(
                 "增益 (dB)",
+                None,
                 self.eq_band_gains[idx],
                 -12.0,
                 12.0,
                 0.5,
+                1,
+                None,
                 move |v| Message::EqBandGainChanged(idx, v),
                 |v| format!("{:+.1} dB", v),
                 tooltips::EQ_PARAM_GAIN,
@@ -2683,40 +2834,52 @@ impl SpecView {
         let core = column![
             self.create_slider_row(
                 "增益 (dB)",
+                None,
                 self.eq_band_gains[idx],
                 -12.0,
                 12.0,
                 0.5,
+                1,
+                None,
                 move |v| Message::EqBandGainChanged(idx, v),
                 |v| format!("{:+.1} dB", v),
                 tooltips::EQ_PARAM_GAIN,
             ),
             self.create_slider_row(
                 "频率 (Hz)",
+                None,
                 self.eq_band_frequencies[idx],
                 20.0,
                 20000.0,
                 1.0,
+                0,
+                None,
                 move |v| Message::EqBandFrequencyChanged(idx, v),
                 |v| format!("{:.0} Hz", v),
                 tooltips::EQ_PARAM_FREQUENCY,
             ),
             self.create_slider_row(
                 "阈值 (dB)",
+                None,
                 self.eq_band_thresholds[idx],
                 -60.0,
                 0.0,
                 0.5,
+                1,
+                None,
                 move |v| Message::EqBandThresholdChanged(idx, v),
                 |v| format!("{:+.1} dB", v),
                 tooltips::EQ_PARAM_THRESHOLD,
             ),
             self.create_slider_row(
                 "比率",
+                None,
                 self.eq_band_ratios[idx],
                 1.0,
                 10.0,
                 0.1,
+                1,
+                None,
                 move |v| Message::EqBandRatioChanged(idx, v),
                 |v| ratio_short_text(self.eq_band_modes[idx], v),
                 tooltips::EQ_PARAM_RATIO,
@@ -2738,60 +2901,78 @@ impl SpecView {
                 column![
                     self.create_slider_row(
                         "Q 值",
+                        None,
                         self.eq_band_qs[idx],
                         0.1,
                         5.0,
                         0.01,
+                        2,
+                        None,
                         move |v| Message::EqBandQChanged(idx, v),
                         |v| format!("{:.2}", v),
                         tooltips::EQ_PARAM_Q,
                     ),
                     self.create_slider_row(
                         "检测器 Q",
+                        None,
                         self.eq_band_detector_qs[idx],
                         0.1,
                         5.0,
                         0.01,
+                        2,
+                        None,
                         move |v| Message::EqBandDetectorQChanged(idx, v),
                         |v| format!("{:.2}", v),
                         tooltips::EQ_PARAM_DETECTOR_Q,
                     ),
                     self.create_slider_row(
                         "最大增益 (dB)",
+                        None,
                         self.eq_band_max_gains[idx],
                         0.0,
                         20.0,
                         0.5,
+                        1,
+                        None,
                         move |v| Message::EqBandMaxGainChanged(idx, v),
                         |v| format!("{:.1} dB", v),
                         tooltips::EQ_PARAM_MAX_GAIN,
                     ),
                     self.create_slider_row(
                         "起音 (ms)",
+                        None,
                         self.eq_band_attacks[idx],
                         1.0,
                         100.0,
                         1.0,
+                        0,
+                        None,
                         move |v| Message::EqBandAttackChanged(idx, v),
                         |v| format!("{:.0} ms", v),
                         tooltips::EQ_PARAM_ATTACK,
                     ),
                     self.create_slider_row(
                         "释放 (ms)",
+                        None,
                         self.eq_band_releases[idx],
                         10.0,
                         500.0,
                         5.0,
+                        0,
+                        None,
                         move |v| Message::EqBandReleaseChanged(idx, v),
                         |v| format!("{:.0} ms", v),
                         tooltips::EQ_PARAM_RELEASE,
                     ),
                     self.create_slider_row(
                         "补偿 (dB)",
+                        None,
                         self.eq_band_makeups[idx],
                         -6.0,
                         6.0,
                         0.1,
+                        1,
+                        None,
                         move |v| Message::EqBandMakeupChanged(idx, v),
                         |v| format!("{:+.1} dB", v),
                         tooltips::EQ_PARAM_MAKEUP,
@@ -2836,13 +3017,133 @@ impl SpecView {
             .into()
     }
 
+    fn buffer_value(&self, key: &str, value: f32, precision: usize) -> String {
+        self.input_buffers
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| format!("{:.precision$}", value))
+    }
+
+    fn set_buffer(&mut self, key: &str, value: String) {
+        self.input_buffers.insert(key.to_string(), value);
+    }
+
+    fn apply_slider_value(&mut self, target: SliderTarget, value: f32) {
+        match target {
+            SliderTarget::AttenLim => {
+                self.atten_lim = value;
+                self.send_df_control(DfControl::AttenLim, value);
+            }
+            SliderTarget::PostFilterBeta => {
+                self.post_filter_beta = value;
+                self.send_df_control(DfControl::PostFilterBeta, value);
+            }
+            SliderTarget::MinThreshDb => {
+                self.min_threshdb = value;
+                self.send_df_control(DfControl::MinThreshDb, value);
+            }
+            SliderTarget::MaxErbThreshDb => {
+                self.max_erbthreshdb = value;
+                self.send_df_control(DfControl::MaxErbThreshDb, value);
+            }
+            SliderTarget::MaxDfThreshDb => {
+                self.max_dfthreshdb = value;
+                self.send_df_control(DfControl::MaxDfThreshDb, value);
+            }
+            SliderTarget::HighpassCutoff => {
+                self.highpass_cutoff = value;
+                self.send_control_message(ControlMessage::HighpassCutoff(value));
+            }
+            SliderTarget::StftHfGain => {
+                self.stft_hf_gain_db = value;
+                self.send_control_message(ControlMessage::StftEqHfGain(value));
+            }
+            SliderTarget::StftAirGain => {
+                self.stft_air_gain_db = value;
+                self.send_control_message(ControlMessage::StftEqAirGain(value));
+            }
+            SliderTarget::StftTilt => {
+                self.stft_tilt_db = value;
+                self.send_control_message(ControlMessage::StftEqTilt(value));
+            }
+            SliderTarget::StftBand(idx) => {
+                if idx < self.stft_band_offsets.len() {
+                    self.stft_band_offsets[idx] = value;
+                    self.send_control_message(ControlMessage::StftEqBand(idx, value));
+                }
+            }
+            SliderTarget::SaturationDrive => {
+                self.saturation_drive = value;
+                self.send_control_message(ControlMessage::SaturationDrive(value));
+            }
+            SliderTarget::SaturationMakeup => {
+                self.saturation_makeup = value;
+                self.send_control_message(ControlMessage::SaturationMakeup(value));
+            }
+            SliderTarget::SaturationMix => {
+                self.saturation_mix = value;
+                self.send_control_message(ControlMessage::SaturationMix(value));
+            }
+            SliderTarget::ExciterMix => {
+                let mix = (value / 100.0).clamp(0.0, 0.5);
+                self.exciter_mix = mix;
+                self.send_control_message(ControlMessage::ExciterMix(mix));
+            }
+            SliderTarget::TransientGain => {
+                self.transient_gain = value;
+                self.send_control_message(ControlMessage::TransientGain(value));
+            }
+            SliderTarget::TransientSustain => {
+                self.transient_sustain = value;
+                self.send_control_message(ControlMessage::TransientSustain(value));
+            }
+            SliderTarget::TransientMix => {
+                self.transient_mix = value;
+                self.send_control_message(ControlMessage::TransientMix(value));
+            }
+            SliderTarget::AgcTarget => {
+                self.agc_target_db = value;
+                self.send_control_message(ControlMessage::AgcTargetLevel(value));
+            }
+            SliderTarget::AgcMaxGain => {
+                self.agc_max_gain_db = value;
+                self.send_control_message(ControlMessage::AgcMaxGain(value));
+            }
+            SliderTarget::AgcMaxAtten => {
+                self.agc_max_atten_db = value;
+                self.send_control_message(ControlMessage::AgcMaxAttenuation(value));
+            }
+            SliderTarget::AgcWindow => {
+                self.agc_window_sec = value;
+                self.send_control_message(ControlMessage::AgcWindowSeconds(value));
+            }
+            SliderTarget::AgcAttack => {
+                self.agc_attack_ms = value;
+                self.send_control_message(ControlMessage::AgcAttackRelease(
+                    value,
+                    self.agc_release_ms,
+                ));
+            }
+            SliderTarget::AgcRelease => {
+                self.agc_release_ms = value;
+                self.send_control_message(ControlMessage::AgcAttackRelease(
+                    self.agc_attack_ms,
+                    value,
+                ));
+            }
+        }
+    }
+
     fn create_slider_row<F, G>(
         &self,
         label: &str,
+        key: Option<&str>,
         value: f32,
         min: f32,
         max: f32,
         step: f32,
+        precision: usize,
+        target: Option<SliderTarget>,
         on_change: F,
         formatter: G,
         tooltip_text: &'static str,
@@ -2851,23 +3152,35 @@ impl SpecView {
         F: 'static + Copy + Fn(f32) -> Message,
         G: Fn(f32) -> String,
     {
-        let on_input = move |s: String| {
-            // 允许带单位的输入，提取数字部分
-            let cleaned: String = s
-                .chars()
-                .filter(|c| c.is_ascii_digit() || *c == '-' || *c == '+' || *c == '.')
-                .collect();
-            if let Ok(parsed) = cleaned.parse::<f32>() {
-                let clamped = parsed.clamp(min, max);
-                on_change(clamped)
+        let key_owned = key.map(|k| k.to_string());
+        let (display, on_input): (String, Box<dyn Fn(String) -> Message + 'static>) =
+            if let (Some(k), Some(t)) = (key_owned.clone(), target.clone()) {
+                let d = self.buffer_value(&k, value, precision);
+                let handler = move |s: String| Message::SliderInputChanged {
+                    key: k.clone(),
+                    raw: s,
+                    target: t.clone(),
+                    min,
+                    max,
+                    precision,
+                };
+                (d, Box::new(handler))
             } else {
-                Message::None
-            }
-        };
+                let d = formatter(value);
+                let handler = move |s: String| {
+                    if let Ok(parsed) = s.parse::<f32>() {
+                        let clamped = parsed.clamp(min, max);
+                        on_change(clamped)
+                    } else {
+                        Message::None
+                    }
+                };
+                (d, Box::new(handler))
+            };
         let row_element = row![
             text(label).size(13).width(110),
             slider(min..=max, value, on_change).step(step).width(Length::Fill),
-            text_input("", &formatter(value))
+            text_input("", &display)
                 .on_input(on_input)
                 .on_submit(Message::None)
                 .padding(6)
@@ -2878,47 +3191,53 @@ impl SpecView {
         .align_items(Alignment::Center);
         apply_tooltip(row_element, tooltip_text)
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn slider_view<'a>(
-    title: &str,
-    value: f32,
-    min: f32,
-    max: f32,
-    message: impl Fn(f32) -> Message + Copy + 'a,
-    width: u16,
-    precision: usize,
-    step: f32,
-    tooltip_text: Option<&'static str>,
-) -> Element<'a, Message> {
-    let slider_widget = slider(min..=max, value, message).step(step);
-    let slider_element = if let Some(text) = tooltip_text {
-        apply_tooltip(slider_widget, text)
-    } else {
-        slider_widget.into()
-    };
-    let on_input = move |s: String| {
-        if let Ok(parsed) = s.parse::<f32>() {
-            let clamped = parsed.clamp(min, max);
-            message(clamped)
+    #[allow(clippy::too_many_arguments)]
+    fn slider_view<'a>(
+        &self,
+        key: impl Into<String>,
+        title: &str,
+        value: f32,
+        min: f32,
+        max: f32,
+        target: SliderTarget,
+        message: impl Fn(f32) -> Message + Copy + 'a,
+        width: u16,
+        precision: usize,
+        step: f32,
+        tooltip_text: Option<&'static str>,
+    ) -> Element<'a, Message> {
+        let key: String = key.into();
+        let slider_widget = slider(min..=max, value, message).step(step);
+        let slider_element = if let Some(text) = tooltip_text {
+            apply_tooltip(slider_widget, text)
         } else {
-            Message::None
-        }
-    };
-    let input = text_input("", &format!("{:.precision$}", value))
-        .on_input(on_input)
-        .on_submit(Message::None)
-        .padding(6)
-        .size(16)
-        .width(90);
-    column![
-        text(title).size(18).width(Length::Fill),
-        row![container(slider_element).width(Length::Fill), input,]
-    ]
-    .max_width(width)
-    .width(Length::Fill)
-    .into()
+            slider_widget.into()
+        };
+        let display = self.buffer_value(&key, value, precision);
+        let on_input = move |s: String| Message::SliderInputChanged {
+            key: key.clone(),
+            raw: s,
+            target: target.clone(),
+            min,
+            max,
+            precision,
+        };
+        let input = text_input("", &display)
+            .on_input(on_input)
+            .on_submit(Message::None)
+            .padding(6)
+            .size(16)
+            .width(90);
+        column![
+            text(title).size(18).width(Length::Fill),
+            row![container(slider_element).width(Length::Fill), input,]
+        ]
+        .max_width(width)
+        .width(Length::Fill)
+        .into()
+    }
+
 }
 
 fn apply_tooltip<'a>(
