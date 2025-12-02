@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::env;
 use std::fmt::Display;
 use std::io::{self, stdout, Write};
@@ -9,7 +10,7 @@ use std::sync::{
     Arc, Mutex, Once,
 };
 use std::thread::{self, sleep, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::audio::agc::AutoGainControl;
 use crate::audio::eq::{DynamicEq, EqControl, EqPresetKind, MAX_EQ_BANDS};
@@ -27,6 +28,9 @@ use ndarray::prelude::*;
 use once_cell::sync::Lazy;
 use ringbuf::{producer::PostponedProducer, Consumer, HeapRb, SharedRb};
 use rubato::{FftFixedIn, FftFixedOut, Resampler};
+use webrtc_vad::Vad;
+
+const OUTPUT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/output");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnvClass {
@@ -269,6 +273,7 @@ pub enum ControlMessage {
     TransientGain(f32),
     TransientSustain(f32),
     TransientMix(f32),
+    VadEnabled(bool),
     HighpassCutoff(f32),
     SaturationEnabled(bool),
     SaturationDrive(f32),
@@ -759,6 +764,15 @@ fn get_worker_fn(
         let mut saturation = Saturation::new();
         let mut agc = AutoGainControl::new(df.sr as f32);
         let mut bus_limiter = BusLimiter::new(df.sr);
+        let mut vad = Vad::new(df.sr as i32).expect("初始化 WebRTC VAD 失败"); // 固定 DF 采样率
+        let vad_frame_len = match df.sr {
+            8000 => 160,   // 20 ms
+            16000 => 320,  // 20 ms
+            32000 => 640,  // 20 ms
+            48000 => 960,  // 20 ms
+            _ => 0,
+        };
+        let mut vad_buf: Vec<f32> = Vec::with_capacity(vad_frame_len.max(1));
         // 更长淡入，避免启动瞬间脉冲
         let fade_total = (df.sr as f32 * 0.20) as usize; // 200ms fade-in
         let mut fade_progress = 0usize;
@@ -786,6 +800,9 @@ fn get_worker_fn(
         let mut smoothed_energy = -80.0f32;
         let mut smoothed_flatness = 0.0f32;
         let mut smoothed_centroid = 0.0f32;
+        let mut smoothed_rt60 = 0.35f32;
+        let mut last_env_log = Instant::now();
+        let mut vad_enabled = true;
         // 噪声地板 & SNR 跟踪
         let mut noise_floor_db = -60.0f32;
         let mut snr_db = 10.0f32;
@@ -801,17 +818,20 @@ fn get_worker_fn(
         let mut manual_max_thresh = df.max_db_df_thresh;
         // 冲击/键盘保护计数
         let mut impact_hold = 0usize;
-        const IMPACT_HOLD_FRAMES: usize = 60; // 约 0.6s（取决于 hop）
+        const IMPACT_HOLD_FRAMES: usize = 80; // 更短保持，减小语音起音被吞
                                               // 柔和模式用于外部 ANC/极静环境，降低降噪力度并补高频
         let mut soft_mode = false;
         let mut last_soft_mode = false;
         // 滞后计数，避免频繁切换
         let mut soft_mode_hold = 0usize;
         const SOFT_MODE_HOLD_FRAMES: usize = 160; // 约 2s（取决于 hop）
+        let mut last_impact_hold = 0usize;
         let mut _auto_gain_scale = 1.0f32;
         has_init.store(true, Ordering::Relaxed);
         log::info!("Worker init");
         let block_duration = df.hop_size as f32 / df.sr as f32;
+        let rt60_window_frames = ((0.7 / block_duration).ceil() as usize).max(14);
+        let mut rt60_history: VecDeque<f32> = VecDeque::with_capacity(rt60_window_frames);
         // 连续低峰值检测阈值（约 3 秒）
         let low_peak_required = ((3.0 / block_duration).ceil() as usize).max(30);
         // 启动静音时长（避免“啪”），单位：Hop block 数
@@ -968,17 +988,50 @@ fn get_worker_fn(
                 smoothed_centroid =
                     smooth_value(smoothed_centroid, feats.spectral_centroid, update_alpha);
 
-                // 噪声地板跟踪：下降快，上升慢
-                if rms_db < noise_floor_db {
-                    noise_floor_db = smooth_value(noise_floor_db, rms_db, 0.4);
+                // WebRTC VAD 判定（优先）+ 简易备份
+                if let Some(buf) = inframe.as_slice() {
+                    // 聚合到 20ms 窗口
+                    vad_buf.extend_from_slice(buf);
+                    if vad_buf.len() > vad_frame_len * 2 && vad_frame_len > 0 {
+                        let keep_from = vad_buf.len() - vad_frame_len * 2;
+                        vad_buf.drain(0..keep_from);
+                    }
+                }
+                let vad_voice = if vad_enabled && vad_frame_len > 0 && vad_buf.len() >= vad_frame_len {
+                    run_webrtc_vad(&mut vad, &vad_buf, vad_frame_len).unwrap_or(false)
                 } else {
-                    noise_floor_db = smooth_value(noise_floor_db, rms_db, 0.02);
+                    false
+                };
+                let heuristic_voice = rms_db > -45.0
+                    && smoothed_flatness < 0.45
+                    && smoothed_centroid < 0.65;
+                let is_voice = vad_voice || heuristic_voice;
+
+                // 噪声地板跟踪：仅在非语音段更新，下降快，上升慢
+                if !is_voice {
+                    if rms_db < noise_floor_db {
+                        noise_floor_db = smooth_value(noise_floor_db, rms_db, 0.45);
+                    } else {
+                        noise_floor_db = smooth_value(noise_floor_db, rms_db, 0.03);
+                    }
+                    if rt60_history.len() >= rt60_window_frames {
+                        rt60_history.pop_front();
+                    }
+                    rt60_history.push_back(rms_db);
+                    if let Some(rt) = estimate_rt60_from_energy(&rt60_history, block_duration) {
+                        // 避免估计异常拉满，强制上限 0.8s
+                        smoothed_rt60 = smooth_value(smoothed_rt60, rt.clamp(0.2, 0.8), 0.25);
+                    }
                 }
                 snr_db = (rms_db - noise_floor_db).clamp(-5.0, 30.0);
 
                 // 柔和模式：低能量、低平坦度、低重心
-                let soft_candidate =
-                    smoothed_energy < -55.0 && smoothed_flatness < 0.2 && smoothed_centroid < 0.35;
+                // 仅在高 SNR、低噪声平坦度时进入柔和模式；低 SNR 或高混响时禁用
+                let soft_candidate = smoothed_energy < -55.0
+                    && smoothed_flatness < 0.2
+                    && smoothed_centroid < 0.35
+                    && snr_db > 8.0
+                    && smoothed_rt60 < 0.6;
                 if soft_candidate {
                     soft_mode_hold = soft_mode_hold.saturating_add(1);
                 } else {
@@ -987,6 +1040,9 @@ fn get_worker_fn(
                 if soft_mode_hold > SOFT_MODE_HOLD_FRAMES {
                     soft_mode = true;
                 } else if soft_mode_hold < SOFT_MODE_HOLD_FRAMES / 4 {
+                    soft_mode = false;
+                }
+                if soft_mode && (snr_db < 6.0 || smoothed_rt60 > 0.65) {
                     soft_mode = false;
                 }
                 if soft_mode != last_soft_mode {
@@ -1010,19 +1066,40 @@ fn get_worker_fn(
                     let rms = df::rms(buf.iter());
                     let peak = buf.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
                     let crest = if rms > 1e-6 { peak / rms } else { 0.0 };
-                    if crest > 12.0 && rms > 1e-3 {
+                    if crest > 5.5 && rms > 1e-4 {
+                        impact = true;
+                    } else {
+                        // 高频能量突增（键盘/点击常见），辅助触发
+                    let mut hf_energy = 0.0f32;
+                    let mut hf_count = 0usize;
+                    // 取每隔 4 个样本近似高频
+                    for (idx, v) in buf.iter().enumerate() {
+                        if idx % 4 == 0 {
+                            hf_energy += v * v;
+                            hf_count += 1;
+                        }
+                    }
+                    let hf_rms = if hf_count > 0 {
+                        (hf_energy / hf_count as f32).sqrt()
+                    } else {
+                        0.0
+                    };
+                    if hf_rms > 8e-4 && crest > 3.5 {
                         impact = true;
                     }
                 }
+                }
                 if impact {
-                    impact_hold = (impact_hold + 10).min(IMPACT_HOLD_FRAMES);
+                    impact_hold = (impact_hold + 20).min(IMPACT_HOLD_FRAMES);
                 } else if impact_hold > 0 {
                     impact_hold = impact_hold.saturating_sub(1);
                 }
+                last_impact_hold = impact_hold;
 
-                // SNR 连续映射（安静保色，嘈杂保清晰）
-                let mapped = map_snr_to_params(snr_db);
-                target_atten = mapped.atten.min(manual_atten);
+                // SNR + RT60 连续映射（安静保色，嘈杂/长混响保清晰）
+                let mapped = map_env_to_params(snr_db, smoothed_rt60);
+                // 自适应时允许超过手动阈值上限，优先确保抑制力度
+                target_atten = mapped.atten;
                 target_min_thresh = mapped.min_thresh.max(manual_min_thresh);
                 target_max_thresh = mapped.max_thresh.min(manual_max_thresh);
                 target_df_mix = 1.0;
@@ -1035,14 +1112,39 @@ fn get_worker_fn(
                     classify_env(smoothed_energy, smoothed_flatness, smoothed_centroid);
                 if target_env != env_class {
                     log::info!(
-                        "环境自适应: {:?} -> {:?} (energy {:.1} dB, flatness {:.3}, centroid {:.3}, SNR {:.1} dB, floor {:.1} dB)",
-                        env_class, target_env, smoothed_energy, smoothed_flatness, smoothed_centroid, snr_db, noise_floor_db
+                        "环境自适应: {:?} -> {:?} (energy {:.1} dB, flatness {:.3}, centroid {:.3}, SNR {:.1} dB, floor {:.1} dB, RT60 {:.2} s)",
+                        env_class, target_env, smoothed_energy, smoothed_flatness, smoothed_centroid, snr_db, noise_floor_db, smoothed_rt60
                     );
                     env_class = target_env;
                 }
 
+                // 节流日志，便于观测自适应是否生效（Warn 级别在默认日志下可见）
+                if last_env_log.elapsed() >= Duration::from_millis(900) {
+                    let impact_note = if impact_hold > 0 {
+                        "检测到冲击/点击，已触发强抑制（无 duck 以保护语音起音）"
+                    } else {
+                        "未检测到冲击"
+                    };
+                    log::warn!(
+                        "自适应: SNR {:.1} dB, RT60 {:.2} s；{}；VAD 语音={}；调整 衰减 {:.1} dB，高通 {:.0} Hz，阈值 {:.1}/{:.1} dB，EQ 湿度 {:.2}，激励 {:.2}；软模式 {}，冲击保持 {}",
+                        snr_db,
+                        smoothed_rt60,
+                        impact_note,
+                        is_voice,
+                        target_atten,
+                        target_hp,
+                        target_min_thresh,
+                        target_max_thresh,
+                        target_eq_mix,
+                        target_exciter_mix,
+                        soft_mode,
+                        impact_hold
+                    );
+                    last_env_log = Instant::now();
+                }
+
                 if soft_mode {
-                    target_atten = 24.0;
+                    target_atten = 30.0;
                     target_min_thresh = -58.0;
                     target_max_thresh = 12.0;
                     target_df_mix = 1.0;
@@ -1051,22 +1153,33 @@ fn get_worker_fn(
                     target_exciter_mix = 0.2;
                 }
 
+                // 语音段放松：降低额外抑制，减小高通，保护起音
+                if is_voice && impact_hold == 0 {
+                    target_atten = target_atten.min(60.0);
+                    target_hp = target_hp.min(140.0);
+                    target_eq_mix = target_eq_mix.max(0.6);
+                    target_exciter_mix = target_exciter_mix.max(0.05);
+                }
+
                 if impact_hold > 0 {
-                    target_atten = (target_atten + 8.0).min(60.0);
+                    // 键盘/点击/关门：瞬时提高抑制和高通，关闭激励
+                    target_atten = (target_atten + 12.0).min(75.0);
                     target_df_mix = 1.0;
-                    target_hp = target_hp.max(110.0);
-                    target_eq_mix = (target_eq_mix - 0.1).max(0.5);
+                    target_hp = target_hp.max(180.0);
+                    target_eq_mix = (target_eq_mix - 0.18).max(0.35);
                     target_exciter_mix = 0.0;
                 }
 
+                // 全湿，避免干湿并行导致相位/冲击泄露
                 _df_mix = 1.0;
                 let current_atten = df.atten_lim.unwrap_or(target_atten);
-                let new_atten = smooth_value(current_atten, target_atten, 0.25);
+                let alpha_fast = if impact_hold > 0 { 0.35 } else { 0.2 };
+                let new_atten = smooth_value(current_atten, target_atten, alpha_fast);
                 df.set_atten_lim(new_atten);
-                df.min_db_thresh = smooth_value(df.min_db_thresh, target_min_thresh, 0.25);
-                df.max_db_df_thresh = smooth_value(df.max_db_df_thresh, target_max_thresh, 0.25);
-                df.max_db_erb_thresh = smooth_value(df.max_db_erb_thresh, target_max_thresh, 0.25);
-                highpass_cutoff = smooth_value(highpass_cutoff, target_hp, 0.25);
+                df.min_db_thresh = smooth_value(df.min_db_thresh, target_min_thresh, alpha_fast);
+                df.max_db_df_thresh = smooth_value(df.max_db_df_thresh, target_max_thresh, alpha_fast);
+                df.max_db_erb_thresh = smooth_value(df.max_db_erb_thresh, target_max_thresh, alpha_fast);
+                highpass_cutoff = smooth_value(highpass_cutoff, target_hp, alpha_fast);
                 highpass.set_cutoff(highpass_cutoff);
                 // 动态 EQ 全湿，避免干/湿并行带来的相位梳状
                 dynamic_eq.set_dry_wet(1.0);
@@ -1265,27 +1378,6 @@ fn get_worker_fn(
             if let Some(buffer) = outframe.as_slice_mut() {
                 apply_final_limiter(buffer);
             }
-            if auto_sys_volume && !SYS_VOL_MON_ACTIVE.load(Ordering::Relaxed) {
-                if let Some(buffer) = outframe.as_slice() {
-                    let mut peak = 0.0f32;
-                    for v in buffer.iter() {
-                        peak = peak.max(v.abs());
-                    }
-                    const CLIP_THRESH: f32 = 0.95;
-                    const CLIP_FRAMES: usize = 2;
-                    const COOLDOWN: Duration = Duration::from_secs(1);
-                    if peak > CLIP_THRESH {
-                        clip_counter += 1;
-                    } else {
-                        clip_counter = 0;
-                    }
-                    if clip_counter >= CLIP_FRAMES && last_sys_adjust.elapsed() > COOLDOWN {
-                        clip_counter = 0;
-                        last_sys_adjust = Instant::now();
-                        adjust_system_input_volume_async(-15, 20, 90);
-                    }
-                }
-            }
             // 录音最终输出（限幅后）
             if let Some(ref rec) = recording {
                 if let Some(buffer) = outframe.as_slice_mut() {
@@ -1316,7 +1408,8 @@ fn get_worker_fn(
                     if warmup_blocks > 0 {
                         warmup_blocks = warmup_blocks.saturating_sub(1);
                     } else {
-                        let temp = buf[..n_out].to_vec();
+                        // 冲击期间短暂 duck，防止点击/关门残留
+                        let mut temp = buf[..n_out].to_vec();
                         push_output_block(&should_stop, &mut rb_out, &temp[..], n_out);
                     }
                 } else {
@@ -1445,6 +1538,10 @@ fn get_worker_fn(
                             }
                             log::info!("瞬态增强: {}", if enabled { "开启" } else { "关闭" });
                         }
+                        ControlMessage::VadEnabled(enabled) => {
+                            vad_enabled = enabled;
+                            log::warn!("WebRTC VAD: {}", if enabled { "开启" } else { "关闭" });
+                        }
                         ControlMessage::TransientGain(db) => {
                             transient_shaper.set_attack_gain(db);
                         }
@@ -1488,10 +1585,12 @@ fn get_worker_fn(
                         }
                         ControlMessage::EnvAutoEnabled(enabled) => {
                             env_auto_enabled = enabled;
-                            log::info!("环境自适应: {}", if enabled { "开启" } else { "关闭" });
+                            log::warn!("环境自适应: {}", if enabled { "开启" } else { "关闭" });
                             if !enabled {
                                 soft_mode = false;
                                 last_soft_mode = false;
+                                smoothed_rt60 = 0.35;
+                                rt60_history.clear();
                                 if let Some(ref sender) = s_env_status {
                                     let _ = sender.try_send(EnvStatus::Normal);
                                 }
@@ -1952,6 +2051,25 @@ fn smooth_value(current: f32, target: f32, alpha: f32) -> f32 {
     current + (target - current) * alpha.clamp(0.0, 1.0)
 }
 
+fn run_webrtc_vad(vad: &mut Vad, frame: &[f32], frame_len: usize) -> Option<bool> {
+    if frame_len == 0 || frame.len() < frame_len {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(frame_len);
+    for &v in frame.iter().rev().take(frame_len).rev() {
+        let clamped = v.clamp(-1.0, 1.0);
+        buf.push((clamped * 32767.0) as i16);
+    }
+    vad.is_voice_segment(&buf).ok()
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_millis(0))
+        .as_millis()
+}
+
 fn compute_noise_features(spec: ArrayView2<Complex32>) -> NoiseFeatures {
     let (_, freq_len) = spec.dim();
     let freq_len_f32 = freq_len.max(1) as f32;
@@ -1982,6 +2100,31 @@ fn compute_noise_features(spec: ArrayView2<Complex32>) -> NoiseFeatures {
     }
 }
 
+fn estimate_rt60_from_energy(history: &VecDeque<f32>, block_duration: f32) -> Option<f32> {
+    let len = history.len();
+    if len < 10 {
+        return None;
+    }
+    let duration = block_duration * (len.saturating_sub(1) as f32);
+    if duration < 0.2 {
+        return None;
+    }
+    let head = (len as f32 * 0.35).max(4.0) as usize;
+    let tail = (len as f32 * 0.25).max(3.0) as usize;
+    let start_mean = history.iter().take(head).sum::<f32>() / head as f32;
+    let end_mean = history.iter().rev().take(tail).sum::<f32>() / tail as f32;
+    let decay_db = start_mean - end_mean;
+    if decay_db < 6.0 {
+        return None;
+    }
+    let slope = (end_mean - start_mean) / duration; // dB/s，衰减应为负值
+    if slope >= -10.0 {
+        return None;
+    }
+    let rt60 = (-60.0 / slope).clamp(0.2, 1.2);
+    Some(rt60)
+}
+
 fn classify_env(energy_db: f32, flatness: f32, centroid: f32) -> EnvClass {
     // 更敏感的噪声判定，优先进入 Noisy，重度降噪
     if energy_db > -60.0 {
@@ -2010,55 +2153,67 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 fn map_snr_to_params(snr_db: f32) -> SnrParams {
     let points = [
         (
+            -15.0,
+            SnrParams {
+                atten: 90.0,
+                min_thresh: -60.0,
+                max_thresh: 4.0,
+                df_mix: 1.0,
+                hp_cut: 180.0,
+                eq_mix: 0.3,
+                exciter_mix: 0.0,
+            },
+        ),
+        (
             -5.0,
             SnrParams {
-                atten: 60.0,
-                min_thresh: -55.0,
-                max_thresh: 8.0,
+                atten: 80.0,
+                min_thresh: -58.0,
+                max_thresh: 6.0,
                 df_mix: 1.0,
-                hp_cut: 110.0,
-                eq_mix: 0.5,
+                hp_cut: 140.0,
+                eq_mix: 0.45,
                 exciter_mix: 0.05,
             },
         ),
         (
             5.0,
             SnrParams {
-                atten: 50.0,
-                min_thresh: -53.0,
-                max_thresh: 10.0,
+                atten: 58.0,
+                min_thresh: -55.0,
+                max_thresh: 8.0,
                 df_mix: 1.0,
-                hp_cut: 90.0,
-                eq_mix: 0.6,
-                exciter_mix: 0.10,
+                hp_cut: 110.0,
+                eq_mix: 0.55,
+                exciter_mix: 0.06,
             },
         ),
         (
             15.0,
             SnrParams {
-                atten: 32.0,
-                min_thresh: -56.0,
+                atten: 40.0,
+                min_thresh: -58.0,
                 max_thresh: 12.0,
-                df_mix: 0.9,
-                hp_cut: 70.0,
-                eq_mix: 0.7,
-                exciter_mix: 0.18,
+                df_mix: 1.0,
+                hp_cut: 80.0,
+                eq_mix: 0.75,
+                exciter_mix: 0.15,
             },
         ),
         (
             25.0,
             SnrParams {
-                atten: 22.0,
-                min_thresh: -58.0,
+                atten: 25.0,
+                min_thresh: -60.0,
                 max_thresh: 14.0,
-                df_mix: 0.8,
-                hp_cut: 55.0,
-                eq_mix: 0.8,
-                exciter_mix: 0.22,
+                df_mix: 1.0,
+                hp_cut: 60.0,
+                eq_mix: 0.85,
+                exciter_mix: 0.20,
             },
         ),
     ];
-    let snr = snr_db.clamp(points[0].0, points[3].0);
+    let snr = snr_db.clamp(points[0].0, points[points.len() - 1].0);
     let mut i = 0;
     while i + 1 < points.len() && snr > points[i + 1].0 {
         i += 1;
@@ -2079,6 +2234,27 @@ fn map_snr_to_params(snr_db: f32) -> SnrParams {
         eq_mix: lerp(p0.eq_mix, p1.eq_mix, t),
         exciter_mix: lerp(p0.exciter_mix, p1.exciter_mix, t),
     }
+}
+
+fn map_env_to_params(snr_db: f32, rt60: f32) -> SnrParams {
+    let mut params = map_snr_to_params(snr_db);
+    let rt60 = rt60.clamp(0.2, 0.8);
+    if rt60 > 0.5 {
+        // 混响重：增强抑制、提高高通、减弱高频/激励
+        let t = ((rt60 - 0.5) / 0.3).clamp(0.0, 1.0);
+        params.atten = (params.atten + 20.0 * t).min(95.0);
+        params.max_thresh -= 8.0 * t;
+        params.hp_cut = lerp(params.hp_cut.max(130.0), 220.0, t);
+        params.eq_mix = (params.eq_mix - 0.25 * t).clamp(0.25, 1.0);
+        params.exciter_mix = lerp(params.exciter_mix, 0.0, t).clamp(0.0, 0.15);
+    } else if rt60 < 0.3 {
+        // 混响轻：放松高通与抑制，保留音质
+        let t = ((0.3 - rt60) / 0.1).clamp(0.0, 1.0);
+        params.hp_cut = lerp(params.hp_cut, 70.0, t);
+        params.eq_mix = (params.eq_mix + 0.1 * t).clamp(0.0, 1.0);
+        params.exciter_mix = (params.exciter_mix + 0.08 * t).clamp(0.0, 0.22);
+    }
+    params
 }
 
 pub fn log_format(buf: &mut env_logger::fmt::Formatter, record: &log::Record) -> io::Result<()> {

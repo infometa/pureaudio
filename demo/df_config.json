@@ -1,0 +1,154 @@
+{
+  "version": 1,
+  "scene_preset": "Broadcast",
+  "atten_lim": 30.0,
+  "post_filter_beta": 0.0,
+  "min_threshdb": -60.0,
+  "max_erbthreshdb": 20.0,
+  "max_dfthreshdb": 20.0,
+  "df_mix": 1.0,
+  "headroom_gain": 0.9,
+  "post_trim_gain": 1.0,
+  "eq_enabled": false,
+  "eq_preset": "Broadcast",
+  "eq_dry_wet": 1.0,
+  "eq_band_gains": [
+    2.0,
+    3.0,
+    0.0,
+    2.0,
+    4.5
+  ],
+  "eq_band_frequencies": [
+    80.0,
+    180.0,
+    450.0,
+    3500.0,
+    8000.0
+  ],
+  "eq_band_qs": [
+    0.7,
+    1.0,
+    1.5,
+    1.2,
+    0.7
+  ],
+  "eq_band_detector_qs": [
+    0.7,
+    1.0,
+    1.5,
+    1.2,
+    0.7
+  ],
+  "eq_band_thresholds": [
+    -60.0,
+    -60.0,
+    -28.0,
+    -60.0,
+    -60.0
+  ],
+  "eq_band_ratios": [
+    1.0,
+    1.0,
+    3.0,
+    1.0,
+    1.0
+  ],
+  "eq_band_max_gains": [
+    6.0,
+    6.0,
+    4.0,
+    6.0,
+    8.0
+  ],
+  "eq_band_attacks": [
+    30.0,
+    30.0,
+    25.0,
+    20.0,
+    35.0
+  ],
+  "eq_band_releases": [
+    200.0,
+    200.0,
+    200.0,
+    160.0,
+    220.0
+  ],
+  "eq_band_makeups": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "eq_band_modes": [
+    "Upward",
+    "Upward",
+    "Downward",
+    "Upward",
+    "Upward"
+  ],
+  "eq_band_filters": [
+    "LowShelf",
+    "Peak",
+    "Peak",
+    "Peak",
+    "HighShelf"
+  ],
+  "eq_show_advanced": false,
+  "eq_band_show_advanced": [
+    false,
+    false,
+    false,
+    false,
+    false
+  ],
+  "eq_band_expanded": [
+    true,
+    false,
+    false,
+    false,
+    false
+  ],
+  "noise_show_advanced": false,
+  "mute_playback": false,
+  "auto_play_enabled": false,
+  "auto_play_file": "/Users/haifeng/Desktop/code/project/pureaudio/demo/audio/kh.wav",
+  "highpass_enabled": true,
+  "highpass_cutoff": 60.0,
+  "stft_eq_enabled": false,
+  "stft_hf_gain_db": 2.0,
+  "stft_air_gain_db": 3.0,
+  "stft_tilt_db": 0.0,
+  "stft_band_offsets": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "saturation_enabled": false,
+  "saturation_drive": 1.2,
+  "saturation_makeup": -0.5,
+  "saturation_mix": 100.0,
+  "show_saturation_advanced": false,
+  "transient_enabled": false,
+  "transient_gain": 3.5,
+  "transient_sustain": 0.0,
+  "transient_mix": 100.0,
+  "show_transient_advanced": false,
+  "agc_enabled": true,
+  "agc_target_db": -16.0,
+  "agc_max_gain_db": 12.0,
+  "agc_max_atten_db": 12.0,
+  "agc_window_sec": 0.6,
+  "agc_attack_ms": 500.0,
+  "agc_release_ms": 2000.0,
+  "show_agc_advanced": false,
+  "sys_auto_volume": false,
+  "env_auto_enabled": true
+}

@@ -257,6 +257,7 @@ struct SpecView {
     bypass_enabled: bool,
     user_selected_input: bool,
     user_selected_output: bool,
+    vad_enabled: bool,
     env_status_label: String,
     noise_show_advanced: bool,
     scene_preset: ScenePreset,
@@ -376,6 +377,7 @@ pub enum Message {
     TransientSustainChanged(f32),
     TransientMixChanged(f32),
     TransientToggleAdvanced,
+    VadToggled(bool),
     AgcToggled(bool),
     AgcTargetChanged(f32),
     AgcMaxGainChanged(f32),
@@ -695,7 +697,7 @@ impl Application for SpecView {
                 s_controls: None,
                 r_eq_status: None,
                 r_env_status: None,
-                eq_enabled: true,
+                eq_enabled: false,
                 eq_preset,
                 eq_dry_wet: 1.0,
                 eq_status: EqStatus::default(),
@@ -721,7 +723,7 @@ impl Application for SpecView {
                 auto_play_pid: None,
                 highpass_enabled: true,
                 highpass_cutoff: 60.0,
-                stft_eq_enabled: true,
+                stft_eq_enabled: false,
                 stft_hf_gain_db: default_stft_hf_gain(),
                 stft_air_gain_db: default_stft_air_gain(),
                 stft_tilt_db: default_stft_tilt(),
@@ -747,12 +749,13 @@ impl Application for SpecView {
                 show_agc_advanced: false,
                 sys_auto_volume: false,
                 env_auto_enabled: false,
+                vad_enabled: true,
                 exciter_enabled: true,
                 exciter_mix: 0.25,
                 bypass_enabled: false,
                 user_selected_input: false,
                 user_selected_output: false,
-                env_status_label: "环境自适应: 关闭".to_string(),
+                env_status_label: "自适应降噪: 关闭".to_string(),
                 sysvol_monitor: None,
                 scene_preset: ScenePreset::Broadcast,
                 model_path,
@@ -1119,11 +1122,15 @@ impl Application for SpecView {
             Message::EnvAutoToggled(enabled) => {
                 self.env_auto_enabled = enabled;
                 self.env_status_label = if enabled {
-                    "环境自适应: 正常".to_string()
+                    "自适应降噪: 正常".to_string()
                 } else {
-                    "环境自适应: 关闭".to_string()
+                    "自适应降噪: 关闭".to_string()
                 };
                 self.send_control_message(ControlMessage::EnvAutoEnabled(enabled));
+            }
+            Message::VadToggled(enabled) => {
+                self.vad_enabled = enabled;
+                self.send_control_message(ControlMessage::VadEnabled(enabled));
             }
             Message::ExciterToggled(enabled) => {
                 self.exciter_enabled = enabled;
@@ -1156,8 +1163,8 @@ impl Application for SpecView {
             }
             Message::EnvStatusUpdated(status) => {
                 self.env_status_label = match status {
-                    EnvStatus::Normal => "环境自适应: 正常".to_string(),
-                    EnvStatus::Soft => "环境自适应: 柔和".to_string(),
+                    EnvStatus::Normal => "自适应降噪: 正常".to_string(),
+                    EnvStatus::Soft => "自适应降噪: 柔和".to_string(),
                 };
             }
             Message::LsnrChanged(lsnr) => self.lsnr = lsnr,
@@ -1522,6 +1529,7 @@ impl SpecView {
         self.send_control_message(ControlMessage::MutePlayback(self.mute_playback));
         self.send_control_message(ControlMessage::SysAutoVolumeEnabled(self.sys_auto_volume));
         self.send_control_message(ControlMessage::EnvAutoEnabled(self.env_auto_enabled));
+        self.send_control_message(ControlMessage::VadEnabled(self.vad_enabled));
         let mut cmds: Vec<Command<Message>> = Vec::new();
         if self.auto_play_enabled {
             if let Some(path) = self.auto_play_file.clone() {
@@ -1884,6 +1892,7 @@ impl SpecView {
         ));
         self.send_control_message(ControlMessage::SysAutoVolumeEnabled(self.sys_auto_volume));
         self.send_control_message(ControlMessage::EnvAutoEnabled(self.env_auto_enabled));
+        self.send_control_message(ControlMessage::VadEnabled(self.vad_enabled));
     }
 
     fn ensure_sys_volume_monitor(&mut self) {
@@ -2716,11 +2725,24 @@ impl SpecView {
                     self.env_auto_enabled,
                     Message::EnvAutoToggled
                 ),
-                text("自动环境自适应（根据噪声自动调整降噪和高通）").size(14),
+                text("自适应降噪（根据噪声自动调整降噪和高通）").size(14),
             ]
             .spacing(10)
             .align_items(Alignment::Center),
-            "根据噪声特征自动调整 DF 阈值/高通/混合，无需手动切换预设",
+            "开启后根据噪声特征自动调整 DF 阈值/高通/混合，关闭则完全按手动参数",
+        );
+        let vad_toggle = apply_tooltip(
+            row![
+                toggler(
+                    String::new(),
+                    self.vad_enabled,
+                    Message::VadToggled
+                ),
+                text("VAD 语音检测（仅非语音段更新噪声/RT60）").size(14),
+            ]
+            .spacing(10)
+            .align_items(Alignment::Center),
+            "关闭可对比效果；关闭后噪声地板与 RT60 更新不再用 WebRTC VAD 门控",
         );
 
         container(
@@ -2739,7 +2761,8 @@ impl SpecView {
                 agc_row,
                 agc_controls,
                 sys_auto_volume_toggle,
-                env_auto_toggle
+                env_auto_toggle,
+                vad_toggle
             ]
             .spacing(12),
         )
