@@ -39,7 +39,7 @@ impl HighpassFilter {
 
     pub fn set_cutoff(&mut self, cutoff_hz: f32) {
         let nyq = (self.sample_rate / 2.0).max(1.0);
-        let safe_max = nyq * 0.5;
+        let safe_max = nyq * 0.45;
         self.cutoff_hz = cutoff_hz.clamp(0.0, safe_max);
         self.update_coefficients();
     }
@@ -100,6 +100,16 @@ impl HighpassFilter {
         self.b2 = b2 / a0;
         self.a1 = a1 / a0;
         self.a2 = a2 / a0;
+        // 简单稳定性防护
+        let poles_sum = self.a1.abs() + self.a2.abs();
+        if poles_sum > 1.999 {
+            warn!(
+                "HighpassFilter 系数接近不稳定 (cutoff {:.1} Hz @ {:.0} Hz sr)，已钳制",
+                self.cutoff_hz, self.sample_rate
+            );
+            self.a1 = self.a1.clamp(-1.999, 1.999);
+            self.a2 = self.a2.clamp(-0.999, 0.999);
+        }
     }
 }
 

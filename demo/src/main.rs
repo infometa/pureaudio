@@ -471,6 +471,8 @@ pub struct UserConfig {
     sys_auto_volume: bool,
     #[serde(default = "default_false")]
     env_auto_enabled: bool,
+    #[serde(default = "default_true")]
+    vad_enabled: bool,
 }
 
 fn write_config_file(cfg: &UserConfig, path: &Path) -> Result<PathBuf, String> {
@@ -2013,6 +2015,7 @@ impl SpecView {
             show_agc_advanced: self.show_agc_advanced,
             sys_auto_volume: self.sys_auto_volume,
             env_auto_enabled: self.env_auto_enabled,
+            vad_enabled: self.vad_enabled,
         }
     }
 
@@ -2080,6 +2083,7 @@ impl SpecView {
         self.show_agc_advanced = cfg.show_agc_advanced;
         self.sys_auto_volume = cfg.sys_auto_volume;
         self.env_auto_enabled = cfg.env_auto_enabled;
+        self.vad_enabled = cfg.vad_enabled;
         self.sync_runtime_controls();
         self.ensure_sys_volume_monitor();
     }

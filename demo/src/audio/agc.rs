@@ -51,7 +51,6 @@ impl AutoGainControl {
         if sanitize_samples("AutoGainControl", samples) {
             return;
         }
-        let len = self.rms_buffer.len() as f32;
         for &sample in samples.iter() {
             let old_val = self.rms_buffer[self.rms_index];
             let new_val = sample.powi(2);
@@ -60,7 +59,8 @@ impl AutoGainControl {
             self.rms_index = (self.rms_index + 1) % self.rms_buffer.len();
         }
 
-        let rms = (self.rms_sum / len).max(1e-10).sqrt();
+        let win_len = self.rms_buffer.len().max(1) as f32;
+        let rms = (self.rms_sum / win_len).max(1e-10).sqrt();
         let rms_db = 20.0 * rms.log10();
 
         let required_gain_db = self.target_level_db - rms_db;

@@ -39,7 +39,6 @@ impl HarmonicExciter {
             return;
         }
         let wet = self.mix;
-        let dry = 1.0 - wet;
         let drive = self.drive;
         let alpha = self.alpha;
         for sample in samples.iter_mut() {
@@ -49,8 +48,8 @@ impl HarmonicExciter {
             self.prev_hp = hp;
             // Gentle saturation on high band only
             let excited = (hp * drive).tanh() / drive;
-            // Mix: add excited high content back to original
-            *sample = *sample * dry + (*sample + excited) * wet;
+            // Mix: 只叠加高频激励，避免重复增强低频
+            *sample = *sample + excited * wet;
         }
     }
 
