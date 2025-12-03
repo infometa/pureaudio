@@ -1705,52 +1705,6 @@ impl SpecView {
 
     fn apply_scene(&mut self, scene: ScenePreset) {
         match scene {
-            ScenePreset::Broadcast => {
-                self.highpass_cutoff = 60.0;
-                self.atten_lim = 30.0;
-                self.min_threshdb = -60.0;
-                self.max_erbthreshdb = 20.0;
-                self.max_dfthreshdb = 20.0;
-                self.df_mix = 1.0;
-                self.headroom_gain = 1.0;
-                self.post_trim_gain = 1.0;
-                self.transient_gain = 3.5;
-                self.transient_sustain = 0.0;
-                self.transient_mix = 100.0;
-                self.saturation_drive = 1.2;
-                self.saturation_makeup = -0.5;
-                self.saturation_mix = 100.0;
-                self.agc_target_db = -12.0;
-                self.agc_max_gain_db = 15.0;
-                self.agc_max_atten_db = 12.0;
-                self.agc_window_sec = 1.0;
-                self.agc_attack_ms = 500.0;
-                self.agc_release_ms = 2000.0;
-                self.eq_preset = EqPresetKind::Broadcast;
-                self.eq_dry_wet = 1.0;
-                self.apply_eq_preset_config(self.eq_preset);
-            }
-            ScenePreset::OpenOffice => {
-                self.highpass_cutoff = 75.0;
-                self.atten_lim = 40.0;
-                self.min_threshdb = -50.0;
-                self.max_erbthreshdb = 20.0;
-                self.max_dfthreshdb = 20.0;
-                self.df_mix = 1.0;
-                self.headroom_gain = 1.0;
-                self.post_trim_gain = 1.0;
-                self.transient_gain = 4.5;
-                self.transient_sustain = 0.0;
-                self.transient_mix = 100.0;
-                self.saturation_drive = 1.1;
-                self.saturation_makeup = -0.5;
-                self.saturation_mix = 100.0;
-                self.agc_target_db = -3.0;
-                self.agc_max_gain_db = 15.0;
-                self.eq_preset = EqPresetKind::OpenOffice;
-                self.eq_dry_wet = 1.0;
-                self.apply_eq_preset_config(self.eq_preset);
-            }
             ScenePreset::ConferenceHall => {
                 self.highpass_cutoff = 50.0;
                 self.atten_lim = 20.0;
@@ -1773,14 +1727,14 @@ impl SpecView {
                 self.apply_eq_preset_config(self.eq_preset);
             }
             ScenePreset::OpenOfficeMeeting => {
-                // 开放式办公会议：重降噪、高通抬升，弱化激励，保护语音起音
+                // 开放式办公区：重降噪、高通抬升，激励保守
                 self.highpass_cutoff = 120.0;
-                self.atten_lim = 45.0;
-                self.min_threshdb = -60.0;
-                self.max_erbthreshdb = 12.0;
-                self.max_dfthreshdb = 12.0;
+                self.atten_lim = 80.0;
+                self.min_threshdb = -55.0;
+                self.max_erbthreshdb = 10.0;
+                self.max_dfthreshdb = 10.0;
                 self.df_mix = 1.0;
-                self.headroom_gain = 0.9;
+                self.headroom_gain = 1.0;
                 self.post_trim_gain = 1.0;
                 self.transient_gain = 3.0;
                 self.transient_sustain = -2.0;
@@ -1797,8 +1751,8 @@ impl SpecView {
                 self.eq_preset = EqPresetKind::OpenOffice;
                 self.eq_dry_wet = 1.0;
                 self.apply_eq_preset_config(self.eq_preset);
-                self.exciter_enabled = false;
-                self.exciter_mix = 0.0;
+                self.exciter_enabled = true;
+                self.exciter_mix = 0.1;
                 self.env_auto_enabled = true;
                 self.vad_enabled = true;
             }
@@ -2483,17 +2437,17 @@ impl SpecView {
             if self.show_agc_advanced {
                 advanced = advanced
                     .push(self.create_slider_row(
-                        "目标电平 [dBFS]",
+                        "目标电平（距满刻度）[dB]",
                         Some("agc_target"),
                         self.agc_target_db,
-                        -18.0,
+                        -20.0,
                         -6.0,
-                        0.5,
+                        1.0,
                         1,
                         Some(SliderTarget::AgcTarget),
                         Message::AgcTargetChanged,
-                        |v| format!("{:.1} dBFS", v),
-                        tooltips::AGC_TARGET,
+                        |v| format!("{:.0} dBFS", v),
+                        "WebRTC AGC 目标：距满刻度的正值（0~31），-10 表示目标 -10 dBFS。",
                     ))
                     .push(self.create_slider_row(
                         "最大增益 [dB]",
@@ -2508,58 +2462,8 @@ impl SpecView {
                         |v| format!("{:+.1} dB", v),
                         tooltips::AGC_MAX_GAIN,
                     ))
-                    .push(self.create_slider_row(
-                        "最大衰减 [dB]",
-                        Some("agc_max_atten"),
-                        self.agc_max_atten_db,
-                        3.0,
-                        18.0,
-                        0.5,
-                        1,
-                        Some(SliderTarget::AgcMaxAtten),
-                        Message::AgcMaxAttenChanged,
-                        |v| format!("-{:.1} dB", v),
-                        tooltips::AGC_MAX_ATTEN,
-                    ))
-                    .push(self.create_slider_row(
-                        "检测窗长 [s]",
-                        Some("agc_window"),
-                        self.agc_window_sec,
-                        0.2,
-                        2.0,
-                        0.05,
-                        2,
-                        Some(SliderTarget::AgcWindow),
-                        Message::AgcWindowChanged,
-                        |v| format!("{:.2} s", v),
-                        "AGC RMS 窗长，越短越快响，越长越平滑。",
-                    ))
-                    .push(self.create_slider_row(
-                        "攻击时间 [ms]",
-                        Some("agc_attack"),
-                        self.agc_attack_ms,
-                        5.0,
-                        800.0,
-                        5.0,
-                        0,
-                        Some(SliderTarget::AgcAttack),
-                        Message::AgcAttackChanged,
-                        |v| format!("{:.0} ms", v),
-                        "AGC 降增益速度，越短越快压制尖峰。",
-                    ))
-                    .push(self.create_slider_row(
-                        "释放时间 [ms]",
-                        Some("agc_release"),
-                        self.agc_release_ms,
-                        100.0,
-                        2500.0,
-                        10.0,
-                        0,
-                        Some(SliderTarget::AgcRelease),
-                        Message::AgcReleaseChanged,
-                        |v| format!("{:.0} ms", v),
-                        "AGC 提升增益速度，越长越自然。",
-                    ));
+                    // WebRTC AGC 内部自适应，以下参数无效，收起避免误解
+                    ;
             }
             widget::Column::new().spacing(8).push(toggle_button).push(advanced).into()
         } else {

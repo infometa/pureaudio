@@ -1,0 +1,7 @@
+[env]
+# 保证 WebRTC AudioProcessing 编译能找到 Apple SDK/C++ 头文件与 glibtoolize（Homebrew）
+SDKROOT = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+CFLAGS = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+CXXFLAGS = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -I/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1"
+LIBTOOLIZE = "/opt/homebrew/opt/libtool/libexec/gnubin/glibtoolize"
+PATH = "/opt/homebrew/opt/libtool/libexec/gnubin:${PATH}"

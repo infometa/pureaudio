@@ -808,7 +808,7 @@ fn get_worker_fn(
         let mut exciter = HarmonicExciter::new(df.sr as f32, 3800.0, 1.6, 0.25);
         let mut transient_shaper = TransientShaper::new(df.sr as f32);
         let mut saturation = Saturation::new();
-        let mut agc = AutoGainControl::new(df.sr as f32);
+        let mut agc = AutoGainControl::new(df.sr as f32, df.hop_size);
         let mut vad = Vad::new(df.sr as i32)
             .ok()
             .map(|mut v| {
@@ -825,7 +825,7 @@ fn get_worker_fn(
         };
         let mut vad_buf: VecDeque<f32> = VecDeque::with_capacity(vad_frame_len.max(1) * 2);
         // 更长淡入，避免启动瞬间脉冲
-        let fade_total = (df.sr as f32 * 0.20) as usize; // 200ms fade-in
+        let fade_total = (df.sr as f32 * 0.08) as usize; // 80ms fade-in，减少开口被吞
         let mut fade_progress = 0usize;
         let mut highpass_enabled = true;
         let mut highpass_cutoff = 60.0f32;
@@ -851,9 +851,8 @@ fn get_worker_fn(
         let mut vad_state = false;
         let mut vad_voice_count = 0usize;
         let mut vad_noise_count = 0usize;
-        // 噪声门控，保护静音段不被环境/键盘穿透
+        // 噪声门控已禁用（交给 WebRTC AGC/DF 处理），固定全通
         let mut gate_gain = 1.0f32;
-        const GATE_FLOOR: f32 = 0.02;
         // 噪声地板 & SNR 跟踪
         let mut noise_floor_db = -60.0f32;
         let mut snr_db = 10.0f32;
@@ -887,8 +886,8 @@ fn get_worker_fn(
         let mut rt60_history: VecDeque<f32> = VecDeque::with_capacity(rt60_window_frames);
         // 连续低峰值检测阈值（约 3 秒）
         let low_peak_required = ((3.0 / block_duration).ceil() as usize).max(30);
-        // 启动静音时长（避免“啪”），单位：Hop block 数
-        let mut warmup_blocks = ((df.sr as f32 * 0.15) / df.hop_size as f32).ceil() as usize; // ~150ms
+        // 启动静音时长（避免“啪”），单位：Hop block 数；仅用于内部标记，不再丢弃输出
+        let mut warmup_blocks = 0usize;
         let (mut input_resampler, n_in) = if input_sr != df.sr {
             match FftFixedOut::<f32>::new(input_sr, df.sr, df.hop_size, 1, 1) {
                 Ok(r) => {
@@ -1212,19 +1211,15 @@ fn get_worker_fn(
                     atten: 100.0,
                     min_thresh: -5.0,
                     max_thresh: 8.0,
-                    df_mix: 1.0,
                     hp_cut: 120.0,
-                    eq_mix: 0.7,
-                    exciter_mix: 0.10,
+                    exciter_mix: 0.05,
                 };
                 let conf_anchor = SnrParams {
-                    atten: 40.0,
+                    atten: 50.0,
                     min_thresh: -15.0,
                     max_thresh: 12.0,
-                    df_mix: 1.0,
                     hp_cut: 60.0,
-                    eq_mix: 0.8,
-                    exciter_mix: 0.25,
+                    exciter_mix: 0.12,
                 };
                 // SNR 低则强行偏向办公区；否则根据 RT60 判断混响权重
                 let mut target_office = if snr_db < 10.0 {
@@ -1317,14 +1312,8 @@ fn get_worker_fn(
                     target_exciter_mix = 0.0;
                 }
 
-                // 输出端硬门限：非语音时强抑制，避免环境与键盘穿透
-                if Instant::now() < startup_guard_until {
-                    gate_gain = 1.0; // 启动期不 gate，保护开口
-                } else {
-                    let gate_target = if is_voice || impact_hold > 0 { 1.0 } else { GATE_FLOOR };
-                    let gate_alpha = if gate_target > gate_gain { 0.45 } else { 0.25 };
-                    gate_gain = smooth_value(gate_gain, gate_target, gate_alpha);
-                }
+                // 噪声门控交由 DF/AGC 处理，保持全通
+                gate_gain = 1.0;
 
                 // 全湿，避免干湿并行导致相位/冲击泄露
                 _df_mix = 1.0;
@@ -1368,17 +1357,13 @@ fn get_worker_fn(
                     log::error!("输出帧内存布局异常，跳过动态 EQ");
                     EqProcessMetrics::default()
                 };
-                if transient_enabled {
-                    if let Some(buffer) = outframe.as_slice_mut() {
-                        transient_shaper.process(buffer);
-                    }
-                }
+                // 饱和/谐波（可选，放在 AGC 前）
                 if saturation_enabled {
                     if let Some(buffer) = outframe.as_slice_mut() {
                         saturation.process(buffer);
                     }
                 }
-                // Add gentle harmonic excitation to restore air/brightness
+                // 高频激励（放在 AGC 前，轻混合）
                 if exciter_enabled {
                     if let Some(buffer) = outframe.as_slice_mut() {
                         exciter.process(buffer);
@@ -1394,6 +1379,10 @@ fn get_worker_fn(
                         for v in buffer.iter_mut() {
                             *v *= out_gain;
                         }
+                    }
+                    // AGC 之后轻微瞬态还原
+                    if transient_enabled {
+                        transient_shaper.process(buffer);
                     }
                 } else {
                     log::error!("输出帧内存布局异常，跳过后级处理");
@@ -1438,7 +1427,6 @@ fn get_worker_fn(
                             before
                         );
                         adjust_system_input_volume_async(DOWN_STEP, MIN_VOL, MAX_VOL);
-                        warmup_blocks = warmup_blocks.saturating_add(3);
                     } else if low_peak_counter >= low_peak_required
                         && last_sys_restore.elapsed() > RESTORE_COOLDOWN
                     {
@@ -1472,14 +1460,7 @@ fn get_worker_fn(
                     }
                 }
             }
-            // 非语音硬门限：在最终限幅前执行，静音段进一步压低输出
-            if env_auto_enabled && !bypass_enabled {
-                if let Some(buf) = outframe.as_slice_mut() {
-                    for v in buf.iter_mut() {
-                        *v *= gate_gain;
-                    }
-                }
-            }
+            // gate 已禁用
             let eq_elapsed = eq_start.elapsed();
             let mut eq_cpu = 0.0;
             if block_duration > 0.0 {
@@ -1524,8 +1505,6 @@ fn get_worker_fn(
                     if let Some(slice) = outframe.as_slice() {
                         if let Err(err) = r.process_into_buffer(&[slice], buf, None) {
                             log::error!("输出重采样失败: {:?}", err);
-                        } else if warmup_blocks > 0 {
-                            warmup_blocks = warmup_blocks.saturating_sub(1);
                         } else {
                             push_output_block(&should_stop, &mut rb_out, &buf[0][..n_out], n_out);
                         }
@@ -1533,12 +1512,8 @@ fn get_worker_fn(
                         log::error!("输出帧内存布局异常，跳过输出");
                     }
                 } else if let Some(buf) = outframe.as_slice() {
-                    if warmup_blocks > 0 {
-                        warmup_blocks = warmup_blocks.saturating_sub(1);
-                    } else {
-                        let temp = buf[..n_out].to_vec();
-                        push_output_block(&should_stop, &mut rb_out, &temp[..], n_out);
-                    }
+                    let temp = buf[..n_out].to_vec();
+                    push_output_block(&should_stop, &mut rb_out, &temp[..], n_out);
                 } else {
                     log::error!("输出帧内存布局异常，跳过输出");
                 }
@@ -1703,12 +1678,9 @@ fn get_worker_fn(
                             agc.set_attack_release(attack_ms, release_ms);
                             log::info!("AGC 攻击/释放: {:.0} / {:.0} ms", attack_ms, release_ms);
                         }
-                        ControlMessage::SysAutoVolumeEnabled(enabled) => {
-                            auto_sys_volume = enabled;
-                            log::info!(
-                                "自动系统音量保护: {}",
-                                if enabled { "开启" } else { "关闭" }
-                            );
+                        ControlMessage::SysAutoVolumeEnabled(_) => {
+                            auto_sys_volume = false;
+                            log::warn!("系统音量保护已禁用（使用 WebRTC AGC），忽略 UI 设置");
                         }
                         ControlMessage::EnvAutoEnabled(enabled) => {
                             env_auto_enabled = enabled;
@@ -1894,12 +1866,9 @@ fn get_worker_fn(
                             agc.set_attack_release(attack_ms, release_ms);
                             log::info!("AGC 攻击/释放: {:.0} / {:.0} ms", attack_ms, release_ms);
                         }
-                        ControlMessage::SysAutoVolumeEnabled(enabled) => {
-                            auto_sys_volume = enabled;
-                            log::info!(
-                                "自动系统音量保护: {}",
-                                if enabled { "开启" } else { "关闭" }
-                            );
+                        ControlMessage::SysAutoVolumeEnabled(_) => {
+                            auto_sys_volume = false;
+                            log::warn!("系统音量保护已禁用（使用 WebRTC AGC），忽略 UI 设置");
                         }
                         ControlMessage::EnvAutoEnabled(enabled) => {
                             env_auto_enabled = enabled;
@@ -2450,120 +2419,11 @@ struct SnrParams {
     min_thresh: f32,
     max_thresh: f32,
     hp_cut: f32,
-    df_mix: f32,
-    eq_mix: f32,
     exciter_mix: f32,
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t.clamp(0.0, 1.0)
-}
-
-fn map_snr_to_params(snr_db: f32) -> SnrParams {
-    let points = [
-        (
-            -15.0,
-            SnrParams {
-                atten: 90.0,
-                min_thresh: -60.0,
-                max_thresh: 4.0,
-                df_mix: 1.0,
-                hp_cut: 180.0,
-                eq_mix: 0.3,
-                exciter_mix: 0.0,
-            },
-        ),
-        (
-            -5.0,
-            SnrParams {
-                atten: 80.0,
-                min_thresh: -58.0,
-                max_thresh: 6.0,
-                df_mix: 1.0,
-                hp_cut: 140.0,
-                eq_mix: 0.45,
-                exciter_mix: 0.05,
-            },
-        ),
-        (
-            5.0,
-            SnrParams {
-                atten: 58.0,
-                min_thresh: -55.0,
-                max_thresh: 8.0,
-                df_mix: 1.0,
-                hp_cut: 110.0,
-                eq_mix: 0.55,
-                exciter_mix: 0.06,
-            },
-        ),
-        (
-            15.0,
-            SnrParams {
-                atten: 40.0,
-                min_thresh: -58.0,
-                max_thresh: 12.0,
-                df_mix: 1.0,
-                hp_cut: 80.0,
-                eq_mix: 0.75,
-                exciter_mix: 0.15,
-            },
-        ),
-        (
-            25.0,
-            SnrParams {
-                atten: 25.0,
-                min_thresh: -60.0,
-                max_thresh: 14.0,
-                df_mix: 1.0,
-                hp_cut: 60.0,
-                eq_mix: 0.85,
-                exciter_mix: 0.20,
-            },
-        ),
-    ];
-    let snr = snr_db.clamp(points[0].0, points[points.len() - 1].0);
-    let mut i = 0;
-    while i + 1 < points.len() && snr > points[i + 1].0 {
-        i += 1;
-    }
-    let (s0, p0) = points[i];
-    let (s1, p1) = points[i + 1];
-    let t = if (s1 - s0).abs() > 1e-6 {
-        (snr - s0) / (s1 - s0)
-    } else {
-        0.0
-    };
-    SnrParams {
-        atten: lerp(p0.atten, p1.atten, t),
-        min_thresh: lerp(p0.min_thresh, p1.min_thresh, t),
-        max_thresh: lerp(p0.max_thresh, p1.max_thresh, t),
-        df_mix: lerp(p0.df_mix, p1.df_mix, t),
-        hp_cut: lerp(p0.hp_cut, p1.hp_cut, t),
-        eq_mix: lerp(p0.eq_mix, p1.eq_mix, t),
-        exciter_mix: lerp(p0.exciter_mix, p1.exciter_mix, t),
-    }
-}
-
-fn map_env_to_params(snr_db: f32, rt60: f32) -> SnrParams {
-    let mut params = map_snr_to_params(snr_db);
-    let rt60 = rt60.clamp(0.2, 0.8);
-    if rt60 > 0.5 {
-        // 混响重：增强抑制、提高高通、减弱高频/激励
-        let t = ((rt60 - 0.5) / 0.3).clamp(0.0, 1.0);
-        params.atten = (params.atten + 20.0 * t).min(95.0);
-        params.max_thresh -= 8.0 * t;
-        params.hp_cut = lerp(params.hp_cut.max(130.0), 220.0, t);
-        params.eq_mix = (params.eq_mix - 0.25 * t).clamp(0.25, 1.0);
-        params.exciter_mix = lerp(params.exciter_mix, 0.0, t).clamp(0.0, 0.15);
-    } else if rt60 < 0.3 {
-        // 混响轻：放松高通与抑制，保留音质
-        let t = ((0.3 - rt60) / 0.1).clamp(0.0, 1.0);
-        params.hp_cut = lerp(params.hp_cut, 70.0, t);
-        params.eq_mix = (params.eq_mix + 0.1 * t).clamp(0.0, 1.0);
-        params.exciter_mix = (params.exciter_mix + 0.08 * t).clamp(0.0, 0.22);
-    }
-    params
 }
 
 pub fn log_format(buf: &mut env_logger::fmt::Formatter, record: &log::Record) -> io::Result<()> {
