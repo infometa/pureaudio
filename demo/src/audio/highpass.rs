@@ -95,21 +95,23 @@ impl HighpassFilter {
         let a1 = -2.0 * cos_omega;
         let a2 = 1.0 - alpha;
 
+        let a0 = a0;
+        let mut na1 = a1 / a0;
+        let mut na2 = a2 / a0;
         self.b0 = b0 / a0;
         self.b1 = b1 / a0;
         self.b2 = b2 / a0;
-        self.a1 = a1 / a0;
-        self.a2 = a2 / a0;
-        // 简单稳定性防护
-        let poles_sum = self.a1.abs() + self.a2.abs();
-        if poles_sum > 1.999 {
+        // 标准 IIR 稳定性防护：|a1|<2, |a2|<1
+        if na1.abs() >= 1.999 || na2.abs() >= 0.999 {
             warn!(
                 "HighpassFilter 系数接近不稳定 (cutoff {:.1} Hz @ {:.0} Hz sr)，已钳制",
                 self.cutoff_hz, self.sample_rate
             );
-            self.a1 = self.a1.clamp(-1.999, 1.999);
-            self.a2 = self.a2.clamp(-0.999, 0.999);
+            na1 = na1.clamp(-1.999, 1.999);
+            na2 = na2.clamp(-0.999, 0.999);
         }
+        self.a1 = na1;
+        self.a2 = na2;
     }
 }
 

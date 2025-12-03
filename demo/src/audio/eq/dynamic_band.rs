@@ -127,7 +127,8 @@ impl DynamicBand {
             let filtered = self.detector.process(sample);
             acc += filtered * filtered;
         }
-        (acc / block.len().max(1) as f32).sqrt()
+        let mean_sq = acc / block.len().max(1) as f32;
+        mean_sq.max(1e-20).sqrt()
     }
 
     pub fn update(&mut self, rms: f32, block_len: usize) {

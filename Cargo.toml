@@ -9,6 +9,9 @@ members = [
   "demo",
 ]
 
+[patch.crates-io]
+webrtc-vad = { path = "crates/webrtc-vad" }
+
 [profile.dev]
 opt-level = 1
 incremental = false

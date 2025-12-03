@@ -109,14 +109,15 @@ impl StftStaticEq {
         }
         let n = input.len();
         self.input_buf.extend_from_slice(input);
-        if self.pending_output.len() < self.input_buf.len() + self.win * 2 {
-            self.pending_output.resize(self.input_buf.len() + self.win * 2, 0.0);
+        let needed = self.input_buf.len() + self.win * 3;
+        if self.pending_output.len() < needed {
+            self.pending_output.resize(needed, 0.0);
         }
         let mut frame_start = 0usize;
         // 只要凑齐一个 hop，就执行一次 STFT 帧
         while self.input_buf.len() >= frame_start + self.win {
-            let frame = &self.input_buf[frame_start..frame_start + self.win];
-            self.process_frame(frame, frame_start);
+            let frame = self.input_buf[frame_start..frame_start + self.win].to_vec();
+            self.process_frame(&frame, frame_start);
             frame_start += self.hop;
         }
         // 输出当前块

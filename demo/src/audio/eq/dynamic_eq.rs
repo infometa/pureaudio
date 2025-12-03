@@ -212,16 +212,8 @@ impl DynamicEq {
         if should_soft_limit(samples) {
             apply_soft_limiter(samples);
         }
-        let wet = self.dry_wet;
-        if wet < 0.999 {
-            let dry = 1.0 - wet;
-            for (idx, sample) in samples.iter_mut().enumerate().take(len) {
-                *sample = *sample * wet + self.analysis_buf[idx] * dry;
-            }
-            if should_soft_limit(samples) {
-                apply_soft_limiter(samples);
-            }
-        }
+        // 全湿处理：避免干/湿相位错位带来的梳状
+        self.dry_wet = 1.0;
         metrics
     }
 

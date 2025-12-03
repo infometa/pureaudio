@@ -6,18 +6,17 @@ use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex, Once,
 };
 use std::thread::{self, sleep, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::audio::agc::AutoGainControl;
-use crate::audio::eq::{DynamicEq, EqControl, EqPresetKind, MAX_EQ_BANDS};
+use crate::audio::eq::{DynamicEq, EqControl, EqPresetKind, EqProcessMetrics, MAX_EQ_BANDS};
 use crate::audio::exciter::HarmonicExciter;
 use crate::audio::highpass::HighpassFilter;
 use crate::audio::saturation::Saturation;
-use crate::audio::stft_eq::StftStaticEq;
 use crate::audio::transient_shaper::TransientShaper;
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -28,7 +27,7 @@ use ndarray::prelude::*;
 use once_cell::sync::Lazy;
 use ringbuf::{producer::PostponedProducer, Consumer, HeapRb, SharedRb};
 use rubato::{FftFixedIn, FftFixedOut, Resampler};
-use webrtc_vad::Vad;
+use webrtc_vad::{Vad, VadMode};
 
 const OUTPUT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/output");
 
@@ -84,6 +83,8 @@ pub(crate) static INIT_LOGGER: Once = Once::new();
 pub(crate) static MODEL_PATH: Lazy<Mutex<Option<PathBuf>>> = Lazy::new(|| Mutex::new(None));
 static MODEL_CACHE: Lazy<Mutex<Option<ModelMetadata>>> = Lazy::new(|| Mutex::new(None));
 static SYS_VOL_MON_ACTIVE: AtomicBool = AtomicBool::new(false);
+static INPUT_DROPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
+static OUTPUT_UNDERRUNS: AtomicU64 = AtomicU64::new(0);
 
 const DEFAULT_MAX_RECORDING_DURATION_SECS: usize = 900;
 const MAX_RECORDING_DURATION_CAP_SECS: usize = 3600;
@@ -156,7 +157,7 @@ impl RecordingState {
         }
     }
 
-    fn append_with_limit(&self, buf: &mut Vec<f32>, samples: &[f32], tag: &str) {
+    fn append_with_limit(&self, buf: &mut Vec<f32>, samples: &[f32], _tag: &str) {
         if buf.len() >= self.max_samples {
             // 长时间运行时录音缓冲达到上限，静默丢弃，避免日志刷屏
             return;
@@ -296,10 +297,13 @@ pub enum ControlMessage {
     StftEqBand(usize, f32),
 }
 
-pub fn model_dimensions(model_path: Option<PathBuf>, _channels: usize) -> (usize, usize, usize) {
+pub fn model_dimensions(
+    model_path: Option<PathBuf>,
+    _channels: usize,
+) -> Result<(usize, usize, usize)> {
     let path = model_path.or_else(get_model_path);
-    let meta = resolve_model_metadata(path).expect("Failed to load DeepFilterNet metadata");
-    (meta.sr, meta.frame_size, meta.freq_size)
+    let meta = resolve_model_metadata(path).map_err(|e| anyhow!("加载模型元数据失败: {e}"))?;
+    Ok((meta.sr, meta.frame_size, meta.freq_size))
 }
 
 #[derive(Clone, Copy)]
@@ -455,6 +459,7 @@ fn push_into_ring(rb: &mut RbProd, data: &[f32], ch: u16, needs_downmix: bool) {
     }
     if dropped > 0 {
         log::warn!("输入环形缓冲区已满，丢弃 {} 帧音频", dropped);
+        INPUT_DROPPED_FRAMES.fetch_add(dropped as u64, Ordering::Relaxed);
     }
     rb.sync();
 }
@@ -472,10 +477,25 @@ fn fill_output_buffer(rb: &mut RbCons, data: &mut [f32], ch: u16, needs_upmix: b
                 filled += 1;
             }
             if filled == 0 {
-                for frame in data.chunks_mut(ch as usize).skip(n) {
-                    frame.fill(0.0);
+                let prev: Vec<f32> = if n > 0 {
+                    data[(n * ch as usize - ch as usize)..(n * ch as usize)]
+                        .to_vec()
+                } else {
+                    vec![0.0; ch as usize]
+                };
+                let remain = frames.saturating_sub(n);
+                for (i, frame) in data.chunks_mut(ch as usize).skip(n).enumerate() {
+                    let gain = if remain > 1 {
+                        (remain - 1 - i) as f32 / (remain - 1) as f32
+                    } else {
+                        0.0
+                    };
+                    for (s, p) in frame.iter_mut().zip(prev.iter()) {
+                        *s = *p * gain;
+                    }
                     n += 1;
                 }
+                OUTPUT_UNDERRUNS.fetch_add(1, Ordering::Relaxed);
                 break;
             }
         }
@@ -483,7 +503,28 @@ fn fill_output_buffer(rb: &mut RbCons, data: &mut [f32], ch: u16, needs_upmix: b
         while n < frames {
             let popped = rb.pop_slice(&mut data[n..]);
             if popped == 0 {
-                data[n..].fill(0.0);
+                let remain = frames.saturating_sub(n);
+                if remain > 0 {
+                    let ch_len = ch as usize;
+                    let prev = if n > 0 {
+                        data[(n * ch_len - ch_len)..(n * ch_len)].to_vec()
+                    } else {
+                        vec![0.0; ch_len]
+                    };
+                    for i in 0..remain {
+                        let gain = if remain > 1 {
+                            (remain - 1 - i) as f32 / (remain - 1) as f32
+                        } else {
+                            0.0
+                        };
+                        let start = (n + i) * ch_len;
+                        let end = start + ch_len;
+                        for (s, p) in data[start..end].iter_mut().zip(prev.iter()) {
+                            *s = *p * gain;
+                        }
+                    }
+                    OUTPUT_UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+                }
                 n = frames;
                 break;
             }
@@ -496,7 +537,9 @@ fn fill_output_buffer(rb: &mut RbCons, data: &mut [f32], ch: u16, needs_upmix: b
 impl AudioSink {
     fn new(sample_rate: u32, frame_size: usize, device_str: Option<String>) -> Result<Self> {
         let host = cpal::default_host();
-        let mut device = host.default_output_device().expect("no output device available");
+        let Some(mut device) = host.default_output_device() else {
+            return Err(anyhow!("未找到默认输出设备"));
+        };
         if let Some(device_str) = device_str {
             for avail_dev in host.output_devices()? {
                 if avail_dev.name()?.to_lowercase().contains(&device_str.to_lowercase()) {
@@ -600,7 +643,9 @@ impl AudioSink {
 impl AudioSource {
     fn new(sample_rate: u32, frame_size: usize, device_str: Option<String>) -> Result<Self> {
         let host = cpal::default_host();
-        let mut device = host.default_input_device().expect("no input device available");
+        let Some(mut device) = host.default_input_device() else {
+            return Err(anyhow!("未找到默认输入设备"));
+        };
         if let Some(device_str) = device_str {
             for avail_dev in host.input_devices()? {
                 if avail_dev.name()?.to_lowercase().contains(&device_str.to_lowercase()) {
@@ -749,22 +794,40 @@ fn get_worker_fn(
     };
     let recording = recorder.clone();
     move || {
-        let mut df = DfTract::new(df_params.clone(), &RuntimeParams::default_with_ch(channels))
-            .expect("Failed to initialize DeepFilterNet runtime");
+        let mut df = match DfTract::new(df_params.clone(), &RuntimeParams::default_with_ch(channels)) {
+            Ok(df) => df,
+            Err(err) => {
+                log::error!("初始化 DeepFilterNet 失败: {:?}", err);
+                return;
+            }
+        };
         debug_assert_eq!(df.ch, 1); // Processing for more channels are not implemented yet
         let mut inframe = Array2::zeros((df.ch, df.hop_size));
         let mut outframe = inframe.clone();
-        df.process(inframe.view(), outframe.view_mut())
-            .expect("Failed to run DeepFilterNet");
+        if let Err(err) = df.process(inframe.view(), outframe.view_mut()) {
+            log::error!("初始化 DF 首帧失败: {:?}", err);
+            return;
+        }
         let mut dynamic_eq = DynamicEq::new(df.sr as f32, EqPresetKind::default());
         let mut highpass = HighpassFilter::new(df.sr as f32);
-        let mut stft_eq = StftStaticEq::new(df.sr);
-        let mut exciter = HarmonicExciter::new(df.sr as f32, 7500.0, 1.6, 0.25);
+        // STFT 静态 EQ 已禁用，保留实例以兼容接口
+        let mut stft_enabled = false;
+        let mut stft_hf_gain = 0.0f32;
+        let mut stft_air_gain = 0.0f32;
+        let mut stft_tilt_gain = 0.0f32;
+        let mut stft_band_offsets = [0.0f32; 8];
+        let mut stft_dirty = false;
+        let mut exciter = HarmonicExciter::new(df.sr as f32, 3800.0, 1.6, 0.25);
         let mut transient_shaper = TransientShaper::new(df.sr as f32);
         let mut saturation = Saturation::new();
         let mut agc = AutoGainControl::new(df.sr as f32);
-        let mut bus_limiter = BusLimiter::new(df.sr);
-        let mut vad = Vad::new(df.sr as i32).expect("初始化 WebRTC VAD 失败"); // 固定 DF 采样率
+        let mut vad = Vad::new(df.sr as i32)
+            .ok()
+            .map(|mut v| {
+                // 默认使用模式 2（Aggressive），提高语音判定门限
+                let _ = v.fvad_set_mode(VadMode::Aggressive);
+                v
+            }); // VAD 可选，失败时禁用
         let vad_frame_len = match df.sr {
             8000 => 160,   // 20 ms
             16000 => 320,  // 20 ms
@@ -772,7 +835,7 @@ fn get_worker_fn(
             48000 => 960,  // 20 ms
             _ => 0,
         };
-        let mut vad_buf: Vec<f32> = Vec::with_capacity(vad_frame_len.max(1));
+        let mut vad_buf: VecDeque<f32> = VecDeque::with_capacity(vad_frame_len.max(1) * 2);
         // 更长淡入，避免启动瞬间脉冲
         let fade_total = (df.sr as f32 * 0.20) as usize; // 200ms fade-in
         let mut fade_progress = 0usize;
@@ -780,12 +843,6 @@ fn get_worker_fn(
         let mut highpass_cutoff = 60.0f32;
         let mut manual_highpass = highpass_cutoff;
         highpass.set_cutoff(highpass_cutoff);
-        let mut stft_enabled = true;
-        let mut stft_hf_gain = 2.0f32;
-        let mut stft_air_gain = 3.0f32;
-        let mut stft_tilt_gain = 0.0f32;
-        let mut stft_band_offsets = [0.0f32; 8];
-        let mut stft_dirty = true;
         let mut transient_enabled = true;
         let mut saturation_enabled = true;
         let mut agc_enabled = true;
@@ -803,6 +860,12 @@ fn get_worker_fn(
         let mut smoothed_rt60 = 0.35f32;
         let mut last_env_log = Instant::now();
         let mut vad_enabled = true;
+        let mut vad_state = false;
+        let mut vad_voice_count = 0usize;
+        let mut vad_noise_count = 0usize;
+        // 噪声门控，保护静音段不被环境/键盘穿透
+        let mut gate_gain = 1.0f32;
+        const GATE_FLOOR: f32 = 0.02;
         // 噪声地板 & SNR 跟踪
         let mut noise_floor_db = -60.0f32;
         let mut snr_db = 10.0f32;
@@ -813,12 +876,14 @@ fn get_worker_fn(
         let mut target_hp = 80.0f32;
         let mut target_eq_mix = 0.7f32;
         let mut target_exciter_mix = 0.15f32;
+        let mut target_transient_sustain = 0.0f32;
         let mut manual_atten = df.atten_lim.unwrap_or(target_atten);
         let mut manual_min_thresh = df.min_db_thresh;
         let mut manual_max_thresh = df.max_db_df_thresh;
+        let mut office_factor = 0.5f32;
         // 冲击/键盘保护计数
         let mut impact_hold = 0usize;
-        const IMPACT_HOLD_FRAMES: usize = 80; // 更短保持，减小语音起音被吞
+        const IMPACT_HOLD_FRAMES: usize = 120; // 更长保持，强压键盘/点击
                                               // 柔和模式用于外部 ANC/极静环境，降低降噪力度并补高频
         let mut soft_mode = false;
         let mut last_soft_mode = false;
@@ -826,6 +891,8 @@ fn get_worker_fn(
         let mut soft_mode_hold = 0usize;
         const SOFT_MODE_HOLD_FRAMES: usize = 160; // 约 2s（取决于 hop）
         let mut last_impact_hold = 0usize;
+        // 启动保护期，前 1s 禁止 gate/瞬态强抑制，避免开口被吞
+        let startup_guard_until = Instant::now() + Duration::from_millis(1000);
         let mut _auto_gain_scale = 1.0f32;
         has_init.store(true, Ordering::Relaxed);
         log::info!("Worker init");
@@ -835,23 +902,34 @@ fn get_worker_fn(
         // 连续低峰值检测阈值（约 3 秒）
         let low_peak_required = ((3.0 / block_duration).ceil() as usize).max(30);
         // 启动静音时长（避免“啪”），单位：Hop block 数
-        let mut warmup_blocks = ((df.sr as f32 * 0.3) / df.hop_size as f32).ceil() as usize; // ~300ms
+        let mut warmup_blocks = ((df.sr as f32 * 0.15) / df.hop_size as f32).ceil() as usize; // ~150ms
         let (mut input_resampler, n_in) = if input_sr != df.sr {
-            let r = FftFixedOut::<f32>::new(input_sr, df.sr, df.hop_size, 1, 1)
-                .expect("Failed to init input resampler");
-            let n_in = r.input_frames_max();
-            let buf = r.input_buffer_allocate(true);
-            (Some((r, buf)), n_in)
+            match FftFixedOut::<f32>::new(input_sr, df.sr, df.hop_size, 1, 1) {
+                Ok(r) => {
+                    let n_in = r.input_frames_max();
+                    let buf = r.input_buffer_allocate(true);
+                    (Some((r, buf)), n_in)
+                }
+                Err(err) => {
+                    log::error!("输入重采样初始化失败: {:?}", err);
+                    return;
+                }
+            }
         } else {
             (None, df.hop_size)
         };
         let (mut output_resampler, n_out) = if output_sr != df.sr {
-            let r = FftFixedIn::<f32>::new(df.sr, output_sr, df.hop_size, 1, 1)
-                .expect("Failed to init output resampler");
-            let n_out = r.output_frames_max();
-            let buf = r.output_buffer_allocate(true);
-            // let buf = vec![0.; n_out];
-            (Some((r, buf)), n_out)
+            match FftFixedIn::<f32>::new(df.sr, output_sr, df.hop_size, 1, 1) {
+                Ok(r) => {
+                    let n_out = r.output_frames_max();
+                    let buf = r.output_buffer_allocate(true);
+                    (Some((r, buf)), n_out)
+                }
+                Err(err) => {
+                    log::error!("输出重采样初始化失败: {:?}", err);
+                    return;
+                }
+            }
         } else {
             (None, df.hop_size)
         };
@@ -864,8 +942,8 @@ fn get_worker_fn(
         let mut last_sys_restore = last_sys_adjust;
         let mut clip_counter = 0usize;
         let mut low_peak_counter = 0usize;
-        // Align with UI default: 环境自适应默认关闭，避免启动瞬间修改参数
-        let mut env_auto_enabled = false;
+        // Align with UI default: 环境自适应默认开启，自动调整降噪
+        let mut env_auto_enabled = true;
         'processing: while !should_stop.load(Ordering::Relaxed) {
             if rb_in.len() < n_in {
                 // Sleep for half a hop size
@@ -948,6 +1026,16 @@ fn get_worker_fn(
                 }
             }
 
+            // 输入增益：软件层前级，避免过载或过低（默认 0 dB）
+            if let Some(buffer) = inframe.as_slice_mut() {
+                let input_gain = 1.0f32; // 如需调节可做成控制消息
+                if input_gain < 0.9999 || input_gain > 1.0001 {
+                    for v in buffer.iter_mut() {
+                        *v *= input_gain;
+                    }
+                }
+                sanitize_samples("输入信号", buffer);
+            }
             if highpass_enabled {
                 if let Some(buffer) = inframe.as_slice_mut() {
                     highpass.process(buffer);
@@ -959,9 +1047,16 @@ fn get_worker_fn(
                     out.copy_from_slice(inp);
                 }
             } else {
-                lsnr = df
-                    .process(inframe.view(), outframe.view_mut())
-                    .expect("Failed to run DeepFilterNet");
+                lsnr = match df.process(inframe.view(), outframe.view_mut()) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        log::error!("DeepFilterNet 处理失败: {:?}", err);
+                        continue;
+                    }
+                };
+                if let Some(buffer) = outframe.as_slice_mut() {
+                    sanitize_samples("降噪输出", buffer);
+                }
             }
             if env_auto_enabled && !bypass_enabled {
                 // 环境噪声特征估计与自适应参数：噪声地板 + SNR 连续映射
@@ -972,11 +1067,11 @@ fn get_worker_fn(
                     let alpha = if db < -50.0 {
                         0.35
                     } else if db < -30.0 {
-                        0.18
+                        0.25
                     } else if db < -20.0 {
-                        0.10
+                        0.18
                     } else {
-                        0.05
+                        0.12
                     };
                     (db, alpha)
                 } else {
@@ -990,22 +1085,52 @@ fn get_worker_fn(
 
                 // WebRTC VAD 判定（优先）+ 简易备份
                 if let Some(buf) = inframe.as_slice() {
-                    // 聚合到 20ms 窗口
-                    vad_buf.extend_from_slice(buf);
-                    if vad_buf.len() > vad_frame_len * 2 && vad_frame_len > 0 {
-                        let keep_from = vad_buf.len() - vad_frame_len * 2;
-                        vad_buf.drain(0..keep_from);
+                    // 聚合到 20ms 窗口，使用 VecDeque 保持 O(1) 进出
+                    for &v in buf {
+                        vad_buf.push_back(v);
+                        if vad_buf.len() > vad_frame_len * 2 && vad_frame_len > 0 {
+                            vad_buf.pop_front();
+                        }
                     }
                 }
                 let vad_voice = if vad_enabled && vad_frame_len > 0 && vad_buf.len() >= vad_frame_len {
-                    run_webrtc_vad(&mut vad, &vad_buf, vad_frame_len).unwrap_or(false)
+                    if let Some(ref mut v) = vad {
+                        let buf = vad_buf.make_contiguous();
+                        run_webrtc_vad(v, &buf[buf.len() - vad_frame_len..], vad_frame_len).unwrap_or(false)
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 };
-                let heuristic_voice = rms_db > -45.0
-                    && smoothed_flatness < 0.45
-                    && smoothed_centroid < 0.65;
-                let is_voice = vad_voice || heuristic_voice;
+                let heuristic_voice = rms_db > -50.0
+                    && smoothed_flatness < 0.35
+                    && smoothed_centroid < 0.60;
+                let energy_gap = rms_db - noise_floor_db;
+                let energy_gate = energy_gap > 12.0 && rms_db > -55.0;
+                // 语音判定：VAD & 特征 & SNR，同时要求能量高于噪声地板
+                let mut is_voice = vad_voice && snr_db > 8.0 && energy_gate;
+                if !is_voice && heuristic_voice && energy_gap > 14.0 {
+                    is_voice = true;
+                }
+                // 滞后：累积计数防抖
+                if is_voice {
+                    vad_voice_count = vad_voice_count.saturating_add(1).min(50);
+                    vad_noise_count = vad_noise_count.saturating_sub(vad_noise_count.min(1));
+                } else {
+                    vad_noise_count = vad_noise_count.saturating_add(1).min(50);
+                    vad_voice_count = vad_voice_count.saturating_sub(vad_voice_count.min(1));
+                }
+                if vad_voice_count >= 3 {
+                    vad_state = true;
+                } else if vad_noise_count >= 2 {
+                    vad_state = false;
+                }
+                is_voice = vad_state;
+                // 近讲优先：如果离麦较远（能量差不足），强制当噪声
+                if is_voice && energy_gap < 12.0 && rms_db < -42.0 {
+                    is_voice = false;
+                }
 
                 // 噪声地板跟踪：仅在非语音段更新，下降快，上升慢
                 if !is_voice {
@@ -1042,7 +1167,7 @@ fn get_worker_fn(
                 } else if soft_mode_hold < SOFT_MODE_HOLD_FRAMES / 4 {
                     soft_mode = false;
                 }
-                if soft_mode && (snr_db < 6.0 || smoothed_rt60 > 0.65) {
+                if soft_mode && (snr_db < 12.0 || smoothed_rt60 > 0.6 || !is_voice) {
                     soft_mode = false;
                 }
                 if soft_mode != last_soft_mode {
@@ -1096,16 +1221,47 @@ fn get_worker_fn(
                 }
                 last_impact_hold = impact_hold;
 
-                // SNR + RT60 连续映射（安静保色，嘈杂/长混响保清晰）
-                let mapped = map_env_to_params(snr_db, smoothed_rt60);
-                // 自适应时允许超过手动阈值上限，优先确保抑制力度
-                target_atten = mapped.atten;
-                target_min_thresh = mapped.min_thresh.max(manual_min_thresh);
-                target_max_thresh = mapped.max_thresh.min(manual_max_thresh);
+                // “办公区(嘈杂) ↔ 会议室(高混响)” 双锚点线性插值
+                let office_anchor = SnrParams {
+                    atten: 100.0,
+                    min_thresh: -5.0,
+                    max_thresh: 8.0,
+                    df_mix: 1.0,
+                    hp_cut: 120.0,
+                    eq_mix: 0.7,
+                    exciter_mix: 0.10,
+                };
+                let conf_anchor = SnrParams {
+                    atten: 40.0,
+                    min_thresh: -15.0,
+                    max_thresh: 12.0,
+                    df_mix: 1.0,
+                    hp_cut: 60.0,
+                    eq_mix: 0.8,
+                    exciter_mix: 0.25,
+                };
+                // SNR 低则强行偏向办公区；否则根据 RT60 判断混响权重
+                let mut target_office = if snr_db < 10.0 {
+                    1.0
+                } else {
+                    1.0 - ((smoothed_rt60 - 0.2) / 0.3).clamp(0.0, 1.0)
+                };
+                office_factor = smooth_value(office_factor, target_office, 0.05);
+                target_atten = lerp(conf_anchor.atten, office_anchor.atten, office_factor);
+                target_min_thresh =
+                    lerp(conf_anchor.min_thresh, office_anchor.min_thresh, office_factor)
+                        .max(manual_min_thresh);
+                target_max_thresh =
+                    lerp(conf_anchor.max_thresh, office_anchor.max_thresh, office_factor)
+                        .min(manual_max_thresh);
                 target_df_mix = 1.0;
-                target_hp = mapped.hp_cut.max(manual_highpass);
-                target_eq_mix = mapped.eq_mix;
-                target_exciter_mix = mapped.exciter_mix;
+                target_hp = lerp(conf_anchor.hp_cut, office_anchor.hp_cut, office_factor)
+                    .max(manual_highpass);
+                target_eq_mix = lerp(conf_anchor.eq_mix, office_anchor.eq_mix, office_factor);
+                target_exciter_mix =
+                    lerp(conf_anchor.exciter_mix, office_anchor.exciter_mix, office_factor);
+                target_transient_sustain =
+                    lerp(-6.0, -2.0, office_factor); // 会议室切尾更狠，办公区轻抑制
 
                 // 档位仅用于日志
                 let target_env =
@@ -1155,10 +1311,24 @@ fn get_worker_fn(
 
                 // 语音段放松：降低额外抑制，减小高通，保护起音
                 if is_voice && impact_hold == 0 {
-                    target_atten = target_atten.min(60.0);
-                    target_hp = target_hp.min(140.0);
-                    target_eq_mix = target_eq_mix.max(0.6);
+                    target_atten = target_atten.min(48.0);
+                    target_min_thresh = target_min_thresh.max(-58.0);
+                    target_max_thresh = target_max_thresh.min(10.0);
+                    target_hp = target_hp.min(110.0);
+                    target_eq_mix = target_eq_mix.max(0.75);
                     target_exciter_mix = target_exciter_mix.max(0.05);
+                    soft_mode = false;
+                    soft_mode_hold = 0;
+                } else if !is_voice {
+                    // 非语音段：重度抑制，快速压制键盘/底噪
+                    target_atten = (target_atten + 22.0).min(100.0);
+                    target_hp = target_hp.max(220.0);
+                    target_min_thresh = target_min_thresh.max(-54.0);
+                    target_max_thresh = target_max_thresh.min(6.0);
+                    target_eq_mix = target_eq_mix.max(0.7);
+                    target_exciter_mix = 0.0;
+                    soft_mode = false;
+                    soft_mode_hold = 0;
                 }
 
                 if impact_hold > 0 {
@@ -1170,10 +1340,19 @@ fn get_worker_fn(
                     target_exciter_mix = 0.0;
                 }
 
+                // 输出端硬门限：非语音时强抑制，避免环境与键盘穿透
+                if Instant::now() < startup_guard_until {
+                    gate_gain = 1.0; // 启动期不 gate，保护开口
+                } else {
+                    let gate_target = if is_voice || impact_hold > 0 { 1.0 } else { GATE_FLOOR };
+                    let gate_alpha = if gate_target > gate_gain { 0.45 } else { 0.25 };
+                    gate_gain = smooth_value(gate_gain, gate_target, gate_alpha);
+                }
+
                 // 全湿，避免干湿并行导致相位/冲击泄露
                 _df_mix = 1.0;
                 let current_atten = df.atten_lim.unwrap_or(target_atten);
-                let alpha_fast = if impact_hold > 0 { 0.35 } else { 0.2 };
+                let alpha_fast = 0.35;
                 let new_atten = smooth_value(current_atten, target_atten, alpha_fast);
                 df.set_atten_lim(new_atten);
                 df.min_db_thresh = smooth_value(df.min_db_thresh, target_min_thresh, alpha_fast);
@@ -1185,6 +1364,7 @@ fn get_worker_fn(
                 dynamic_eq.set_dry_wet(1.0);
                 exciter
                     .set_mix(smooth_value(exciter.mix(), target_exciter_mix, 0.25).clamp(0.0, 0.3));
+                transient_shaper.set_sustain_gain(target_transient_sustain);
             }
             // 录音降噪输出（仅 DF + 高通），保证 nc 不受后级 STFT/EQ 影响
             if let Some(ref rec) = recording {
@@ -1193,54 +1373,24 @@ fn get_worker_fn(
                 }
             }
 
-            if !bypass_enabled {
-                if stft_enabled {
-                    if stft_dirty {
-                        stft_eq.set_curve(
-                            stft_hf_gain,
-                            stft_air_gain,
-                            stft_tilt_gain,
-                            &stft_band_offsets,
-                            df.sr,
-                        );
-                        stft_dirty = false;
-                    }
-                    if let Some(buf) = outframe.as_slice_mut() {
-                        stft_eq.process_block(buf);
-                    }
-                }
-            }
+            // STFT 静态 EQ 已移除，不再处理
             let bypass_post = bypass_enabled
                 || (!dynamic_eq.is_enabled()
                     && !transient_enabled
                     && !saturation_enabled
                     && !agc_enabled);
-
-            if !bypass_post {
-                // 自适应峰值保护，防止 DF 输出直接过 0dBFS
-                if let Some(buf) = outframe.as_slice_mut() {
-                    let mut peak = 0.0f32;
-                    for v in buf.iter() {
-                        peak = peak.max(v.abs());
-                    }
-                    const TARGET: f32 = 0.9;
-                    if peak > TARGET && peak.is_finite() && peak > 0.0 {
-                        let mut scale = (TARGET / peak).min(1.0);
-                        if headroom_gain < 0.9999 {
-                            scale = scale.min(headroom_gain.max(0.0).min(1.0));
-                        }
-                        if scale < 0.9999 {
-                            for v in buf.iter_mut() {
-                                *v *= scale;
-                            }
-                        }
-                    }
-                }
-            }
             let eq_start = Instant::now();
             let (eq_gain_db, eq_enabled_flag) = if bypass_post {
                 ([0.0; MAX_EQ_BANDS], false)
             } else {
+                // 动态 EQ 优先，后接瞬态/色彩处理
+                let mut metrics = if let Some(buffer) = outframe.as_slice_mut() {
+                    dynamic_eq.set_dry_wet(1.0);
+                    dynamic_eq.process_block(buffer)
+                } else {
+                    log::error!("输出帧内存布局异常，跳过动态 EQ");
+                    EqProcessMetrics::default()
+                };
                 if transient_enabled {
                     if let Some(buffer) = outframe.as_slice_mut() {
                         transient_shaper.process(buffer);
@@ -1257,27 +1407,19 @@ fn get_worker_fn(
                         exciter.process(buffer);
                     }
                 }
-                let metrics = {
-                    let buffer =
-                        outframe.as_slice_mut().expect("Output frame should be contiguous");
-                    // 保持全湿，防止并行干声导致的相位波动
-                    dynamic_eq.set_dry_wet(1.0);
-                    dynamic_eq.process_block(buffer)
-                };
-                if post_trim_gain < 0.9999 {
-                    if let Some(buffer) = outframe.as_slice_mut() {
-                        for v in buffer.iter_mut() {
-                            *v *= post_trim_gain;
-                        }
-                    }
-                }
-                if agc_enabled {
-                    if let Some(buffer) = outframe.as_slice_mut() {
+                if let Some(buffer) = outframe.as_slice_mut() {
+                    if agc_enabled {
                         agc.process(buffer);
                     }
-                }
-                if let Some(buffer) = outframe.as_slice_mut() {
-                    bus_limiter.process(buffer);
+                    // 输出增益（Post-trim + Headroom），统一放在 AGC 之后
+                    let out_gain = post_trim_gain * headroom_gain;
+                    if out_gain < 0.9999 || out_gain > 1.0001 {
+                        for v in buffer.iter_mut() {
+                            *v *= out_gain;
+                        }
+                    }
+                } else {
+                    log::error!("输出帧内存布局异常，跳过后级处理");
                 }
                 (metrics.gain_db, metrics.enabled)
             };
@@ -1353,6 +1495,14 @@ fn get_worker_fn(
                     }
                 }
             }
+            // 非语音硬门限：在最终限幅前执行，静音段进一步压低输出
+            if env_auto_enabled && !bypass_enabled {
+                if let Some(buf) = outframe.as_slice_mut() {
+                    for v in buf.iter_mut() {
+                        *v *= gate_gain;
+                    }
+                }
+            }
             let eq_elapsed = eq_start.elapsed();
             let mut eq_cpu = 0.0;
             if block_duration > 0.0 {
@@ -1386,7 +1536,6 @@ fn get_worker_fn(
             }
             if !mute_playback {
                 if let Some((ref mut r, ref mut buf)) = output_resampler.as_mut() {
-                    // 仅首次重采样时清零缓冲，避免未初始化数据脉冲
                     if !output_resampler_cleared {
                         for frame in buf.iter_mut() {
                             for sample in frame.iter_mut() {
@@ -1395,25 +1544,233 @@ fn get_worker_fn(
                         }
                         output_resampler_cleared = true;
                     }
-                    if let Err(err) =
-                        r.process_into_buffer(&[outframe.as_slice().unwrap()], buf, None)
-                    {
-                        log::error!("输出重采样失败: {:?}", err);
-                    } else if warmup_blocks > 0 {
-                        warmup_blocks = warmup_blocks.saturating_sub(1);
+                    if let Some(slice) = outframe.as_slice() {
+                        if let Err(err) = r.process_into_buffer(&[slice], buf, None) {
+                            log::error!("输出重采样失败: {:?}", err);
+                        } else if warmup_blocks > 0 {
+                            warmup_blocks = warmup_blocks.saturating_sub(1);
+                        } else {
+                            push_output_block(&should_stop, &mut rb_out, &buf[0][..n_out], n_out);
+                        }
                     } else {
-                        push_output_block(&should_stop, &mut rb_out, &buf[0][..n_out], n_out);
+                        log::error!("输出帧内存布局异常，跳过输出");
                     }
                 } else if let Some(buf) = outframe.as_slice() {
                     if warmup_blocks > 0 {
                         warmup_blocks = warmup_blocks.saturating_sub(1);
                     } else {
-                        // 冲击期间短暂 duck，防止点击/关门残留
-                        let mut temp = buf[..n_out].to_vec();
+                        let temp = buf[..n_out].to_vec();
                         push_output_block(&should_stop, &mut rb_out, &temp[..], n_out);
                     }
                 } else {
                     log::error!("输出帧内存布局异常，跳过输出");
+                }
+            }
+            if let Some(sender) = s_lsnr.as_ref() {
+                if let Err(err) = sender.send(lsnr) {
+                    log::warn!("Failed to send LSNR value: {}", err);
+                }
+            }
+            if let Some((ref mut s_noisy, ref mut s_enh)) = s_spec.as_mut() {
+                push_spec(df.get_spec_noisy(), s_noisy);
+                push_spec(df.get_spec_enh(), s_enh);
+            }
+            if let Some(ref mut r_opt) = r_opt.as_mut() {
+                while let Ok(message) = r_opt.try_recv() {
+                    match message {
+                        ControlMessage::DeepFilter(control, value) => match control {
+                            DfControl::AttenLim => {
+                                manual_atten = value;
+                                df.set_atten_lim(value);
+                            }
+                            DfControl::PostFilterBeta => df.set_pf_beta(value),
+                            DfControl::MinThreshDb => {
+                                manual_min_thresh = value;
+                                df.min_db_thresh = value;
+                            }
+                            DfControl::MaxErbThreshDb => df.max_db_erb_thresh = value,
+                            DfControl::MaxDfThreshDb => {
+                                manual_max_thresh = value;
+                                df.max_db_df_thresh = value;
+                                df.max_db_erb_thresh = value;
+                            }
+                        },
+                        ControlMessage::Eq(control) => match control {
+                            EqControl::SetEnabled(enabled) => dynamic_eq.set_enabled(enabled),
+                            EqControl::SetPreset(preset) => dynamic_eq.apply_preset(preset),
+                            // 干/湿混合固定全湿，避免梳状；忽略外部传入比例
+                            EqControl::SetDryWet(_) => dynamic_eq.set_dry_wet(1.0),
+                            EqControl::SetBandGain(idx, gain) => dynamic_eq.set_band_gain(idx, gain),
+                            EqControl::SetBandFrequency(idx, freq) => {
+                                dynamic_eq.set_band_frequency(idx, freq)
+                            }
+                            EqControl::SetBandQ(idx, q) => dynamic_eq.set_band_q(idx, q),
+                            EqControl::SetBandDetectorQ(idx, value) => {
+                                dynamic_eq.set_band_detector_q(idx, value)
+                            }
+                            EqControl::SetBandThreshold(idx, value) => {
+                                dynamic_eq.set_band_threshold(idx, value)
+                            }
+                            EqControl::SetBandRatio(idx, value) => {
+                                dynamic_eq.set_band_ratio(idx, value)
+                            }
+                            EqControl::SetBandMaxGain(idx, value) => {
+                                dynamic_eq.set_band_max_gain(idx, value)
+                            }
+                            EqControl::SetBandAttack(idx, value) => {
+                                dynamic_eq.set_band_attack(idx, value)
+                            }
+                            EqControl::SetBandRelease(idx, value) => {
+                                dynamic_eq.set_band_release(idx, value)
+                            }
+                            EqControl::SetBandMakeup(idx, value) => {
+                                dynamic_eq.set_band_makeup(idx, value)
+                            }
+                            EqControl::SetBandMode(idx, mode) => dynamic_eq.set_band_mode(idx, mode),
+                            EqControl::SetBandFilter(idx, filter) => {
+                                dynamic_eq.set_band_filter(idx, filter)
+                            }
+                        },
+                        ControlMessage::MutePlayback(muted) => {
+                            mute_playback = muted;
+                            log::info!("播放静音: {}", if mute_playback { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::BypassEnabled(enabled) => {
+                            bypass_enabled = enabled;
+                            log::info!("旁路: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::HighpassEnabled(enabled) => {
+                            highpass_enabled = enabled;
+                            if !enabled {
+                                highpass.reset();
+                            }
+                            log::info!("高通滤波: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::HighpassCutoff(freq) => {
+                            manual_highpass = freq;
+                            highpass_cutoff = freq;
+                            highpass.set_cutoff(freq);
+                            log::info!("高通截止频率: {:.0} Hz", freq);
+                        }
+                        ControlMessage::DfMix(_) => {
+                            // 固定全湿，忽略外部比例，避免干/湿并行相位问题
+                            _df_mix = 1.0;
+                            log::info!("DF 混合比例固定为 100%");
+                        }
+                        ControlMessage::HeadroomGain(gain) => {
+                            headroom_gain = gain.clamp(0.0, 1.0);
+                            log::info!("Headroom 增益: {:.2}", headroom_gain);
+                        }
+                        ControlMessage::PostTrimGain(gain) => {
+                            post_trim_gain = gain.clamp(0.0, 1.0);
+                            log::info!("Post-Trim 增益: {:.2}", post_trim_gain);
+                        }
+                        ControlMessage::SaturationEnabled(enabled) => {
+                            saturation_enabled = enabled;
+                            log::info!("饱和度: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::SaturationDrive(drive) => {
+                            saturation.set_drive(drive);
+                            log::info!("饱和驱动: {:.2}", drive);
+                        }
+                        ControlMessage::SaturationMakeup(db) => {
+                            saturation.set_makeup(db);
+                            log::info!("饱和补偿: {:+.1} dB", db);
+                        }
+                        ControlMessage::SaturationMix(ratio) => {
+                            saturation.set_mix((ratio / 100.0).clamp(0.0, 1.0));
+                            log::info!("饱和混合: {:.0}%", ratio);
+                        }
+                        ControlMessage::TransientEnabled(enabled) => {
+                            transient_enabled = enabled;
+                            if !enabled {
+                                transient_shaper.reset();
+                            }
+                            log::info!("瞬态增强: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::VadEnabled(enabled) => {
+                            vad_enabled = enabled;
+                            log::warn!("WebRTC VAD: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::TransientGain(db) => {
+                            transient_shaper.set_attack_gain(db);
+                        }
+                        ControlMessage::TransientSustain(db) => {
+                            transient_shaper.set_sustain_gain(db);
+                        }
+                        ControlMessage::TransientMix(ratio) => {
+                            transient_shaper.set_dry_wet((ratio / 100.0).clamp(0.0, 1.0));
+                        }
+                        ControlMessage::AgcEnabled(enabled) => {
+                            agc_enabled = enabled;
+                            agc.reset();
+                            log::info!("AGC: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::AgcTargetLevel(db) => {
+                            agc.set_target_level(db);
+                            log::info!("AGC 目标电平: {:.1} dBFS", db);
+                        }
+                        ControlMessage::AgcMaxGain(db) => {
+                            agc.set_max_gain(db);
+                            log::info!("AGC 最大增益: {:.1} dB", db);
+                        }
+                        ControlMessage::AgcMaxAttenuation(db) => {
+                            agc.set_max_attenuation(db);
+                            log::info!("AGC 最大衰减: {:.1} dB", db);
+                        }
+                        ControlMessage::AgcWindowSeconds(sec) => {
+                            agc.set_window_seconds(sec);
+                            log::info!("AGC 窗长: {:.2} s", sec);
+                        }
+                        ControlMessage::AgcAttackRelease(attack_ms, release_ms) => {
+                            agc.set_attack_release(attack_ms, release_ms);
+                            log::info!("AGC 攻击/释放: {:.0} / {:.0} ms", attack_ms, release_ms);
+                        }
+                        ControlMessage::SysAutoVolumeEnabled(enabled) => {
+                            auto_sys_volume = enabled;
+                            log::info!(
+                                "自动系统音量保护: {}",
+                                if enabled { "开启" } else { "关闭" }
+                            );
+                        }
+                        ControlMessage::EnvAutoEnabled(enabled) => {
+                            env_auto_enabled = enabled;
+                            log::warn!("环境自适应: {}", if enabled { "开启" } else { "关闭" });
+                            if !enabled {
+                                soft_mode = false;
+                                last_soft_mode = false;
+                                smoothed_rt60 = 0.35;
+                                rt60_history.clear();
+                                if let Some(ref sender) = s_env_status {
+                                    let _ = sender.try_send(EnvStatus::Normal);
+                                }
+                            }
+                        }
+                        ControlMessage::ExciterEnabled(enabled) => {
+                            exciter_enabled = enabled;
+                            log::info!("谐波激励: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::ExciterMix(value) => {
+                            exciter.set_mix(value.clamp(0.0, 0.5));
+                            log::info!("谐波激励混合: {:.0}%", value * 100.0);
+                        }
+                        ControlMessage::StftEqEnabled(_) => {
+                            log::info!("STFT 静态 EQ 已禁用，忽略该开关");
+                            stft_enabled = false;
+                        }
+                        ControlMessage::StftEqHfGain(_) => {
+                            log::info!("STFT 静态 EQ 已禁用，忽略高频补偿");
+                        }
+                        ControlMessage::StftEqAirGain(_) => {
+                            log::info!("STFT 静态 EQ 已禁用，忽略空气感补偿");
+                        }
+                        ControlMessage::StftEqTilt(_) => {
+                            log::info!("STFT 静态 EQ 已禁用，忽略倾斜补偿");
+                        }
+                        ControlMessage::StftEqBand(_, _) => {
+                            log::info!("STFT 静态 EQ 已禁用，忽略 Band 调节");
+                        }
+                    }
                 }
             }
             if let Some(sender) = s_lsnr.as_ref() {
@@ -1604,31 +1961,21 @@ fn get_worker_fn(
                             exciter.set_mix(value.clamp(0.0, 0.5));
                             log::info!("谐波激励混合: {:.0}%", value * 100.0);
                         }
-                        ControlMessage::StftEqEnabled(enabled) => {
-                            stft_enabled = enabled;
-                            log::info!("STFT 静态 EQ: {}", if enabled { "开启" } else { "关闭" });
+                        ControlMessage::StftEqEnabled(_) => {
+                            log::info!("STFT 静态 EQ 已禁用，忽略该开关");
+                            stft_enabled = false;
                         }
-                        ControlMessage::StftEqHfGain(db) => {
-                            stft_hf_gain = db.clamp(0.0, 8.0);
-                            stft_dirty = true;
-                            log::info!("STFT EQ 高频补偿: {:+.1} dB", stft_hf_gain);
+                        ControlMessage::StftEqHfGain(_) => {
+                            log::info!("STFT 静态 EQ 已禁用，忽略高频补偿");
                         }
-                        ControlMessage::StftEqAirGain(db) => {
-                            stft_air_gain = db.clamp(0.0, 10.0);
-                            stft_dirty = true;
-                            log::info!("STFT EQ 空气感补偿: {:+.1} dB", stft_air_gain);
+                        ControlMessage::StftEqAirGain(_) => {
+                            log::info!("STFT 静态 EQ 已禁用，忽略空气感补偿");
                         }
-                        ControlMessage::StftEqTilt(db) => {
-                            stft_tilt_gain = db.clamp(-6.0, 6.0);
-                            stft_dirty = true;
-                            log::info!("STFT EQ 倾斜补偿: {:+.1} dB", stft_tilt_gain);
+                        ControlMessage::StftEqTilt(_) => {
+                            log::info!("STFT 静态 EQ 已禁用，忽略倾斜补偿");
                         }
-                        ControlMessage::StftEqBand(idx, db) => {
-                            if idx < stft_band_offsets.len() {
-                                stft_band_offsets[idx] = db.clamp(-6.0, 6.0);
-                                stft_dirty = true;
-                                log::info!("STFT EQ 静态段 {} 调整: {:+.1} dB", idx + 1, db);
-                            }
+                        ControlMessage::StftEqBand(_, _) => {
+                            log::info!("STFT 静态 EQ 已禁用，忽略 Band 调节");
                         }
                         ControlMessage::BypassEnabled(enabled) => {
                             bypass_enabled = enabled;
@@ -1679,6 +2026,7 @@ fn push_output_block(
     rb_out.sync();
 }
 
+#[allow(dead_code)]
 struct BusLimiter {
     gain: f32,
     attack_coef: f32,
@@ -1691,6 +2039,7 @@ struct BusLimiter {
     la_pos: usize,
 }
 
+#[allow(dead_code)]
 impl BusLimiter {
     fn new(sample_rate: usize) -> Self {
         // 更快攻击捕捉冲击，稍长释放避免泵效
@@ -2049,6 +2398,21 @@ fn adjust_system_input_volume_async(_delta_percent: i8, _min: u8, _max: u8) {
 
 fn smooth_value(current: f32, target: f32, alpha: f32) -> f32 {
     current + (target - current) * alpha.clamp(0.0, 1.0)
+}
+
+fn sanitize_samples(tag: &str, samples: &mut [f32]) -> bool {
+    const DENORMAL_THRESHOLD: f32 = 1e-38;
+    let mut dirty = false;
+    for s in samples.iter_mut() {
+        if !s.is_finite() || s.abs() < DENORMAL_THRESHOLD {
+            *s = 0.0;
+            dirty = true;
+        }
+    }
+    if dirty {
+        log::debug!("{tag} 检测到非法/次正规样本，已归零防止性能下降");
+    }
+    dirty
 }
 
 fn run_webrtc_vad(vad: &mut Vad, frame: &[f32], frame_len: usize) -> Option<bool> {

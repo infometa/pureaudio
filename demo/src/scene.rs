@@ -5,17 +5,23 @@ pub enum ScenePreset {
     Broadcast,
     OpenOffice,
     ConferenceHall,
+    OpenOfficeMeeting,
 }
 
 impl ScenePreset {
-    pub const fn all() -> [Self; 3] {
-        [Self::Broadcast, Self::OpenOffice, Self::ConferenceHall]
+    pub const fn all() -> [Self; 4] {
+        [
+            Self::Broadcast,
+            Self::OpenOffice,
+            Self::ConferenceHall,
+            Self::OpenOfficeMeeting,
+        ]
     }
 }
 
 impl Default for ScenePreset {
     fn default() -> Self {
-        ScenePreset::Broadcast
+        ScenePreset::OpenOfficeMeeting
     }
 }
 
@@ -25,6 +31,7 @@ impl std::fmt::Display for ScenePreset {
             ScenePreset::Broadcast => "播音级",
             ScenePreset::OpenOffice => "开放办公区",
             ScenePreset::ConferenceHall => "会议室去混响",
+            ScenePreset::OpenOfficeMeeting => "开放办公会议",
         };
         write!(f, "{name}")
     }

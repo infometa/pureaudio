@@ -469,7 +469,7 @@ pub struct UserConfig {
     show_agc_advanced: bool,
     #[serde(default)]
     sys_auto_volume: bool,
-    #[serde(default = "default_false")]
+    #[serde(default = "default_true")]
     env_auto_enabled: bool,
     #[serde(default = "default_true")]
     vad_enabled: bool,
@@ -635,7 +635,8 @@ impl Application for SpecView {
 
     fn new(_flags: ()) -> (Self, Command<Message>) {
         let model_path = current_model_path();
-        let (sr, frame_size, freq_size) = capture::model_dimensions(model_path.clone(), 1);
+        let (sr, frame_size, freq_size) =
+            capture::model_dimensions(model_path.clone(), 1).unwrap_or_else(|_| (48000, 960, 512));
         let spec_frames = ((sr / frame_size) * 10).max(1) as u32;
         let freq_res = (sr / 2) / (freq_size.saturating_sub(1).max(1));
         let spec_freqs = (8000 / freq_res.max(1)).max(1) as u32;
@@ -730,12 +731,12 @@ impl Application for SpecView {
                 stft_air_gain_db: default_stft_air_gain(),
                 stft_tilt_db: default_stft_tilt(),
                 stft_band_offsets: [0.0; 8],
-                transient_enabled: true,
+                transient_enabled: false,
                 transient_gain: 3.5,
                 transient_sustain: 0.0,
                 transient_mix: 100.0,
                 show_transient_advanced: false,
-                saturation_enabled: true,
+                saturation_enabled: false,
                 saturation_drive: 1.2,
                 saturation_makeup: -0.5,
                 saturation_mix: 100.0,
@@ -750,16 +751,16 @@ impl Application for SpecView {
                 agc_release_ms: 2000.0,
                 show_agc_advanced: false,
                 sys_auto_volume: false,
-                env_auto_enabled: false,
+                env_auto_enabled: true,
                 vad_enabled: true,
-                exciter_enabled: true,
-                exciter_mix: 0.25,
+                exciter_enabled: false,
+                exciter_mix: 0.0,
                 bypass_enabled: false,
                 user_selected_input: false,
                 user_selected_output: false,
-                env_status_label: "自适应降噪: 关闭".to_string(),
+                env_status_label: "自适应降噪: 开启".to_string(),
                 sysvol_monitor: None,
-                scene_preset: ScenePreset::Broadcast,
+                scene_preset: ScenePreset::OpenOfficeMeeting,
                 model_path,
                 recording: None,
                 is_running: false,
@@ -1849,6 +1850,37 @@ impl SpecView {
                 self.stft_band_offsets = [0.0; 8];
                 self.apply_eq_preset_config(self.eq_preset);
             }
+            ScenePreset::OpenOfficeMeeting => {
+                // 开放式办公会议：重降噪、高通抬升，弱化激励，保护语音起音
+                self.highpass_cutoff = 120.0;
+                self.atten_lim = 45.0;
+                self.min_threshdb = -60.0;
+                self.max_erbthreshdb = 12.0;
+                self.max_dfthreshdb = 12.0;
+                self.df_mix = 1.0;
+                self.headroom_gain = 0.9;
+                self.post_trim_gain = 1.0;
+                self.transient_gain = 3.0;
+                self.transient_sustain = -2.0;
+                self.transient_mix = 100.0;
+                self.saturation_drive = 1.0;
+                self.saturation_makeup = -0.5;
+                self.saturation_mix = 100.0;
+                self.agc_target_db = -6.0;
+                self.agc_max_gain_db = 12.0;
+                self.agc_max_atten_db = 12.0;
+                self.agc_window_sec = 0.6;
+                self.agc_attack_ms = 400.0;
+                self.agc_release_ms = 1500.0;
+                self.eq_preset = EqPresetKind::OpenOffice;
+                self.eq_dry_wet = 1.0;
+                self.stft_band_offsets = [0.0; 8];
+                self.apply_eq_preset_config(self.eq_preset);
+                self.exciter_enabled = false;
+                self.exciter_mix = 0.0;
+                self.env_auto_enabled = true;
+                self.vad_enabled = true;
+            }
         }
         self.input_buffers.clear();
         self.sync_runtime_controls();
@@ -2338,7 +2370,7 @@ impl SpecView {
                 "截止频率 [Hz]",
                 self.highpass_cutoff,
                 0.0,
-                90.0,
+                300.0,
                 SliderTarget::HighpassCutoff,
                 Message::HighpassCutoffChanged,
                 380,
@@ -2346,88 +2378,6 @@ impl SpecView {
                 1.0,
                 Some(tooltips::HIGHPASS_FILTER),
             )
-        } else {
-            widget::Column::new().into()
-        };
-
-        let stft_toggle = row![
-            toggler(String::new(), self.stft_eq_enabled, Message::StftEqToggled),
-            text("STFT 静态 EQ (高频/空气补偿)").size(14),
-        ]
-        .spacing(10)
-        .align_items(Alignment::Center);
-        let stft_controls: Element<'_, Message> = if self.stft_eq_enabled {
-            {
-                let mut col = widget::Column::new().spacing(8);
-                col = col
-                    .push(self.slider_view(
-                        "stft_hf",
-                        "高频恢复 [dB] (6-12k)",
-                        self.stft_hf_gain_db,
-                        0.0,
-                        6.0,
-                        SliderTarget::StftHfGain,
-                        Message::StftEqHfChanged,
-                        380,
-                        1,
-                        0.1,
-                        Some("补偿 DF 高频损失，建议 1~3 dB"),
-                    ))
-                    .push(self.slider_view(
-                        "stft_air",
-                        "空气感 [dB] (12k+)",
-                        self.stft_air_gain_db,
-                        0.0,
-                        8.0,
-                        SliderTarget::StftAirGain,
-                        Message::StftEqAirChanged,
-                        380,
-                        1,
-                        0.1,
-                        Some("补偿 12k 以上空气感，建议 2~4 dB"),
-                    ))
-                    .push(self.slider_view(
-                        "stft_tilt",
-                        "倾斜 [dB]",
-                        self.stft_tilt_db,
-                        -4.0,
-                        4.0,
-                        SliderTarget::StftTilt,
-                        Message::StftEqTiltChanged,
-                        380,
-                        2,
-                        0.1,
-                        Some("整体明暗倾斜，正值更亮"),
-                    ));
-                // 8 段静态 EQ 微调
-                let band_labels = [
-                    "段1 60-120 Hz",
-                    "段2 120-250 Hz",
-                    "段3 250-500 Hz",
-                    "段4 500-1.5k Hz",
-                    "段5 1.5-3k Hz",
-                    "段6 3-6k Hz",
-                    "段7 6-10k Hz",
-                    "段8 10-14k Hz",
-                ];
-                for (i, label) in band_labels.iter().enumerate() {
-                    let idx = i;
-                    col = col.push(self.slider_view(
-                        &format!("stft_band_{}", idx),
-                        &format!("静态 EQ {} [dB]", label),
-                        self.stft_band_offsets[idx],
-                        -3.0,
-                        3.0,
-                        SliderTarget::StftBand(idx),
-                        move |v| Message::StftEqBandChanged(idx, v),
-                        380,
-                        1,
-                        0.1,
-                        Some("微调该频段的静态补偿，-3~+3 dB"),
-                    ));
-                }
-                col.into()
-            }
         } else {
             widget::Column::new().into()
         };
@@ -2754,8 +2704,6 @@ impl SpecView {
                 text("音频增强").size(16),
                 highpass_row,
                 highpass_controls,
-                stft_toggle,
-                stft_controls,
                 saturation_toggle,
                 saturation_controls,
                 exciter_toggle,

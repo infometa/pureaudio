@@ -14,6 +14,7 @@ pub struct EnvelopeDetector {
     release_ms: f32,
     sample_rate: f32,
     value_db: f32,
+    initialized: bool,
 }
 
 impl EnvelopeDetector {
@@ -23,14 +24,21 @@ impl EnvelopeDetector {
             release_ms,
             sample_rate,
             value_db: -80.0,
+            initialized: false,
         }
     }
 
     pub fn reset(&mut self, value_db: f32) {
         self.value_db = value_db;
+        self.initialized = true;
     }
 
     pub fn process(&mut self, input_db: f32, block_len: usize) -> f32 {
+        if !self.initialized {
+            self.value_db = input_db;
+            self.initialized = true;
+            return self.value_db;
+        }
         let coeff = if input_db > self.value_db {
             smoothing_coeff(self.attack_ms, block_len, self.sample_rate)
         } else {

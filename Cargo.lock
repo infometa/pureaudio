@@ -5488,8 +5488,6 @@ dependencies = [
 [[package]]
 name = "webrtc-vad"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17ea66553e5086bf3f89c6e85eb9d44174b499e4da74269605da661d915d4dba"
 dependencies = [
  "cc",
 ]

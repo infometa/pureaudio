@@ -59,11 +59,12 @@ impl TransientShaper {
             };
             self.envelope = coef * self.envelope + (1.0 - coef) * abs_input;
 
+            // 更保守的瞬态判定：增大相对阈值并要求较高包络
             let envelope_delta = self.envelope - self.prev_envelope;
-            let relative_threshold = (self.envelope * 0.1).max(1e-5);
-            if envelope_delta > relative_threshold && self.envelope > threshold_linear {
+            let relative_threshold = (self.envelope * 0.25).max(3e-4);
+            if envelope_delta > relative_threshold && self.envelope > threshold_linear * 2.5 {
                 self.is_transient = true;
-                self.hold_counter = self.hold_samples;
+                self.hold_counter = (self.hold_samples * 2).max(self.hold_samples);
             }
 
             if self.hold_counter > 0 {
@@ -79,8 +80,8 @@ impl TransientShaper {
             } else {
                 sustain_gain
             };
-            let output = input * gain;
-            *sample = input + (output - input) * self.dry_wet;
+            // 全湿处理，避免相位/延迟错位
+            *sample = input * gain;
         }
     }
 

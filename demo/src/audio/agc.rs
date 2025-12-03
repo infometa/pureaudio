@@ -32,9 +32,20 @@ impl AutoGainControl {
 
     pub fn set_window_seconds(&mut self, seconds: f32) {
         let len = ((self.sample_rate * seconds.max(0.05)).round() as usize).max(1);
-        self.rms_buffer.resize(len, 0.0);
-        self.rms_sum = 0.0;
-        self.rms_index = 0;
+        if len != self.rms_buffer.len() {
+            // 保留最近数据，平滑过渡
+            let mut new_buf = vec![0.0; len];
+            let mut new_sum = 0.0;
+            let take = len.min(self.rms_buffer.len());
+            for i in 0..take {
+                let idx = (self.rms_index + self.rms_buffer.len() - take + i) % self.rms_buffer.len();
+                new_buf[i] = self.rms_buffer[idx];
+                new_sum += new_buf[i];
+            }
+            self.rms_buffer = new_buf;
+            self.rms_sum = new_sum;
+            self.rms_index = take % len;
+        }
     }
 
     pub fn set_attack_release(&mut self, attack_ms: f32, release_ms: f32) {

@@ -66,6 +66,13 @@ impl Biquad {
         let out = self.b0 * input + self.z1;
         self.z1 = self.b1 * input + self.z2 - self.a1 * out;
         self.z2 = self.b2 * input - self.a2 * out;
+        // 防止状态漂移/次正规数
+        if !self.z1.is_finite() || self.z1.abs() < 1e-25 {
+            self.z1 = 0.0;
+        }
+        if !self.z2.is_finite() || self.z2.abs() < 1e-25 {
+            self.z2 = 0.0;
+        }
         out
     }
 
@@ -147,11 +154,18 @@ impl Biquad {
 
     fn normalize(&mut self, b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) {
         let a0 = if a0.abs() < 1e-12 { 1.0 } else { a0 };
+        let mut na1 = a1 / a0;
+        let mut na2 = a2 / a0;
+        if na1.abs() >= 1.999 || na2.abs() >= 0.999 {
+            log::warn!("Biquad 系数接近不稳定，已钳制 (a1={:.3}, a2={:.3})", na1, na2);
+            na1 = na1.clamp(-1.999, 1.999);
+            na2 = na2.clamp(-0.999, 0.999);
+        }
         self.b0 = b0 / a0;
         self.b1 = b1 / a0;
         self.b2 = b2 / a0;
-        self.a1 = a1 / a0;
-        self.a2 = a2 / a0;
+        self.a1 = na1;
+        self.a2 = na2;
     }
 }
 
