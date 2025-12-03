@@ -4,7 +4,7 @@ mod dynamic_eq;
 mod envelope;
 mod presets;
 
-pub use biquad::{Biquad, BiquadType};
+// Biquad kept internal; no external re-export to avoid未用警告
 #[cfg(feature = "ui")]
 #[allow(unused_imports)]
 pub use dynamic_band::{BandMode, FilterKind};

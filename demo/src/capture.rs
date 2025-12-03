@@ -860,9 +860,7 @@ fn get_worker_fn(
         let mut target_atten = 45.0f32;
         let mut target_min_thresh = -60.0f32;
         let mut target_max_thresh = 10.0f32;
-        let mut target_df_mix = 1.0f32;
         let mut target_hp = 80.0f32;
-        let mut target_eq_mix = 0.7f32;
         let mut target_exciter_mix = 0.15f32;
         let mut target_transient_sustain = 0.0f32;
         let mut manual_atten = df.atten_lim.unwrap_or(target_atten);
@@ -1242,10 +1240,8 @@ fn get_worker_fn(
                 target_max_thresh =
                     lerp(conf_anchor.max_thresh, office_anchor.max_thresh, office_factor)
                         .min(manual_max_thresh);
-                target_df_mix = 1.0;
                 target_hp = lerp(conf_anchor.hp_cut, office_anchor.hp_cut, office_factor)
                     .max(manual_highpass);
-                target_eq_mix = lerp(conf_anchor.eq_mix, office_anchor.eq_mix, office_factor);
                 target_exciter_mix =
                     lerp(conf_anchor.exciter_mix, office_anchor.exciter_mix, office_factor);
                 target_transient_sustain =
@@ -1270,7 +1266,7 @@ fn get_worker_fn(
                         "未检测到冲击"
                     };
                     log::warn!(
-                        "自适应: SNR {:.1} dB, RT60 {:.2} s；{}；VAD 语音={}；调整 衰减 {:.1} dB，高通 {:.0} Hz，阈值 {:.1}/{:.1} dB，EQ 湿度 {:.2}，激励 {:.2}；软模式 {}，冲击保持 {}",
+                        "自适应: SNR {:.1} dB, RT60 {:.2} s；{}；VAD 语音={}；调整 衰减 {:.1} dB，高通 {:.0} Hz，阈值 {:.1}/{:.1} dB，激励 {:.2}；软模式 {}，冲击保持 {}",
                         snr_db,
                         smoothed_rt60,
                         impact_note,
@@ -1279,7 +1275,6 @@ fn get_worker_fn(
                         target_hp,
                         target_min_thresh,
                         target_max_thresh,
-                        target_eq_mix,
                         target_exciter_mix,
                         soft_mode,
                         impact_hold
@@ -1291,9 +1286,7 @@ fn get_worker_fn(
                     target_atten = 30.0;
                     target_min_thresh = -58.0;
                     target_max_thresh = 12.0;
-                    target_df_mix = 1.0;
                     target_hp = 60.0;
-                    target_eq_mix = 0.6;
                     target_exciter_mix = 0.2;
                 }
 
@@ -1303,7 +1296,6 @@ fn get_worker_fn(
                     target_min_thresh = target_min_thresh.max(-58.0);
                     target_max_thresh = target_max_thresh.min(10.0);
                     target_hp = target_hp.min(110.0);
-                    target_eq_mix = target_eq_mix.max(0.75);
                     target_exciter_mix = target_exciter_mix.max(0.05);
                     soft_mode = false;
                     soft_mode_hold = 0;
@@ -1313,7 +1305,6 @@ fn get_worker_fn(
                     target_hp = target_hp.max(220.0);
                     target_min_thresh = target_min_thresh.max(-54.0);
                     target_max_thresh = target_max_thresh.min(6.0);
-                    target_eq_mix = target_eq_mix.max(0.7);
                     target_exciter_mix = 0.0;
                     soft_mode = false;
                     soft_mode_hold = 0;
@@ -1322,9 +1313,7 @@ fn get_worker_fn(
                 if impact_hold > 0 {
                     // 键盘/点击/关门：瞬时提高抑制和高通，关闭激励
                     target_atten = (target_atten + 12.0).min(75.0);
-                    target_df_mix = 1.0;
                     target_hp = target_hp.max(180.0);
-                    target_eq_mix = (target_eq_mix - 0.18).max(0.35);
                     target_exciter_mix = 0.0;
                 }
 
@@ -2460,8 +2449,8 @@ struct SnrParams {
     atten: f32,
     min_thresh: f32,
     max_thresh: f32,
-    df_mix: f32,
     hp_cut: f32,
+    df_mix: f32,
     eq_mix: f32,
     exciter_mix: f32,
 }
