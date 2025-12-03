@@ -290,11 +290,6 @@ pub enum ControlMessage {
     EnvAutoEnabled(bool),
     ExciterEnabled(bool),
     ExciterMix(f32),
-    StftEqEnabled(bool),
-    StftEqHfGain(f32),
-    StftEqAirGain(f32),
-    StftEqTilt(f32),
-    StftEqBand(usize, f32),
 }
 
 pub fn model_dimensions(
@@ -810,13 +805,6 @@ fn get_worker_fn(
         }
         let mut dynamic_eq = DynamicEq::new(df.sr as f32, EqPresetKind::default());
         let mut highpass = HighpassFilter::new(df.sr as f32);
-        // STFT 静态 EQ 已禁用，保留实例以兼容接口
-        let mut stft_enabled = false;
-        let mut stft_hf_gain = 0.0f32;
-        let mut stft_air_gain = 0.0f32;
-        let mut stft_tilt_gain = 0.0f32;
-        let mut stft_band_offsets = [0.0f32; 8];
-        let mut stft_dirty = false;
         let mut exciter = HarmonicExciter::new(df.sr as f32, 3800.0, 1.6, 0.25);
         let mut transient_shaper = TransientShaper::new(df.sr as f32);
         let mut saturation = Saturation::new();
@@ -1754,22 +1742,6 @@ fn get_worker_fn(
                             exciter.set_mix(value.clamp(0.0, 0.5));
                             log::info!("谐波激励混合: {:.0}%", value * 100.0);
                         }
-                        ControlMessage::StftEqEnabled(_) => {
-                            log::info!("STFT 静态 EQ 已禁用，忽略该开关");
-                            stft_enabled = false;
-                        }
-                        ControlMessage::StftEqHfGain(_) => {
-                            log::info!("STFT 静态 EQ 已禁用，忽略高频补偿");
-                        }
-                        ControlMessage::StftEqAirGain(_) => {
-                            log::info!("STFT 静态 EQ 已禁用，忽略空气感补偿");
-                        }
-                        ControlMessage::StftEqTilt(_) => {
-                            log::info!("STFT 静态 EQ 已禁用，忽略倾斜补偿");
-                        }
-                        ControlMessage::StftEqBand(_, _) => {
-                            log::info!("STFT 静态 EQ 已禁用，忽略 Band 调节");
-                        }
                     }
                 }
             }
@@ -1960,22 +1932,6 @@ fn get_worker_fn(
                         ControlMessage::ExciterMix(value) => {
                             exciter.set_mix(value.clamp(0.0, 0.5));
                             log::info!("谐波激励混合: {:.0}%", value * 100.0);
-                        }
-                        ControlMessage::StftEqEnabled(_) => {
-                            log::info!("STFT 静态 EQ 已禁用，忽略该开关");
-                            stft_enabled = false;
-                        }
-                        ControlMessage::StftEqHfGain(_) => {
-                            log::info!("STFT 静态 EQ 已禁用，忽略高频补偿");
-                        }
-                        ControlMessage::StftEqAirGain(_) => {
-                            log::info!("STFT 静态 EQ 已禁用，忽略空气感补偿");
-                        }
-                        ControlMessage::StftEqTilt(_) => {
-                            log::info!("STFT 静态 EQ 已禁用，忽略倾斜补偿");
-                        }
-                        ControlMessage::StftEqBand(_, _) => {
-                            log::info!("STFT 静态 EQ 已禁用，忽略 Band 调节");
                         }
                         ControlMessage::BypassEnabled(enabled) => {
                             bypass_enabled = enabled;

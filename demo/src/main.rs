@@ -114,22 +114,6 @@ fn default_false() -> bool {
     false
 }
 
-fn default_stft_hf_gain() -> f32 {
-    2.0
-}
-
-fn default_stft_air_gain() -> f32 {
-    3.0
-}
-
-fn default_stft_tilt() -> f32 {
-    0.0
-}
-
-fn default_stft_band_offsets() -> [f32; 8] {
-    [0.0; 8]
-}
-
 fn default_auto_play_file() -> Option<PathBuf> {
     Some(PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -225,11 +209,6 @@ struct SpecView {
     auto_play_pid: Option<u32>,
     highpass_enabled: bool,
     highpass_cutoff: f32,
-    stft_eq_enabled: bool,
-    stft_hf_gain_db: f32,
-    stft_air_gain_db: f32,
-    stft_tilt_db: f32,
-    stft_band_offsets: [f32; 8],
     transient_enabled: bool,
     transient_gain: f32,
     transient_sustain: f32,
@@ -287,10 +266,6 @@ pub enum SliderTarget {
     MaxErbThreshDb,
     MaxDfThreshDb,
     HighpassCutoff,
-    StftHfGain,
-    StftAirGain,
-    StftTilt,
-    StftBand(usize),
     SaturationDrive,
     SaturationMakeup,
     SaturationMix,
@@ -362,11 +337,6 @@ pub enum Message {
     PlaybackFinished(Result<(), String>),
     HighpassToggled(bool),
     HighpassCutoffChanged(f32),
-    StftEqToggled(bool),
-    StftEqHfChanged(f32),
-    StftEqAirChanged(f32),
-    StftEqTiltChanged(f32),
-    StftEqBandChanged(usize, f32),
     SaturationToggled(bool),
     SaturationDriveChanged(f32),
     SaturationMakeupChanged(f32),
@@ -439,16 +409,6 @@ pub struct UserConfig {
     auto_play_file: Option<PathBuf>,
     highpass_enabled: bool,
     highpass_cutoff: f32,
-    #[serde(default = "default_true")]
-    stft_eq_enabled: bool,
-    #[serde(default = "default_stft_hf_gain")]
-    stft_hf_gain_db: f32,
-    #[serde(default = "default_stft_air_gain")]
-    stft_air_gain_db: f32,
-    #[serde(default = "default_stft_tilt")]
-    stft_tilt_db: f32,
-    #[serde(default = "default_stft_band_offsets")]
-    stft_band_offsets: [f32; 8],
     saturation_enabled: bool,
     saturation_drive: f32,
     saturation_makeup: f32,
@@ -726,11 +686,6 @@ impl Application for SpecView {
                 auto_play_pid: None,
                 highpass_enabled: true,
                 highpass_cutoff: 60.0,
-                stft_eq_enabled: false,
-                stft_hf_gain_db: default_stft_hf_gain(),
-                stft_air_gain_db: default_stft_air_gain(),
-                stft_tilt_db: default_stft_tilt(),
-                stft_band_offsets: [0.0; 8],
                 transient_enabled: false,
                 transient_gain: 3.5,
                 transient_sustain: 0.0,
@@ -1018,29 +973,6 @@ impl Application for SpecView {
             Message::HighpassCutoffChanged(freq) => {
                 self.highpass_cutoff = freq;
                 self.send_control_message(ControlMessage::HighpassCutoff(freq));
-            }
-            Message::StftEqToggled(enabled) => {
-                self.stft_eq_enabled = enabled;
-                self.send_control_message(ControlMessage::StftEqEnabled(enabled));
-            }
-            Message::StftEqHfChanged(db) => {
-                self.stft_hf_gain_db = db;
-                self.send_control_message(ControlMessage::StftEqHfGain(db));
-            }
-            Message::StftEqAirChanged(db) => {
-                self.stft_air_gain_db = db;
-                self.send_control_message(ControlMessage::StftEqAirGain(db));
-            }
-            Message::StftEqTiltChanged(db) => {
-                self.stft_tilt_db = db;
-                self.send_control_message(ControlMessage::StftEqTilt(db));
-            }
-            Message::StftEqBandChanged(idx, db) => {
-                if idx < self.stft_band_offsets.len() {
-                    self.stft_band_offsets[idx] = db;
-                    self.set_buffer(&format!("stft_band_{}", idx), format!("{:.1}", db));
-                    self.send_control_message(ControlMessage::StftEqBand(idx, db));
-                }
             }
             Message::SaturationToggled(enabled) => {
                 self.saturation_enabled = enabled;
@@ -1502,13 +1434,6 @@ impl SpecView {
         self.broadcast_eq_band_gains();
         self.send_control_message(ControlMessage::HighpassEnabled(self.highpass_enabled));
         self.send_control_message(ControlMessage::HighpassCutoff(self.highpass_cutoff));
-        self.send_control_message(ControlMessage::StftEqEnabled(self.stft_eq_enabled));
-        self.send_control_message(ControlMessage::StftEqHfGain(self.stft_hf_gain_db));
-        self.send_control_message(ControlMessage::StftEqAirGain(self.stft_air_gain_db));
-        self.send_control_message(ControlMessage::StftEqTilt(self.stft_tilt_db));
-        for (idx, offset) in self.stft_band_offsets.iter().enumerate() {
-            self.send_control_message(ControlMessage::StftEqBand(idx, *offset));
-        }
         self.send_control_message(ControlMessage::SaturationEnabled(self.saturation_enabled));
         self.send_control_message(ControlMessage::SaturationDrive(self.saturation_drive));
         self.send_control_message(ControlMessage::SaturationMakeup(self.saturation_makeup));
@@ -1803,7 +1728,6 @@ impl SpecView {
                 self.agc_release_ms = 2000.0;
                 self.eq_preset = EqPresetKind::Broadcast;
                 self.eq_dry_wet = 1.0;
-                self.stft_band_offsets = [0.0; 8];
                 self.apply_eq_preset_config(self.eq_preset);
             }
             ScenePreset::OpenOffice => {
@@ -1825,7 +1749,6 @@ impl SpecView {
                 self.agc_max_gain_db = 15.0;
                 self.eq_preset = EqPresetKind::OpenOffice;
                 self.eq_dry_wet = 1.0;
-                self.stft_band_offsets = [0.0; 8];
                 self.apply_eq_preset_config(self.eq_preset);
             }
             ScenePreset::ConferenceHall => {
@@ -1847,7 +1770,6 @@ impl SpecView {
                 self.agc_max_gain_db = 6.0;
                 self.eq_preset = EqPresetKind::ConferenceHall;
                 self.eq_dry_wet = 1.0;
-                self.stft_band_offsets = [0.0; 8];
                 self.apply_eq_preset_config(self.eq_preset);
             }
             ScenePreset::OpenOfficeMeeting => {
@@ -1874,7 +1796,6 @@ impl SpecView {
                 self.agc_release_ms = 1500.0;
                 self.eq_preset = EqPresetKind::OpenOffice;
                 self.eq_dry_wet = 1.0;
-                self.stft_band_offsets = [0.0; 8];
                 self.apply_eq_preset_config(self.eq_preset);
                 self.exciter_enabled = false;
                 self.exciter_mix = 0.0;
@@ -1889,10 +1810,6 @@ impl SpecView {
     fn sync_runtime_controls(&self) {
         self.send_control_message(ControlMessage::HighpassEnabled(self.highpass_enabled));
         self.send_control_message(ControlMessage::HighpassCutoff(self.highpass_cutoff));
-        self.send_control_message(ControlMessage::StftEqEnabled(self.stft_eq_enabled));
-        self.send_control_message(ControlMessage::StftEqHfGain(self.stft_hf_gain_db));
-        self.send_control_message(ControlMessage::StftEqAirGain(self.stft_air_gain_db));
-        self.send_control_message(ControlMessage::StftEqTilt(self.stft_tilt_db));
         self.send_control_message(ControlMessage::DfMix(self.df_mix));
         self.send_control_message(ControlMessage::HeadroomGain(self.headroom_gain));
         self.send_control_message(ControlMessage::PostTrimGain(self.post_trim_gain));
@@ -2022,11 +1939,6 @@ impl SpecView {
             auto_play_file: self.auto_play_file.clone(),
             highpass_enabled: self.highpass_enabled,
             highpass_cutoff: self.highpass_cutoff,
-            stft_eq_enabled: self.stft_eq_enabled,
-            stft_hf_gain_db: self.stft_hf_gain_db,
-            stft_air_gain_db: self.stft_air_gain_db,
-            stft_tilt_db: self.stft_tilt_db,
-            stft_band_offsets: self.stft_band_offsets,
             saturation_enabled: self.saturation_enabled,
             saturation_drive: self.saturation_drive,
             saturation_makeup: self.saturation_makeup,
@@ -2090,11 +2002,6 @@ impl SpecView {
         self.auto_play_pid = None;
         self.highpass_enabled = cfg.highpass_enabled;
         self.highpass_cutoff = cfg.highpass_cutoff;
-        self.stft_eq_enabled = cfg.stft_eq_enabled;
-        self.stft_hf_gain_db = cfg.stft_hf_gain_db;
-        self.stft_air_gain_db = cfg.stft_air_gain_db;
-        self.stft_tilt_db = cfg.stft_tilt_db;
-        self.stft_band_offsets = cfg.stft_band_offsets;
         self.saturation_enabled = cfg.saturation_enabled;
         self.saturation_drive = cfg.saturation_drive;
         self.saturation_makeup = cfg.saturation_makeup;
@@ -3028,24 +2935,6 @@ impl SpecView {
             SliderTarget::HighpassCutoff => {
                 self.highpass_cutoff = value;
                 self.send_control_message(ControlMessage::HighpassCutoff(value));
-            }
-            SliderTarget::StftHfGain => {
-                self.stft_hf_gain_db = value;
-                self.send_control_message(ControlMessage::StftEqHfGain(value));
-            }
-            SliderTarget::StftAirGain => {
-                self.stft_air_gain_db = value;
-                self.send_control_message(ControlMessage::StftEqAirGain(value));
-            }
-            SliderTarget::StftTilt => {
-                self.stft_tilt_db = value;
-                self.send_control_message(ControlMessage::StftEqTilt(value));
-            }
-            SliderTarget::StftBand(idx) => {
-                if idx < self.stft_band_offsets.len() {
-                    self.stft_band_offsets[idx] = value;
-                    self.send_control_message(ControlMessage::StftEqBand(idx, value));
-                }
             }
             SliderTarget::SaturationDrive => {
                 self.saturation_drive = value;
