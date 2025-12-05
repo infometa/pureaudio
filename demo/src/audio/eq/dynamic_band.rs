@@ -87,6 +87,7 @@ pub struct DynamicBand {
     sample_rate: f32,
     current_gain_db: f32,
     user_gain_db: f32,
+    rms_ema: f32,
 }
 
 impl DynamicBand {
@@ -107,6 +108,7 @@ impl DynamicBand {
             sample_rate,
             current_gain_db: 0.0,
             user_gain_db: settings.static_gain_db,
+            rms_ema: 0.0,
         }
     }
 
@@ -135,7 +137,14 @@ impl DynamicBand {
         if block_len == 0 {
             return;
         }
-        let level_db = linear_to_db(rms);
+        // 块级 RMS 做 EMA 平滑，降低对块长的敏感度
+        let alpha_rms = smoothing_coeff(50.0, block_len, self.sample_rate); // ~50ms 平滑
+        if self.rms_ema == 0.0 {
+            self.rms_ema = rms;
+        } else {
+            self.rms_ema += alpha_rms * (rms - self.rms_ema);
+        }
+        let level_db = linear_to_db(self.rms_ema);
         let env_db = self.envelope.process(level_db, block_len);
         let target = self.target_gain(env_db);
         let coeff = if target > self.current_gain_db {

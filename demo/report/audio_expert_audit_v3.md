@@ -473,3 +473,4 @@ pub fn new(sample_rate: f32, attack_ms: f32, release_ms: f32) -> Self {
 
 整体代码质量在持续改进，但仍有一些细节需要完善。建议继续关注数值精度、稳定性和性能优化。
 
+

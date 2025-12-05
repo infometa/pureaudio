@@ -49,3 +49,4 @@ rfd = "0.14"
 realfft = "3.5"
 webrtc-vad = "0.1"
 webrtc-audio-processing = { version = "0.5", features = ["bundled"] }
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "download-binaries", "copy-dylibs"] }

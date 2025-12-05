@@ -40,7 +40,16 @@ impl HighpassFilter {
     pub fn set_cutoff(&mut self, cutoff_hz: f32) {
         let nyq = (self.sample_rate / 2.0).max(1.0);
         let safe_max = nyq * 0.45;
-        self.cutoff_hz = cutoff_hz.clamp(0.0, safe_max);
+        // 过低的截止频率会导致系数接近 1，数值不稳定；限制一个安全下限。
+        let safe_min = 20.0;
+        let clamped = cutoff_hz.clamp(safe_min, safe_max);
+        if clamped != cutoff_hz && cutoff_hz > 0.0 {
+            warn!(
+                "HighpassFilter 截止频率过低 ({:.1} Hz)，已提升到 {:.1} Hz 以保证稳定",
+                cutoff_hz, clamped
+            );
+        }
+        self.cutoff_hz = clamped;
         self.update_coefficients();
     }
 

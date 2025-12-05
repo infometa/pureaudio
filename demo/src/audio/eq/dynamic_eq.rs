@@ -197,18 +197,6 @@ impl DynamicEq {
         for band in self.bands.iter_mut() {
             band.apply(samples);
         }
-        let peak = samples.iter().fold(0.0f32, |acc, sample| acc.max(sample.abs()));
-        if peak > 1.0 {
-            let scale = 0.85 / peak;
-            for sample in samples.iter_mut() {
-                *sample *= scale;
-            }
-            log::warn!(
-                "EQ 输出过载 ({:.2}x)，自动降低 {:.1} dB",
-                peak,
-                20.0 * (1.0 / scale).log10()
-            );
-        }
         if should_soft_limit(samples) {
             apply_soft_limiter(samples);
         }

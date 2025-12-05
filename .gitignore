@@ -148,3 +148,5 @@ dmypy.json
 # IDE
 .idea
 demo-AI/
+demo/models/checkpoint_best.pt
+timbre_restore.onnx

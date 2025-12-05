@@ -101,6 +101,7 @@ pub fn main() -> iced::Result {
 const SPEC_DISPLAY_WIDTH: u16 = 1000;
 const SPEC_DISPLAY_HEIGHT: u16 = 250;
 const OUTPUT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/output");
+const TIMBRE_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/timbre_restore.onnx");
 const CONFIG_VERSION: u32 = 1;
 const UI_FONT: Font = Font::with_name("Source Han Sans CN");
 const UI_FONT_BYTES: &[u8] = include_bytes!("../fonts/SourceHanSansCN-Regular.ttf");
@@ -220,6 +221,7 @@ struct SpecView {
     saturation_mix: f32,
     show_saturation_advanced: bool,
     agc_enabled: bool,
+    timbre_enabled: bool,
     agc_current_gain: f32,
     agc_target_db: f32,
     agc_max_gain_db: f32,
@@ -245,7 +247,7 @@ struct SpecView {
     is_running: bool,
     is_saving: bool,
     status_text: String,
-    last_saved: Option<(PathBuf, PathBuf, PathBuf)>,
+    last_saved: Option<(PathBuf, PathBuf, PathBuf, PathBuf)>,
     input_buffers: HashMap<String, String>,
     spec_frames: u32,
     spec_freqs: u32,
@@ -360,10 +362,11 @@ pub enum Message {
     EnvAutoToggled(bool),
     ExciterToggled(bool),
     ExciterMixChanged(f32),
+    TimbreToggled(bool),
     EnvStatusUpdated(EnvStatus),
     StartProcessing,
     StopProcessing,
-    SaveFinished(Result<(PathBuf, PathBuf, PathBuf), String>),
+    SaveFinished(Result<(PathBuf, PathBuf, PathBuf, PathBuf), String>),
     SaveConfigRequested,
     LoadConfigRequested,
     ConfigSaveFinished(Result<PathBuf, String>),
@@ -420,6 +423,8 @@ pub struct UserConfig {
     transient_mix: f32,
     show_transient_advanced: bool,
     agc_enabled: bool,
+    #[serde(default)]
+    timbre_enabled: bool,
     agc_target_db: f32,
     agc_max_gain_db: f32,
     agc_max_atten_db: f32,
@@ -697,6 +702,7 @@ impl Application for SpecView {
                 saturation_mix: 100.0,
                 show_saturation_advanced: false,
                 agc_enabled: true,
+                timbre_enabled: false,
                 agc_current_gain: 0.0,
                 agc_target_db: -16.0,
                 agc_max_gain_db: 12.0,
@@ -753,10 +759,10 @@ impl Application for SpecView {
             Message::SaveFinished(result) => {
                 self.is_saving = false;
                 match result {
-                    Ok((raw, denoised, processed)) => {
+                    Ok((raw, denoised, timbre, processed)) => {
                         self.status_text = "音频已保存".to_string();
-                        self.last_saved = Some((raw, denoised, processed));
-                        if let Some((raw, _, _)) = &self.last_saved {
+                        self.last_saved = Some((raw, denoised, timbre, processed));
+                        if let Some((raw, _, _, _)) = &self.last_saved {
                             if let Some(dir) = raw.parent() {
                                 match self.save_config_to_path(&dir.join("config.json")) {
                                     Ok(_) => {}
@@ -1075,6 +1081,10 @@ impl Application for SpecView {
                 self.exciter_mix = value.clamp(0.0, 0.5);
                 self.send_control_message(ControlMessage::ExciterMix(self.exciter_mix));
             }
+            Message::TimbreToggled(enabled) => {
+                self.timbre_enabled = enabled;
+                self.send_control_message(ControlMessage::TimbreEnabled(enabled));
+            }
             Message::Tick => {
                 // 确保后台系统音量监测在未降噪时也保持运行
                 self.ensure_sys_volume_monitor();
@@ -1302,7 +1312,7 @@ impl Application for SpecView {
                 .align_items(Alignment::Center),
         ];
 
-        if let Some((raw, _, _)) = &self.last_saved {
+        if let Some((raw, _, _, _)) = &self.last_saved {
             if let Some(dir) = raw.parent() {
                 header = header.push(text(format!("文件已保存至: {}", dir.display())).size(16));
             } else {
@@ -1440,6 +1450,7 @@ impl SpecView {
         self.send_control_message(ControlMessage::SaturationMix(self.saturation_mix));
         self.send_control_message(ControlMessage::ExciterEnabled(self.exciter_enabled));
         self.send_control_message(ControlMessage::ExciterMix(self.exciter_mix));
+        self.send_control_message(ControlMessage::TimbreEnabled(self.timbre_enabled));
         self.send_control_message(ControlMessage::BypassEnabled(self.bypass_enabled));
         self.send_control_message(ControlMessage::TransientEnabled(self.transient_enabled));
         self.send_control_message(ControlMessage::TransientGain(self.transient_gain));
@@ -1519,12 +1530,15 @@ impl SpecView {
         self.r_env_status = None;
         self.eq_status = EqStatus::default();
         let sample_rate = recording.sample_rate() as u32;
-        let (noisy, denoised, processed) = recording.take_samples();
+        let (noisy, denoised, _timbre, processed) = recording.take_samples();
         self.status_text = "正在保存音频...".to_string();
         self.last_saved = None;
         self.is_saving = true;
+        let timbre_enabled = self.timbre_enabled;
         Command::perform(
-            async move { save_recordings(noisy, denoised, processed, sample_rate) },
+            async move {
+                save_recordings(noisy, denoised, processed, sample_rate, timbre_enabled)
+            },
             Message::SaveFinished,
         )
     }
@@ -1756,6 +1770,40 @@ impl SpecView {
                 self.env_auto_enabled = true;
                 self.vad_enabled = true;
             }
+            ScenePreset::OpenOfficeHeadset => {
+                // 开放办公-耳机：抑制呼吸/衣物摩擦，保持近讲清晰
+                self.highpass_cutoff = 150.0;
+                self.atten_lim = 85.0;
+                self.min_threshdb = -55.0;
+                self.max_erbthreshdb = 10.0;
+                self.max_dfthreshdb = 10.0;
+                self.df_mix = 1.0;
+                self.headroom_gain = 0.85;
+                self.post_trim_gain = 1.0;
+                self.transient_gain = 2.0;
+                self.transient_sustain = -3.0;
+                self.transient_mix = 80.0;
+                self.saturation_drive = 1.0;
+                self.saturation_makeup = -0.5;
+                self.saturation_mix = 100.0;
+                self.agc_target_db = -6.0;
+                self.agc_max_gain_db = 12.0;
+                self.agc_max_atten_db = 12.0;
+                self.agc_window_sec = 0.5;
+                self.agc_attack_ms = 300.0;
+                self.agc_release_ms = 1200.0;
+                self.eq_preset = EqPresetKind::OpenOfficeHeadset;
+                self.eq_dry_wet = 1.0;
+                self.apply_eq_preset_config(self.eq_preset);
+                self.exciter_enabled = true;
+                self.exciter_mix = 0.08; // 耳机轻激励，防止嘶声
+                self.env_auto_enabled = true;
+                self.vad_enabled = true;
+                self.highpass_enabled = true;
+                self.agc_enabled = true;
+                self.saturation_enabled = true;
+                self.transient_enabled = true;
+            }
         }
         self.input_buffers.clear();
         self.sync_runtime_controls();
@@ -1904,6 +1952,7 @@ impl SpecView {
             transient_mix: self.transient_mix,
             show_transient_advanced: self.show_transient_advanced,
             agc_enabled: self.agc_enabled,
+            timbre_enabled: self.timbre_enabled,
             agc_target_db: self.agc_target_db,
             agc_max_gain_db: self.agc_max_gain_db,
             agc_max_atten_db: self.agc_max_atten_db,
@@ -1967,6 +2016,7 @@ impl SpecView {
         self.transient_mix = cfg.transient_mix;
         self.show_transient_advanced = cfg.show_transient_advanced;
         self.agc_enabled = cfg.agc_enabled;
+        self.timbre_enabled = cfg.timbre_enabled;
         self.agc_target_db = cfg.agc_target_db;
         self.agc_max_gain_db = cfg.agc_max_gain_db;
         self.agc_max_atten_db = cfg.agc_max_atten_db;
@@ -2341,6 +2391,13 @@ impl SpecView {
             widget::Column::new().into()
         };
 
+        let timbre_toggle = row![
+            toggler(String::new(), self.timbre_enabled, Message::TimbreToggled),
+            text("音色修复 (ONNX)").size(14),
+        ]
+        .spacing(10)
+        .align_items(Alignment::Center);
+
         let transient_toggle = apply_tooltip(
             row![
                 toggler(
@@ -2441,7 +2498,7 @@ impl SpecView {
                         Some("agc_target"),
                         self.agc_target_db,
                         -20.0,
-                        -6.0,
+                        0.0,
                         1.0,
                         1,
                         Some(SliderTarget::AgcTarget),
@@ -2519,6 +2576,7 @@ impl SpecView {
                 saturation_controls,
                 exciter_toggle,
                 exciter_controls,
+                timbre_toggle,
                 transient_toggle,
                 transient_controls,
                 agc_row,
@@ -3044,14 +3102,16 @@ fn save_recordings(
     denoised: Vec<f32>,
     processed: Vec<f32>,
     sample_rate: u32,
-) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    timbre_enabled: bool,
+) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), String> {
     let dir = PathBuf::from(OUTPUT_DIR);
     let timestamp = current_timestamp();
     let folder = dir.join(timestamp);
     fs::create_dir_all(&folder).map_err(|err| err.to_string())?;
     let raw_path = folder.join("raw.wav");
     let denoised_path = folder.join("nc.wav");
-    let processed_path = folder.join("eq.wav");
+    let timbre_path = folder.join("timbre.wav");
+    let processed_path = folder.join("final.wav");
     let mut created = Vec::new();
     let cleanup = |paths: &[PathBuf], folder: &Path| {
         for path in paths {
@@ -3073,12 +3133,36 @@ fn save_recordings(
         cleanup(&created, &folder);
         return Err(err);
     }
+    // 离线音色修复：对降噪后音频进行一次性处理，避免实时卡顿
+    let timbre = if timbre_enabled {
+        let mut out = denoised.clone();
+        if let Some(mut tr) = crate::audio::timbre_restore::load_default_timbre(TIMBRE_MODEL, 256)
+        {
+            let frame = 480.min(out.len().max(1)); // 约 20ms 帧长
+            for chunk in out.chunks_mut(frame) {
+                if let Err(e) = tr.process_frame(chunk) {
+                    log::warn!("离线音色修复失败: {e}");
+                    break;
+                }
+            }
+        } else {
+            log::warn!("离线音色修复加载模型失败，跳过");
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    created.push(timbre_path.clone());
+    if let Err(err) = write_wav(&timbre_path, &timbre, sample_rate) {
+        cleanup(&created, &folder);
+        return Err(err);
+    }
     created.push(processed_path.clone());
     if let Err(err) = write_wav(&processed_path, &processed, sample_rate) {
         cleanup(&created, &folder);
         return Err(err);
     }
-    Ok((raw_path, denoised_path, processed_path))
+    Ok((raw_path, denoised_path, timbre_path, processed_path))
 }
 
 #[cfg(target_os = "macos")]

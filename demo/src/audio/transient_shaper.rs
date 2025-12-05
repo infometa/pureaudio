@@ -59,10 +59,10 @@ impl TransientShaper {
             };
             self.envelope = coef * self.envelope + (1.0 - coef) * abs_input;
 
-            // 更保守的瞬态判定：增大相对阈值并要求较高包络
+            // 调高敏感度：降低相对阈值和绝对倍数，减少漏检
             let envelope_delta = self.envelope - self.prev_envelope;
-            let relative_threshold = (self.envelope * 0.25).max(3e-4);
-            if envelope_delta > relative_threshold && self.envelope > threshold_linear * 2.5 {
+            let relative_threshold = (self.envelope * 0.15).max(1.5e-4);
+            if envelope_delta > relative_threshold && self.envelope > threshold_linear * 1.5 {
                 self.is_transient = true;
                 self.hold_counter = (self.hold_samples * 2).max(self.hold_samples);
             }
@@ -86,7 +86,8 @@ impl TransientShaper {
     }
 
     pub fn set_attack_gain(&mut self, db: f32) {
-        self.attack_gain_db = db.clamp(0.0, 12.0);
+        // 允许负值以在键盘/呼吸等冲击时压制瞬态
+        self.attack_gain_db = db.clamp(-12.0, 12.0);
     }
 
     pub fn set_sustain_gain(&mut self, db: f32) {

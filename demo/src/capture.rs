@@ -30,6 +30,7 @@ use rubato::{FftFixedIn, FftFixedOut, Resampler};
 use webrtc_vad::{Vad, VadMode};
 
 const OUTPUT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/output");
+// CARGO_MANIFEST_DIR 已在 demo/，无需重复 demo 前缀
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnvClass {
@@ -120,6 +121,7 @@ pub struct RecordingState {
     noisy: Mutex<Vec<f32>>,
     denoised: Mutex<Vec<f32>>,
     processed: Mutex<Vec<f32>>,
+    timbre: Mutex<Vec<f32>>,
 }
 
 impl RecordingState {
@@ -132,6 +134,7 @@ impl RecordingState {
             noisy: Mutex::new(Vec::with_capacity(reserve)),
             denoised: Mutex::new(Vec::with_capacity(reserve)),
             processed: Mutex::new(Vec::with_capacity(reserve)),
+            timbre: Mutex::new(Vec::with_capacity(reserve)),
         }
     }
 
@@ -157,6 +160,12 @@ impl RecordingState {
         }
     }
 
+    pub fn append_timbre(&self, samples: &[f32]) {
+        if let Ok(mut buf) = self.timbre.lock() {
+            self.append_with_limit(&mut buf, samples, "timbre");
+        }
+    }
+
     fn append_with_limit(&self, buf: &mut Vec<f32>, samples: &[f32], _tag: &str) {
         if buf.len() >= self.max_samples {
             // 长时间运行时录音缓冲达到上限，静默丢弃，避免日志刷屏
@@ -168,13 +177,14 @@ impl RecordingState {
         // 达到容量后继续静默丢弃，避免日志刷屏
     }
 
-    pub fn take_samples(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    pub fn take_samples(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
         let noisy = self.noisy.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default();
         let denoised =
             self.denoised.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default();
         let processed =
             self.processed.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default();
-        (noisy, denoised, processed)
+        let timbre = self.timbre.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default();
+        (noisy, denoised, timbre, processed)
     }
 }
 
@@ -290,6 +300,7 @@ pub enum ControlMessage {
     EnvAutoEnabled(bool),
     ExciterEnabled(bool),
     ExciterMix(f32),
+    TimbreEnabled(bool),
 }
 
 pub fn model_dimensions(
@@ -807,6 +818,9 @@ fn get_worker_fn(
         let mut highpass = HighpassFilter::new(df.sr as f32);
         let mut exciter = HarmonicExciter::new(df.sr as f32, 3800.0, 1.6, 0.25);
         let mut transient_shaper = TransientShaper::new(df.sr as f32);
+        // 记录用户配置的瞬态参数，便于在冲击抑制时暂时改写
+        let mut transient_attack_db = 2.0f32;
+        transient_shaper.set_attack_gain(transient_attack_db);
         let mut saturation = Saturation::new();
         let mut agc = AutoGainControl::new(df.sr as f32, df.hop_size);
         let mut vad = Vad::new(df.sr as i32)
@@ -824,8 +838,8 @@ fn get_worker_fn(
             _ => 0,
         };
         let mut vad_buf: VecDeque<f32> = VecDeque::with_capacity(vad_frame_len.max(1) * 2);
-        // 更长淡入，避免启动瞬间脉冲
-        let fade_total = (df.sr as f32 * 0.08) as usize; // 80ms fade-in，减少开口被吞
+        // 短淡入，避免启动瞬间脉冲，缩短至 20ms 保护首音
+        let fade_total = (df.sr as f32 * 0.02) as usize; // 20ms fade-in
         let mut fade_progress = 0usize;
         let mut highpass_enabled = true;
         let mut highpass_cutoff = 60.0f32;
@@ -835,10 +849,12 @@ fn get_worker_fn(
         let mut saturation_enabled = true;
         let mut agc_enabled = true;
         let mut exciter_enabled = true;
+        let mut _timbre_enabled = false;
         let mut bypass_enabled = false;
         let mut mute_playback = false;
         let mut _df_mix = 1.0f32;
-        let mut headroom_gain = 0.9f32;
+        // 耳机场景：预留更多头间距，减少 clipping
+        let mut headroom_gain = 0.85f32;
         let mut post_trim_gain = 1.0f32;
         // 自适应环境/设备状态（默认关闭，通过 UI 控制开启）
         let mut env_class = EnvClass::Noisy;
@@ -852,7 +868,7 @@ fn get_worker_fn(
         let mut vad_voice_count = 0usize;
         let mut vad_noise_count = 0usize;
         // 噪声门控已禁用（交给 WebRTC AGC/DF 处理），固定全通
-        let mut gate_gain = 1.0f32;
+        let mut _gate_gain = 1.0f32;
         // 噪声地板 & SNR 跟踪
         let mut noise_floor_db = -60.0f32;
         let mut snr_db = 10.0f32;
@@ -868,6 +884,8 @@ fn get_worker_fn(
         let mut office_factor = 0.5f32;
         // 冲击/键盘保护计数
         let mut impact_hold = 0usize;
+        // 呼吸/衣物摩擦等近场气流噪声的抑制计数
+        let mut breath_hold = 0usize;
         const IMPACT_HOLD_FRAMES: usize = 120; // 更长保持，强压键盘/点击
                                               // 柔和模式用于外部 ANC/极静环境，降低降噪力度并补高频
         let mut soft_mode = false;
@@ -877,7 +895,8 @@ fn get_worker_fn(
         const SOFT_MODE_HOLD_FRAMES: usize = 160; // 约 2s（取决于 hop）
         let mut last_impact_hold = 0usize;
         // 启动保护期，前 1s 禁止 gate/瞬态强抑制，避免开口被吞
-        let startup_guard_until = Instant::now() + Duration::from_millis(1000);
+        // 启动保护期：首 3s 保护起音，不做重度抑制
+        let startup_guard_until = Instant::now() + Duration::from_millis(3000);
         let mut _auto_gain_scale = 1.0f32;
         has_init.store(true, Ordering::Relaxed);
         log::info!("Worker init");
@@ -1041,6 +1060,12 @@ fn get_worker_fn(
                 };
                 if let Some(buffer) = outframe.as_slice_mut() {
                     sanitize_samples("降噪输出", buffer);
+                    // 降噪后先做安全头间距，避免后级/重采样 clipping
+                    apply_peak_guard(buffer, 0.90);
+                    // 冲击/呼吸持有期间额外削峰，避免瞬态泄露
+                    if impact_hold > 0 || breath_hold > 0 {
+                        apply_peak_guard(buffer, 0.65);
+                    }
                 }
             }
             if env_auto_enabled && !bypass_enabled {
@@ -1078,6 +1103,7 @@ fn get_worker_fn(
                         }
                     }
                 }
+                let guard_active = Instant::now() < startup_guard_until;
                 let vad_voice = if vad_enabled && vad_frame_len > 0 && vad_buf.len() >= vad_frame_len {
                     if let Some(ref mut v) = vad {
                         let buf = vad_buf.make_contiguous();
@@ -1088,41 +1114,58 @@ fn get_worker_fn(
                 } else {
                     false
                 };
-                let heuristic_voice = rms_db > -50.0
-                    && smoothed_flatness < 0.35
-                    && smoothed_centroid < 0.60;
+                let heuristic_voice = rms_db > -55.0
+                    && smoothed_flatness < 0.40
+                    && smoothed_centroid < 0.65;
                 let energy_gap = rms_db - noise_floor_db;
-                let energy_gate = energy_gap > 12.0 && rms_db > -55.0;
+                let energy_gate = energy_gap > 10.0 && rms_db > -60.0;
                 // 语音判定：VAD & 特征 & SNR，同时要求能量高于噪声地板
                 let mut is_voice = vad_voice && snr_db > 8.0 && energy_gate;
-                if !is_voice && heuristic_voice && energy_gap > 14.0 {
+                let energy_gap_threshold = if guard_active { 8.0 } else { 14.0 };
+                if !is_voice && heuristic_voice && energy_gap > energy_gap_threshold {
                     is_voice = true;
                 }
-                // 滞后：累积计数防抖
-                if is_voice {
-                    vad_voice_count = vad_voice_count.saturating_add(1).min(50);
-                    vad_noise_count = vad_noise_count.saturating_sub(vad_noise_count.min(1));
+                // 启动保护期：强制快速进入语音，避免首音被吞
+                if guard_active {
+                    if is_voice {
+                        vad_state = true;
+                        vad_voice_count = 3;
+                        vad_noise_count = 0;
+                    } else {
+                        // 首秒内只要能量略高也视为语音
+                        if energy_gap > 6.0 {
+                            vad_state = true;
+                        }
+                    }
                 } else {
-                    vad_noise_count = vad_noise_count.saturating_add(1).min(50);
-                    vad_voice_count = vad_voice_count.saturating_sub(vad_voice_count.min(1));
-                }
-                if vad_voice_count >= 3 {
-                    vad_state = true;
-                } else if vad_noise_count >= 2 {
-                    vad_state = false;
+                    // 滞后：累积计数防抖，语音判定更快，噪声判定更慢
+                    if is_voice {
+                        vad_voice_count = vad_voice_count.saturating_add(1).min(50);
+                        vad_noise_count = vad_noise_count.saturating_sub(vad_noise_count.min(1));
+                    } else {
+                        vad_noise_count = vad_noise_count.saturating_add(1).min(50);
+                        vad_voice_count = vad_voice_count.saturating_sub(vad_voice_count.min(1));
+                    }
+                    if vad_voice_count >= 1 {
+                        vad_state = true;
+                    } else if vad_noise_count >= 4 {
+                        vad_state = false;
+                    }
                 }
                 is_voice = vad_state;
                 // 近讲优先：如果离麦较远（能量差不足），强制当噪声
-                if is_voice && energy_gap < 12.0 && rms_db < -42.0 {
+                if !guard_active && is_voice && energy_gap < 12.0 && rms_db < -42.0 {
                     is_voice = false;
                 }
 
-                // 噪声地板跟踪：仅在非语音段更新，下降快，上升慢
+                // 噪声地板跟踪：仅在非语音段更新，下降快，上升慢；启动期更快适配环境
                 if !is_voice {
+                    let nf_fast = if guard_active { 0.7 } else { 0.45 };
+                    let nf_slow = if guard_active { 0.10 } else { 0.03 };
                     if rms_db < noise_floor_db {
-                        noise_floor_db = smooth_value(noise_floor_db, rms_db, 0.45);
+                        noise_floor_db = smooth_value(noise_floor_db, rms_db, nf_fast);
                     } else {
-                        noise_floor_db = smooth_value(noise_floor_db, rms_db, 0.03);
+                        noise_floor_db = smooth_value(noise_floor_db, rms_db, nf_slow);
                     }
                     if rt60_history.len() >= rt60_window_frames {
                         rt60_history.pop_front();
@@ -1206,6 +1249,17 @@ fn get_worker_fn(
                 }
                 last_impact_hold = impact_hold;
 
+                // 急促呼吸/衣物摩擦：低重心、低平坦度但能量突增
+                if !is_voice
+                    && rms_db > noise_floor_db + 8.0
+                    && smoothed_centroid < 0.55
+                    && smoothed_flatness < 0.45
+                {
+                    breath_hold = (breath_hold + 12).min(IMPACT_HOLD_FRAMES / 2);
+                } else if breath_hold > 0 {
+                    breath_hold = breath_hold.saturating_sub(1);
+                }
+
                 // “办公区(嘈杂) ↔ 会议室(高混响)” 双锚点线性插值
                 let office_anchor = SnrParams {
                     atten: 100.0,
@@ -1285,24 +1339,33 @@ fn get_worker_fn(
                     target_exciter_mix = 0.2;
                 }
 
-                // 语音段放松：降低额外抑制，减小高通，保护起音
-                if is_voice && impact_hold == 0 {
-                    target_atten = target_atten.min(48.0);
-                    target_min_thresh = target_min_thresh.max(-58.0);
-                    target_max_thresh = target_max_thresh.min(10.0);
-                    target_hp = target_hp.min(110.0);
-                    target_exciter_mix = target_exciter_mix.max(0.05);
-                    soft_mode = false;
-                    soft_mode_hold = 0;
-                } else if !is_voice {
-                    // 非语音段：重度抑制，快速压制键盘/底噪
-                    target_atten = (target_atten + 22.0).min(100.0);
-                    target_hp = target_hp.max(220.0);
-                    target_min_thresh = target_min_thresh.max(-54.0);
-                    target_max_thresh = target_max_thresh.min(6.0);
-                    target_exciter_mix = 0.0;
-                    soft_mode = false;
-                    soft_mode_hold = 0;
+                // 启动保护期内使用保守参数，避免首句被重度压制
+                if guard_active {
+                    target_atten = target_atten.min(40.0);
+                    target_min_thresh = target_min_thresh.max(-60.0);
+                    target_max_thresh = target_max_thresh.min(12.0);
+                    target_hp = target_hp.min(100.0);
+                    target_exciter_mix = target_exciter_mix.max(0.08);
+                } else {
+                    // 语音段放松：降低额外抑制，减小高通，保护起音
+                    if is_voice && impact_hold == 0 {
+                        target_atten = target_atten.min(48.0);
+                        target_min_thresh = target_min_thresh.max(-58.0);
+                        target_max_thresh = target_max_thresh.min(10.0);
+                        target_hp = target_hp.min(110.0);
+                        target_exciter_mix = target_exciter_mix.max(0.05);
+                        soft_mode = false;
+                        soft_mode_hold = 0;
+                    } else if !is_voice {
+                        // 非语音段：重度抑制，快速压制键盘/底噪
+                        target_atten = (target_atten + 22.0).min(100.0);
+                        target_hp = target_hp.max(220.0);
+                        target_min_thresh = target_min_thresh.max(-54.0);
+                        target_max_thresh = target_max_thresh.min(6.0);
+                        target_exciter_mix = 0.0;
+                        soft_mode = false;
+                        soft_mode_hold = 0;
+                    }
                 }
 
                 if impact_hold > 0 {
@@ -1310,21 +1373,36 @@ fn get_worker_fn(
                     target_atten = (target_atten + 12.0).min(75.0);
                     target_hp = target_hp.max(180.0);
                     target_exciter_mix = 0.0;
+                    // 冲击时瞬态压制，避免突出
+                    transient_shaper.set_attack_gain(-6.0);
+                } else if breath_hold > 0 {
+                    // 急促呼吸/摩擦：提高抑制和高通，去除高频激励
+                    target_atten = (target_atten + 18.0).min(95.0);
+                    target_hp = target_hp.max(200.0);
+                    target_min_thresh = target_min_thresh.max(-52.0);
+                    target_max_thresh = target_max_thresh.min(6.0);
+                    target_exciter_mix = 0.0;
+                    transient_shaper.set_attack_gain(-4.0);
+                    target_transient_sustain = target_transient_sustain.min(-4.0);
+                } else {
+                    // 恢复用户设定的瞬态增益
+                    transient_shaper.set_attack_gain(transient_attack_db);
                 }
 
                 // 噪声门控交由 DF/AGC 处理，保持全通
-                gate_gain = 1.0;
+                _gate_gain = 1.0;
 
                 // 全湿，避免干湿并行导致相位/冲击泄露
                 _df_mix = 1.0;
                 let current_atten = df.atten_lim.unwrap_or(target_atten);
                 let alpha_fast = 0.35;
+                let alpha_hp = 0.15; // 高通调节更平滑，避免可闻跳变
                 let new_atten = smooth_value(current_atten, target_atten, alpha_fast);
                 df.set_atten_lim(new_atten);
                 df.min_db_thresh = smooth_value(df.min_db_thresh, target_min_thresh, alpha_fast);
                 df.max_db_df_thresh = smooth_value(df.max_db_df_thresh, target_max_thresh, alpha_fast);
                 df.max_db_erb_thresh = smooth_value(df.max_db_erb_thresh, target_max_thresh, alpha_fast);
-                highpass_cutoff = smooth_value(highpass_cutoff, target_hp, alpha_fast);
+                highpass_cutoff = smooth_value(highpass_cutoff, target_hp, alpha_hp);
                 highpass.set_cutoff(highpass_cutoff);
                 // 动态 EQ 全湿，避免干/湿并行带来的相位梳状
                 dynamic_eq.set_dry_wet(1.0);
@@ -1338,6 +1416,8 @@ fn get_worker_fn(
                     rec.append_denoised(buffer);
                 }
             }
+
+            // 音色修复改为离线执行（保存时处理），实时链路不做音色修复以避免卡顿。
 
             // STFT 静态 EQ 已移除，不再处理
             let bypass_post = bypass_enabled
@@ -1447,14 +1527,16 @@ fn get_worker_fn(
                     }
                 }
             }
-            // 启动淡入，避免播放砰声
+            // 启动淡入，避免播放砰声；20ms 指数淡入，保护首音
             if fade_progress < fade_total {
                 if let Some(buffer) = outframe.as_slice_mut() {
                     for v in buffer.iter_mut() {
                         if fade_progress >= fade_total {
                             break;
                         }
-                        let g = (fade_progress as f32 / fade_total as f32).min(1.0);
+                        // 指数淡入，前几帧仍保留可听能量
+                        let fp = fade_progress as f32;
+                        let g = 1.0 - (-(fp) / (fade_total as f32 / 3.0)).exp().min(1.0);
                         *v *= g;
                         fade_progress += 1;
                     }
@@ -1645,6 +1727,7 @@ fn get_worker_fn(
                             log::warn!("WebRTC VAD: {}", if enabled { "开启" } else { "关闭" });
                         }
                         ControlMessage::TransientGain(db) => {
+                            transient_attack_db = db;
                             transient_shaper.set_attack_gain(db);
                         }
                         ControlMessage::TransientSustain(db) => {
@@ -1702,6 +1785,10 @@ fn get_worker_fn(
                         ControlMessage::ExciterMix(value) => {
                             exciter.set_mix(value.clamp(0.0, 0.5));
                             log::info!("谐波激励混合: {:.0}%", value * 100.0);
+                        }
+                        ControlMessage::TimbreEnabled(enabled) => {
+                            _timbre_enabled = enabled;
+                            log::info!("音色修复: {}", if enabled { "开启" } else { "关闭" });
                         }
                     }
                 }
@@ -1895,6 +1982,10 @@ fn get_worker_fn(
                             bypass_enabled = enabled;
                             log::info!("全链路旁路: {}", if enabled { "开启" } else { "关闭" });
                         }
+                        ControlMessage::TimbreEnabled(enabled) => {
+                            _timbre_enabled = enabled;
+                            log::info!("音色修复: {}", if enabled { "开启" } else { "关闭" });
+                        }
                     }
                 }
             }
@@ -2034,6 +2125,20 @@ fn apply_final_limiter(data: &mut [f32]) {
         let scale = CEILING / peak;
         for sample in data.iter_mut() {
             *sample *= scale;
+        }
+    }
+}
+
+/// 简单峰值防护，避免链路后级触顶。
+fn apply_peak_guard(data: &mut [f32], ceiling: f32) {
+    let mut peak = 0.0f32;
+    for &v in data.iter() {
+        peak = peak.max(v.abs());
+    }
+    if peak > ceiling && peak.is_finite() {
+        let scale = ceiling / peak;
+        for v in data.iter_mut() {
+            *v *= scale;
         }
     }
 }
