@@ -1,7 +1,9 @@
 pub mod agc;
+pub mod aec;
 pub mod eq;
 pub mod exciter;
 pub mod highpass;
 pub mod saturation;
+pub mod silero;
 pub mod transient_shaper;
 pub mod timbre_restore;

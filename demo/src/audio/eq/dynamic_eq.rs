@@ -1,10 +1,7 @@
 use super::dynamic_band::{BandMode, DynamicBand, FilterKind};
 use super::presets::{EqPresetKind, MAX_EQ_BANDS};
 
-// Soft limiter is kept only as a last resort inside EQ; set higher to avoid unnecessary compression
-const SOFT_LIMIT_THRESHOLD: f32 = 0.97;
-const SOFT_LIMIT_CEILING: f32 = 0.995;
-
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum EqControl {
     SetEnabled(bool),
@@ -66,6 +63,7 @@ impl DynamicEq {
         eq
     }
 
+    #[allow(dead_code)]
     pub fn enabled(&self) -> bool {
         self.enabled
     }
@@ -78,6 +76,7 @@ impl DynamicEq {
         self.dry_wet
     }
 
+    #[allow(dead_code)]
     pub fn preset(&self) -> EqPresetKind {
         self.preset
     }
@@ -197,9 +196,6 @@ impl DynamicEq {
         for band in self.bands.iter_mut() {
             band.apply(samples);
         }
-        if should_soft_limit(samples) {
-            apply_soft_limiter(samples);
-        }
         // 全湿处理：避免干/湿相位错位带来的梳状
         self.dry_wet = 1.0;
         metrics
@@ -226,28 +222,5 @@ impl DynamicEq {
                 self.user_band_gains[idx] = band.static_gain_db;
             }
         }
-    }
-}
-
-fn apply_soft_limiter(samples: &mut [f32]) {
-    for sample in samples.iter_mut() {
-        *sample = soft_clip(*sample, SOFT_LIMIT_THRESHOLD, SOFT_LIMIT_CEILING);
-    }
-}
-
-fn should_soft_limit(samples: &[f32]) -> bool {
-    samples.iter().any(|s| s.abs() > SOFT_LIMIT_THRESHOLD)
-}
-
-fn soft_clip(x: f32, threshold: f32, ceiling: f32) -> f32 {
-    let abs_x = x.abs();
-    if abs_x <= threshold {
-        x
-    } else if abs_x < ceiling {
-        let t = (abs_x - threshold) / (ceiling - threshold);
-        let soft = threshold + (ceiling - threshold) * (3.0 * t.powi(2) - 2.0 * t.powi(3));
-        x.signum() * soft
-    } else {
-        x.signum() * ceiling
     }
 }

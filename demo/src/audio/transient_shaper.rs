@@ -114,6 +114,7 @@ impl TransientShaper {
         self.hold_samples = ((self.hold_ms * self.sample_rate) / 1000.0).round() as usize;
     }
 
+    #[allow(dead_code)]
     pub fn set_detection(
         &mut self,
         threshold_db: f32,

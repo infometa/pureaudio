@@ -36,8 +36,8 @@ impl TimbreRestore {
     /// * `model_path` - ONNX 模型路径
     /// * `frame_size` - 处理帧大小 (建议与 DF 一致，如 480)
     /// * `sample_rate` - 采样率 (48000)
-    /// * `hidden_size` - GRU 隐状态维度（需与训练配置一致，默认 512）
-    /// * `num_layers` - GRU 层数（需与训练配置一致，默认 2）
+    /// * `hidden_size` - GRU 隐状态维度（需与训练配置一致，Balanced: 384）
+    /// * `num_layers` - GRU 层数（需与训练配置一致，Balanced: 2）
     /// * `context_size` - 卷积因果上下文长度（采样点，默认 256）
     pub fn new(
         model_path: impl AsRef<Path>,
@@ -83,6 +83,13 @@ impl TimbreRestore {
         input_full.extend_from_slice(frame);
 
         // ONNX 输入: audio [1, 1, T_full], h_in [num_layers, 1, hidden]
+        // 保存输入尾部作为下一帧的卷积上下文（使用模型输入而非模型输出）
+        let tail_start = input_full.len().saturating_sub(self.context_size);
+        let context_tail = if self.context_size > 0 {
+            input_full[tail_start..].to_vec()
+        } else {
+            Vec::new()
+        };
         let input_array = Array2::from_shape_vec((1, input_full.len()), input_full)?;
         let h_shape = (self.num_layers, 1, self.hidden_size);
         let h_in = ndarray::Array::from_shape_vec(h_shape, self.hidden.clone())?;
@@ -106,11 +113,9 @@ impl TimbreRestore {
             frame[i] = v;
         }
 
-        // 更新上下文缓冲（使用输入端上下文，以保证卷积因果性）
-        if self.context_size > 0 {
-            let keep_start = input_full.len().saturating_sub(self.context_size);
-            self.context_buffer
-                .copy_from_slice(&input_full[keep_start..]);
+        // 更新上下文缓冲（使用模型输入尾部，保证因果性）
+        if self.context_size > 0 && context_tail.len() == self.context_size {
+            self.context_buffer.copy_from_slice(&context_tail);
         }
         
         Ok(())
@@ -154,8 +159,8 @@ impl TimbreRestore {
        "timbre_restore.onnx",
        frame_size,
        sr,
-       512,      // hidden_size (与训练配置保持一致)
-       2,        // num_layers
+       384,      // hidden_size (Balanced 模型)
+       2,        // num_layers (Balanced 模型)
        256,      // context_size (卷积感受野余量)
    ).ok();
    ```
@@ -192,7 +197,7 @@ mod tests {
             return;
         }
         
-        let mut tr = TimbreRestore::new("timbre_restore.onnx", 480, 48000, 512, 2, 256).unwrap();
+        let mut tr = TimbreRestore::new("timbre_restore.onnx", 480, 48000, 384, 2, 256).unwrap();
         
         // 测试帧处理
         let mut frame = vec![0.0f32; 480];

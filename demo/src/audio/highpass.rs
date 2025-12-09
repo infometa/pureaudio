@@ -3,6 +3,7 @@ use log::warn;
 pub struct HighpassFilter {
     cutoff_hz: f32,
     sample_rate: f32,
+    q: f32,
     b0: f32,
     b1: f32,
     b2: f32,
@@ -21,8 +22,9 @@ impl HighpassFilter {
             "HighpassFilter requires sample_rate >= 1 kHz"
         );
         let mut filter = Self {
-            cutoff_hz: 60.0,
+            cutoff_hz: 50.0,
             sample_rate,
+            q: 1.0,
             b0: 0.0,
             b1: 0.0,
             b2: 0.0,
@@ -50,6 +52,12 @@ impl HighpassFilter {
             );
         }
         self.cutoff_hz = clamped;
+        self.update_coefficients();
+    }
+
+    #[allow(dead_code)]
+    pub fn set_q(&mut self, q: f32) {
+        self.q = q.clamp(0.5, 2.5);
         self.update_coefficients();
     }
 
@@ -95,7 +103,7 @@ impl HighpassFilter {
         let omega = 2.0 * std::f32::consts::PI * self.cutoff_hz / self.sample_rate.max(1.0);
         let cos_omega = omega.cos();
         let sin_omega = omega.sin();
-        let alpha = sin_omega / (2.0 * 0.707); // Q = 0.707 (Butterworth)
+        let alpha = sin_omega / (2.0 * self.q.max(1e-6)); // 可调 Q，默认 1.0
 
         let b0 = (1.0 + cos_omega) / 2.0;
         let b1 = -(1.0 + cos_omega);

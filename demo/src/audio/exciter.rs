@@ -43,8 +43,8 @@ impl HarmonicExciter {
         let alpha = self.alpha;
         for sample in samples.iter_mut() {
             // Highpass to focus excitation on upper band
-            // 标准一阶 IIR 高通: y[n] = α*y[n-1] + α*(x[n]-x[n-1])
-            let hp = alpha * self.prev_hp + alpha * (*sample - self.prev_in);
+            // 标准一阶 IIR 高通: y[n] = α*(y[n-1] + x[n] - x[n-1])
+            let hp = alpha * (self.prev_hp + *sample - self.prev_in);
             self.prev_in = *sample;
             self.prev_hp = hp;
             // Gentle saturation on high band only

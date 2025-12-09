@@ -28,6 +28,7 @@ impl EnvelopeDetector {
         }
     }
 
+    #[allow(dead_code)]
     pub fn reset(&mut self, value_db: f32) {
         self.value_db = value_db;
         self.initialized = true;
@@ -48,6 +49,7 @@ impl EnvelopeDetector {
         self.value_db
     }
 
+    #[allow(dead_code)]
     pub fn value_db(&self) -> f32 {
         self.value_db
     }

@@ -230,6 +230,8 @@ struct SpecView {
     agc_attack_ms: f32,
     agc_release_ms: f32,
     show_agc_advanced: bool,
+    aec_enabled: bool,
+    aec_delay_ms: f32,
     sys_auto_volume: bool,
     env_auto_enabled: bool,
     sysvol_monitor: Option<capture::SysVolMonitorHandle>,
@@ -275,6 +277,7 @@ pub enum SliderTarget {
     TransientGain,
     TransientSustain,
     TransientMix,
+    AecDelay,
     AgcTarget,
     AgcMaxGain,
     AgcMaxAtten,
@@ -362,6 +365,8 @@ pub enum Message {
     EnvAutoToggled(bool),
     ExciterToggled(bool),
     ExciterMixChanged(f32),
+    AecToggled(bool),
+    AecDelayChanged(f32),
     TimbreToggled(bool),
     EnvStatusUpdated(EnvStatus),
     StartProcessing,
@@ -433,10 +438,14 @@ pub struct UserConfig {
     agc_release_ms: f32,
     show_agc_advanced: bool,
     #[serde(default)]
+    aec_enabled: bool,
+    #[serde(default)]
+    aec_delay_ms: f32,
+    #[serde(default)]
     sys_auto_volume: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     env_auto_enabled: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     vad_enabled: bool,
 }
 
@@ -711,15 +720,17 @@ impl Application for SpecView {
                 agc_attack_ms: 500.0,
                 agc_release_ms: 2000.0,
                 show_agc_advanced: false,
+                aec_enabled: false,
+                aec_delay_ms: 60.0,
                 sys_auto_volume: false,
-                env_auto_enabled: true,
-                vad_enabled: true,
+                env_auto_enabled: false,
+                vad_enabled: false,
                 exciter_enabled: false,
                 exciter_mix: 0.0,
                 bypass_enabled: false,
                 user_selected_input: false,
                 user_selected_output: false,
-                env_status_label: "自适应降噪: 开启".to_string(),
+                env_status_label: "自适应降噪: 关闭".to_string(),
                 sysvol_monitor: None,
                 scene_preset: ScenePreset::OpenOfficeMeeting,
                 model_path,
@@ -1080,6 +1091,14 @@ impl Application for SpecView {
             Message::ExciterMixChanged(value) => {
                 self.exciter_mix = value.clamp(0.0, 0.5);
                 self.send_control_message(ControlMessage::ExciterMix(self.exciter_mix));
+            }
+            Message::AecToggled(enabled) => {
+                self.aec_enabled = enabled;
+                self.send_control_message(ControlMessage::AecEnabled(enabled));
+            }
+            Message::AecDelayChanged(v) => {
+                self.aec_delay_ms = v;
+                self.send_control_message(ControlMessage::AecDelayMs(v as i32));
             }
             Message::TimbreToggled(enabled) => {
                 self.timbre_enabled = enabled;
@@ -1465,6 +1484,8 @@ impl SpecView {
             self.agc_release_ms,
         ));
         self.send_control_message(ControlMessage::AgcEnabled(self.agc_enabled));
+        self.send_control_message(ControlMessage::AecEnabled(self.aec_enabled));
+        self.send_control_message(ControlMessage::AecDelayMs(self.aec_delay_ms as i32));
         self.send_control_message(ControlMessage::MutePlayback(self.mute_playback));
         self.send_control_message(ControlMessage::SysAutoVolumeEnabled(self.sys_auto_volume));
         self.send_control_message(ControlMessage::EnvAutoEnabled(self.env_auto_enabled));
@@ -1530,14 +1551,14 @@ impl SpecView {
         self.r_env_status = None;
         self.eq_status = EqStatus::default();
         let sample_rate = recording.sample_rate() as u32;
-        let (noisy, denoised, _timbre, processed) = recording.take_samples();
+        let (noisy, denoised, timbre, processed) = recording.take_samples();
         self.status_text = "正在保存音频...".to_string();
         self.last_saved = None;
         self.is_saving = true;
         let timbre_enabled = self.timbre_enabled;
         Command::perform(
             async move {
-                save_recordings(noisy, denoised, processed, sample_rate, timbre_enabled)
+                save_recordings(noisy, denoised, timbre, processed, sample_rate, timbre_enabled)
             },
             Message::SaveFinished,
         )
@@ -1829,6 +1850,8 @@ impl SpecView {
         self.send_df_control(DfControl::MinThreshDb, self.min_threshdb);
         self.send_df_control(DfControl::MaxErbThreshDb, self.max_erbthreshdb);
         self.send_df_control(DfControl::MaxDfThreshDb, self.max_dfthreshdb);
+        self.send_control_message(ControlMessage::AecEnabled(self.aec_enabled));
+        self.send_control_message(ControlMessage::AecDelayMs(self.aec_delay_ms as i32));
         self.send_eq_control(EqControl::SetEnabled(self.eq_enabled));
         self.send_eq_control(EqControl::SetPreset(self.eq_preset));
         self.send_eq_control(EqControl::SetDryWet(self.eq_dry_wet));
@@ -1960,6 +1983,8 @@ impl SpecView {
             agc_attack_ms: self.agc_attack_ms,
             agc_release_ms: self.agc_release_ms,
             show_agc_advanced: self.show_agc_advanced,
+            aec_enabled: self.aec_enabled,
+            aec_delay_ms: self.aec_delay_ms,
             sys_auto_volume: self.sys_auto_volume,
             env_auto_enabled: self.env_auto_enabled,
             vad_enabled: self.vad_enabled,
@@ -2024,6 +2049,8 @@ impl SpecView {
         self.agc_attack_ms = cfg.agc_attack_ms;
         self.agc_release_ms = cfg.agc_release_ms;
         self.show_agc_advanced = cfg.show_agc_advanced;
+        self.aec_enabled = cfg.aec_enabled;
+        self.aec_delay_ms = cfg.aec_delay_ms;
         self.sys_auto_volume = cfg.sys_auto_volume;
         self.env_auto_enabled = cfg.env_auto_enabled;
         self.vad_enabled = cfg.vad_enabled;
@@ -2275,6 +2302,29 @@ impl SpecView {
             .align_items(Alignment::Center),
             tooltips::HIGHPASS_FILTER,
         );
+        let aec_row = row![
+            toggler(String::new(), self.aec_enabled, Message::AecToggled),
+            text("AEC3 回声消除").size(14),
+        ]
+        .spacing(10)
+        .align_items(Alignment::Center);
+        let aec_delay_slider = if self.aec_enabled {
+            self.slider_view(
+                "aec_delay",
+                "回声延迟补偿 [ms]",
+                self.aec_delay_ms,
+                0.0,
+                200.0,
+                SliderTarget::AecDelay,
+                Message::AecDelayChanged,
+                380,
+                0,
+                5.0,
+                Some("播放链路延迟补偿，外放时可尝试 50~120 ms"),
+            )
+        } else {
+            widget::Column::new().into()
+        };
         let highpass_controls: Element<'_, Message> = if self.highpass_enabled {
             self.slider_view(
                 "highpass_cutoff",
@@ -2560,11 +2610,11 @@ impl SpecView {
                     self.vad_enabled,
                     Message::VadToggled
                 ),
-                text("VAD 语音检测（仅非语音段更新噪声/RT60）").size(14),
+                text("VAD 语音检测（Silero，仅非语音段更新噪声/RT60）").size(14),
             ]
             .spacing(10)
             .align_items(Alignment::Center),
-            "关闭可对比效果；关闭后噪声地板与 RT60 更新不再用 WebRTC VAD 门控",
+            "关闭可对比效果；关闭后噪声地板与 RT60 更新不再用 VAD 门控（当前使用 Silero VAD）",
         );
 
         container(
@@ -2572,6 +2622,7 @@ impl SpecView {
                 text("音频增强").size(16),
                 highpass_row,
                 highpass_controls,
+                aec_row,
                 saturation_toggle,
                 saturation_controls,
                 exciter_toggle,
@@ -2927,6 +2978,10 @@ impl SpecView {
                 self.transient_mix = value;
                 self.send_control_message(ControlMessage::TransientMix(value));
             }
+            SliderTarget::AecDelay => {
+                self.aec_delay_ms = value;
+                self.send_control_message(ControlMessage::AecDelayMs(value as i32));
+            }
             SliderTarget::AgcTarget => {
                 self.agc_target_db = value;
                 self.send_control_message(ControlMessage::AgcTargetLevel(value));
@@ -3100,6 +3155,7 @@ fn current_model_path() -> Option<PathBuf> {
 fn save_recordings(
     noisy: Vec<f32>,
     denoised: Vec<f32>,
+    timbre: Vec<f32>,
     processed: Vec<f32>,
     sample_rate: u32,
     timbre_enabled: bool,
@@ -3133,27 +3189,25 @@ fn save_recordings(
         cleanup(&created, &folder);
         return Err(err);
     }
-    // 离线音色修复：对降噪后音频进行一次性处理，避免实时卡顿
-    let timbre = if timbre_enabled {
-        let mut out = denoised.clone();
-        if let Some(mut tr) = crate::audio::timbre_restore::load_default_timbre(TIMBRE_MODEL, 256)
-        {
-            let frame = 480.min(out.len().max(1)); // 约 20ms 帧长
-            for chunk in out.chunks_mut(frame) {
+    // 优先使用实时链路记录的音色修复数据；若未记录则回退到离线处理降噪后的音频
+    let mut timbre_out = if timbre_enabled { timbre } else { Vec::new() };
+    if timbre_enabled && timbre_out.is_empty() {
+        timbre_out = denoised.clone();
+        if let Some(mut tr) = crate::audio::timbre_restore::load_default_timbre(TIMBRE_MODEL) {
+            let frame = 480.min(timbre_out.len().max(1)); // 约 20ms 帧长
+            for chunk in timbre_out.chunks_mut(frame) {
                 if let Err(e) = tr.process_frame(chunk) {
                     log::warn!("离线音色修复失败: {e}");
                     break;
                 }
             }
         } else {
-            log::warn!("离线音色修复加载模型失败，跳过");
+            log::warn!("音色修复加载模型失败，跳过离线处理");
+            timbre_out.clear();
         }
-        out
-    } else {
-        Vec::new()
-    };
+    }
     created.push(timbre_path.clone());
-    if let Err(err) = write_wav(&timbre_path, &timbre, sample_rate) {
+    if let Err(err) = write_wav(&timbre_path, &timbre_out, sample_rate) {
         cleanup(&created, &folder);
         return Err(err);
     }

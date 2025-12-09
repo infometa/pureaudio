@@ -29,6 +29,7 @@ impl Saturation {
         self.mix = mix.clamp(0.0, 1.0);
     }
 
+    #[allow(dead_code)]
     pub fn set_compensate(&mut self, enable: bool) {
         self.compensate = enable;
     }

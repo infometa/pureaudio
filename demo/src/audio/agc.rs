@@ -17,9 +17,9 @@ impl AutoGainControl {
         let init = InitializationConfig { num_capture_channels: 1, num_render_channels: 0, ..Default::default() };
         let cfg = GainControl {
             mode: GainControlMode::AdaptiveDigital,
-            target_level_dbfs: 3,      // -3 dBFS 目标
-            compression_gain_db: 15,   // 适中压缩
-            enable_limiter: true,
+            target_level_dbfs: 6,      // -6 dBFS 目标，更响亮
+            compression_gain_db: 20,   // 更强补偿低音量
+            enable_limiter: false,     // 内限幅关闭，交给最终限幅器
         };
         let frame_ok = frame_size > 0 && hop_size % frame_size == 0;
         let processor = if frame_ok {

@@ -3,12 +3,14 @@ use super::envelope::{smoothing_coeff, EnvelopeDetector};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BandMode {
     Downward,
     Upward,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterKind {
     Peak,
@@ -17,6 +19,7 @@ pub enum FilterKind {
 }
 
 impl BandMode {
+    #[allow(dead_code)]
     pub const fn all() -> [Self; 2] {
         [BandMode::Downward, BandMode::Upward]
     }
@@ -32,6 +35,7 @@ impl fmt::Display for BandMode {
 }
 
 impl FilterKind {
+    #[allow(dead_code)]
     pub const fn all() -> [Self; 3] {
         [
             FilterKind::Peak,
@@ -112,10 +116,12 @@ impl DynamicBand {
         }
     }
 
+    #[allow(dead_code)]
     pub fn configure(&mut self, settings: BandSettings) {
         *self = Self::new(self.sample_rate, settings);
     }
 
+    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         self.settings.label
     }

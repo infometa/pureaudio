@@ -1,5 +1,6 @@
 use std::f32::consts::PI;
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BiquadType {
     Peaking,
@@ -57,6 +58,7 @@ impl Biquad {
         self.update_coeffs();
     }
 
+    #[allow(dead_code)]
     pub fn reset_state(&mut self) {
         self.z1 = 0.0;
         self.z2 = 0.0;

@@ -11,12 +11,17 @@ pub struct TimbreRestore {
     session: Session,
     context_size: usize,
     context_buffer: Vec<f32>,
+    hidden: Vec<f32>,
+    hidden_size: usize,
+    num_layers: usize,
 }
 
 impl TimbreRestore {
     pub fn new(
         model_path: impl AsRef<Path>,
         context_size: usize,
+        hidden_size: usize,
+        num_layers: usize,
     ) -> Result<Self> {
         let session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
@@ -27,6 +32,9 @@ impl TimbreRestore {
             session,
             context_size,
             context_buffer: vec![0.0f32; context_size],
+            hidden: vec![0.0f32; hidden_size * num_layers],
+            hidden_size,
+            num_layers,
         })
     }
 
@@ -40,10 +48,14 @@ impl TimbreRestore {
         // 模型只有 1 个输入：[1, 1, T]
         let input_value =
             Tensor::from_array((vec![1usize, 1, input_full.len()], input_full.clone()))?;
+        let h_shape = vec![self.num_layers, 1usize, self.hidden_size];
+        let h_in = Tensor::from_array((h_shape, self.hidden.clone()))?;
 
-        let outputs = self.session.run(ort::inputs![input_value])?;
+        let outputs = self.session.run(ort::inputs![input_value, h_in])?;
 
         let (_, output) = outputs[0].try_extract_tensor::<f32>()?;
+        let (_, h_out) = outputs[1].try_extract_tensor::<f32>()?;
+        self.hidden = h_out.to_vec();
 
         // 仅取最后 frame_len 部分作为当前帧输出
         let total_len = output.len();
@@ -65,13 +77,14 @@ impl TimbreRestore {
 
     pub fn reset(&mut self) {
         self.context_buffer.fill(0.0);
+        self.hidden.fill(0.0);
     }
 }
 
 /// 简易工厂：失败返回 None 并打日志
-pub fn load_default_timbre(model_path: impl AsRef<Path>, frame_size: usize) -> Option<TimbreRestore> {
-    let _ = frame_size;
-    match TimbreRestore::new(model_path, 256) {
+#[allow(dead_code)]
+pub fn load_default_timbre(model_path: impl AsRef<Path>) -> Option<TimbreRestore> {
+    match TimbreRestore::new(model_path, 256, 384, 2) {
         Ok(p) => Some(p),
         Err(e) => {
             error!("加载音色修复模型失败: {e}");

@@ -18,6 +18,7 @@ pub enum EqPresetKind {
 }
 
 impl EqPresetKind {
+    #[allow(dead_code)]
     pub const fn all() -> [Self; 3] {
         [Self::OpenOffice, Self::ConferenceHall, Self::OpenOfficeHeadset]
     }
@@ -30,14 +31,17 @@ impl EqPresetKind {
         }
     }
 
+    #[allow(dead_code)]
     pub fn default_mix(self) -> f32 {
         self.preset().default_mix
     }
 
+    #[allow(dead_code)]
     pub fn display_name(self) -> &'static str {
         self.preset().name
     }
 
+    #[allow(dead_code)]
     pub fn description(self) -> &'static str {
         match self {
             EqPresetKind::OpenOffice => "开放办公区：抑制浑浊/穿透性人声，聚焦近讲清晰度。",
@@ -46,6 +50,7 @@ impl EqPresetKind {
         }
     }
 
+    #[allow(dead_code)]
     pub fn tooltip_text(self) -> &'static str {
         match self {
             EqPresetKind::OpenOffice => {

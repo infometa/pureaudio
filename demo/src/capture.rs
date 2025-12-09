@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::env;
 use std::fmt::Display;
@@ -10,13 +11,15 @@ use std::sync::{
     Arc, Mutex, Once,
 };
 use std::thread::{self, sleep, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::audio::agc::AutoGainControl;
+use crate::audio::aec::EchoCanceller;
 use crate::audio::eq::{DynamicEq, EqControl, EqPresetKind, EqProcessMetrics, MAX_EQ_BANDS};
 use crate::audio::exciter::HarmonicExciter;
 use crate::audio::highpass::HighpassFilter;
 use crate::audio::saturation::Saturation;
+use crate::audio::timbre_restore::TimbreRestore;
 use crate::audio::transient_shaper::TransientShaper;
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -27,10 +30,17 @@ use ndarray::prelude::*;
 use once_cell::sync::Lazy;
 use ringbuf::{producer::PostponedProducer, Consumer, HeapRb, SharedRb};
 use rubato::{FftFixedIn, FftFixedOut, Resampler};
-use webrtc_vad::{Vad, VadMode};
+use crate::audio::silero::{SileroVad, SileroVadConfig};
 
+#[allow(dead_code)]
 const OUTPUT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/output");
 // CARGO_MANIFEST_DIR 已在 demo/，无需重复 demo 前缀
+const TIMBRE_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/timbre_restore.onnx");
+const TIMBRE_CONTEXT: usize = 256;
+const TIMBRE_HIDDEN: usize = 384;
+const TIMBRE_LAYERS: usize = 2;
+const SILERO_VAD_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/silero_vad.onnx");
+const AEC_DEFAULT_DELAY_MS: i32 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnvClass {
@@ -49,17 +59,27 @@ struct NoiseFeatures {
 pub type RbProd = PostponedProducer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>;
 pub type RbCons = Consumer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>;
 pub type SendLsnr = Sender<f32>;
+#[allow(dead_code)]
 pub type RecvLsnr = Receiver<f32>;
+#[allow(dead_code)]
 pub type SendSpec = Sender<Box<[f32]>>;
+#[allow(dead_code)]
 pub type RecvSpec = Receiver<Box<[f32]>>;
+#[allow(dead_code)]
 pub type SendControl = Sender<ControlMessage>;
+#[allow(dead_code)]
 pub type RecvControl = Receiver<ControlMessage>;
+#[allow(dead_code)]
 pub type SendEqStatus = Sender<EqStatus>;
+#[allow(dead_code)]
 pub type RecvEqStatus = Receiver<EqStatus>;
+#[allow(dead_code)]
 pub type SendEnvStatus = Sender<EnvStatus>;
+#[allow(dead_code)]
 pub type RecvEnvStatus = Receiver<EnvStatus>;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct EqStatus {
     pub gain_reduction_db: [f32; MAX_EQ_BANDS],
     pub cpu_load: f32,
@@ -114,6 +134,7 @@ struct StreamSelection {
     format: cpal::SampleFormat,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct RecordingState {
     sr: usize,
@@ -138,6 +159,7 @@ impl RecordingState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn sample_rate(&self) -> usize {
         self.sr
     }
@@ -177,6 +199,7 @@ impl RecordingState {
         // 达到容量后继续静默丢弃，避免日志刷屏
     }
 
+    #[allow(dead_code)]
     pub fn take_samples(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
         let noisy = self.noisy.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default();
         let denoised =
@@ -255,6 +278,7 @@ pub struct AudioSource {
     sample_format: cpal::SampleFormat,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DfControl {
     AttenLim,
@@ -270,6 +294,7 @@ pub enum EnvStatus {
     Soft,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ControlMessage {
     DeepFilter(DfControl, f32),
@@ -301,8 +326,11 @@ pub enum ControlMessage {
     ExciterEnabled(bool),
     ExciterMix(f32),
     TimbreEnabled(bool),
+    AecEnabled(bool),
+    AecDelayMs(i32),
 }
 
+#[allow(dead_code)]
 pub fn model_dimensions(
     model_path: Option<PathBuf>,
     _channels: usize,
@@ -638,6 +666,7 @@ impl AudioSink {
     fn sr(&self) -> u32 {
         self.config.sample_rate.0
     }
+    #[allow(dead_code)]
     fn pause(&mut self) -> Result<()> {
         if let Some(s) = self.stream.as_mut() {
             s.pause()?;
@@ -737,6 +766,7 @@ impl AudioSource {
     fn sr(&self) -> u32 {
         self.config.sample_rate.0
     }
+    #[allow(dead_code)]
     fn pause(&mut self) -> Result<()> {
         if let Some(s) = self.stream.as_mut() {
             s.pause()?;
@@ -791,6 +821,7 @@ fn get_worker_fn(
     recorder: Option<RecordingHandle>,
     df_params: DfParams,
     channels: usize,
+    input_capacity_frames: usize,
 ) -> impl FnMut() {
     let (has_init, should_stop) = controls.into_inner();
     let (s_lsnr, mut s_spec, mut r_opt, s_eq_status, s_env_status) = if let Some(df_com) = df_com {
@@ -816,45 +847,52 @@ fn get_worker_fn(
         }
         let mut dynamic_eq = DynamicEq::new(df.sr as f32, EqPresetKind::default());
         let mut highpass = HighpassFilter::new(df.sr as f32);
-        let mut exciter = HarmonicExciter::new(df.sr as f32, 3800.0, 1.6, 0.25);
+        let mut exciter = HarmonicExciter::new(df.sr as f32, 5000.0, 2.0, 0.30);
         let mut transient_shaper = TransientShaper::new(df.sr as f32);
         // 记录用户配置的瞬态参数，便于在冲击抑制时暂时改写
-        let mut transient_attack_db = 2.0f32;
+        let mut transient_attack_db = 3.5f32;
         transient_shaper.set_attack_gain(transient_attack_db);
         let mut saturation = Saturation::new();
         let mut agc = AutoGainControl::new(df.sr as f32, df.hop_size);
-        let mut vad = Vad::new(df.sr as i32)
-            .ok()
-            .map(|mut v| {
-                // 默认使用模式 2（Aggressive），提高语音判定门限
-                let _ = v.fvad_set_mode(VadMode::Aggressive);
-                v
-            }); // VAD 可选，失败时禁用
-        let vad_frame_len = match df.sr {
-            8000 => 160,   // 20 ms
-            16000 => 320,  // 20 ms
-            32000 => 640,  // 20 ms
-            48000 => 960,  // 20 ms
-            _ => 0,
-        };
-        let mut vad_buf: VecDeque<f32> = VecDeque::with_capacity(vad_frame_len.max(1) * 2);
+        let mut aec = EchoCanceller::new(df.sr as f32, df.hop_size, AEC_DEFAULT_DELAY_MS);
+        let mut timbre_restore: Option<TimbreRestore> = None;
+        let mut timbre_load_failed = false;
+        // VAD 懒加载，避免未开启时的重采样开销
+        let mut vad: Option<SileroVad> = None;
+        let vad_target_sr = 16000usize;
+        let vad_frame_len = vad_target_sr / 1000 * 30; // 30ms @16k = 480
+        let vad_source_frame = vad_frame_len;
+        let mut vad_resampler: Option<(FftFixedIn<f32>, Vec<Vec<f32>>)> = None;
+        let mut vad_buf_raw: VecDeque<f32> = VecDeque::with_capacity(vad_source_frame.max(1) * 3);
+        let mut vad_frame_buf: Vec<f32> = vec![0.0f32; vad_source_frame.max(1)];
+        let mut vad_drop_count: usize = 0;
+        let mut vad_drop_last_log = Instant::now();
+        let mut vad_resample_error_count: usize = 0;
+        let mut vad_resample_error_last_log = Instant::now();
+        let mut vad_oversample_warn_last = Instant::now();
         // 短淡入，避免启动瞬间脉冲，缩短至 20ms 保护首音
         let fade_total = (df.sr as f32 * 0.02) as usize; // 20ms fade-in
         let mut fade_progress = 0usize;
+        let mut timbre_overload_frames = 0usize;
+        let mut timbre_stride = 1usize;
+        let mut timbre_skip_idx = 0usize;
+        let mut timbre_last_good = Instant::now();
         let mut highpass_enabled = true;
-        let mut highpass_cutoff = 60.0f32;
+        let mut highpass_cutoff = 50.0f32;
         let mut manual_highpass = highpass_cutoff;
         highpass.set_cutoff(highpass_cutoff);
         let mut transient_enabled = true;
         let mut saturation_enabled = true;
         let mut agc_enabled = true;
+        let mut aec_enabled = false;
+        let mut aec_delay_ms: i32;
         let mut exciter_enabled = true;
         let mut _timbre_enabled = false;
         let mut bypass_enabled = false;
         let mut mute_playback = false;
         let mut _df_mix = 1.0f32;
         // 耳机场景：预留更多头间距，减少 clipping
-        let mut headroom_gain = 0.85f32;
+        let mut headroom_gain = 0.92f32;
         let mut post_trim_gain = 1.0f32;
         // 自适应环境/设备状态（默认关闭，通过 UI 控制开启）
         let mut env_class = EnvClass::Noisy;
@@ -863,7 +901,10 @@ fn get_worker_fn(
         let mut smoothed_centroid = 0.0f32;
         let mut smoothed_rt60 = 0.35f32;
         let mut last_env_log = Instant::now();
-        let mut vad_enabled = true;
+        // 环境特征节流
+        let mut feature_counter = 0usize;
+        let mut cached_feats = NoiseFeatures::default();
+        let mut vad_enabled = false;
         let mut vad_state = false;
         let mut vad_voice_count = 0usize;
         let mut vad_noise_count = 0usize;
@@ -872,13 +913,12 @@ fn get_worker_fn(
         // 噪声地板 & SNR 跟踪
         let mut noise_floor_db = -60.0f32;
         let mut snr_db = 10.0f32;
-        let mut target_atten = 45.0f32;
-        let mut target_min_thresh = -60.0f32;
-        let mut target_max_thresh = 10.0f32;
-        let mut target_hp = 80.0f32;
-        let mut target_exciter_mix = 0.15f32;
-        let mut target_transient_sustain = 0.0f32;
-        let mut manual_atten = df.atten_lim.unwrap_or(target_atten);
+        let mut target_atten;
+        let mut target_min_thresh;
+        let mut target_max_thresh;
+        let mut target_hp;
+        let mut target_exciter_mix;
+        let mut target_transient_sustain;
         let mut manual_min_thresh = df.min_db_thresh;
         let mut manual_max_thresh = df.max_db_df_thresh;
         let mut office_factor = 0.5f32;
@@ -893,7 +933,6 @@ fn get_worker_fn(
         // 滞后计数，避免频繁切换
         let mut soft_mode_hold = 0usize;
         const SOFT_MODE_HOLD_FRAMES: usize = 160; // 约 2s（取决于 hop）
-        let mut last_impact_hold = 0usize;
         // 启动保护期，前 1s 禁止 gate/瞬态强抑制，避免开口被吞
         // 启动保护期：首 3s 保护起音，不做重度抑制
         let startup_guard_until = Instant::now() + Duration::from_millis(3000);
@@ -903,10 +942,11 @@ fn get_worker_fn(
         let block_duration = df.hop_size as f32 / df.sr as f32;
         let rt60_window_frames = ((0.7 / block_duration).ceil() as usize).max(14);
         let mut rt60_history: VecDeque<f32> = VecDeque::with_capacity(rt60_window_frames);
+        let mut proc_time_avg_ms = 0.0f32;
+        let mut proc_time_peak_ms = 0.0f32;
+        let mut perf_last_log = Instant::now();
         // 连续低峰值检测阈值（约 3 秒）
         let low_peak_required = ((3.0 / block_duration).ceil() as usize).max(30);
-        // 启动静音时长（避免“啪”），单位：Hop block 数；仅用于内部标记，不再丢弃输出
-        let mut warmup_blocks = 0usize;
         let (mut input_resampler, n_in) = if input_sr != df.sr {
             match FftFixedOut::<f32>::new(input_sr, df.sr, df.hop_size, 1, 1) {
                 Ok(r) => {
@@ -937,6 +977,29 @@ fn get_worker_fn(
         } else {
             (None, df.hop_size)
         };
+        let mut resample_latency_ms = 0.0f32;
+        if input_sr != df.sr {
+            resample_latency_ms += (n_in as f32 / input_sr as f32) * 1000.0;
+        }
+        if output_sr != df.sr {
+            resample_latency_ms += (n_out as f32 / output_sr as f32) * 1000.0;
+        }
+        // AEC 初始延迟根据设备/重采样自适应估算，而非写死
+        let auto_aec_delay =
+            ((block_duration * 1000.0) + resample_latency_ms + 5.0).round().clamp(0.0, 200.0);
+        aec_delay_ms = auto_aec_delay as i32;
+        aec.set_delay_ms(aec_delay_ms);
+        let mut pipeline_delay_ms =
+            block_duration * 1000.0 + aec_delay_ms as f32 + resample_latency_ms;
+        log::info!(
+            "估算链路延迟 {:.2} ms (DF hop {:.2} ms, AEC 延迟 {} ms, 重采样 {:.2} ms)",
+            pipeline_delay_ms,
+            block_duration * 1000.0,
+            aec_delay_ms,
+            resample_latency_ms
+        );
+        // 频谱推送节流计数
+        let mut spec_push_counter: usize = 0;
         let mut output_resampler_cleared = output_resampler.is_none();
         let input_retry_delay = Duration::from_micros(100);
         let input_timeout = Duration::from_millis(20);
@@ -946,8 +1009,8 @@ fn get_worker_fn(
         let mut last_sys_restore = last_sys_adjust;
         let mut clip_counter = 0usize;
         let mut low_peak_counter = 0usize;
-        // Align with UI default: 环境自适应默认开启，自动调整降噪
-        let mut env_auto_enabled = true;
+        // Align with UI默认：环境自适应默认关闭
+        let mut env_auto_enabled = false;
         'processing: while !should_stop.load(Ordering::Relaxed) {
             if rb_in.len() < n_in {
                 // Sleep for half a hop size
@@ -955,6 +1018,25 @@ fn get_worker_fn(
                     df.hop_size as f32 / df.sr as f32 / 2.,
                 ));
                 continue;
+            }
+            let backlog = rb_in.len();
+            if _timbre_enabled && backlog.saturating_mul(2) > input_capacity_frames {
+                // 输入积压过高时跳过音色修复，先确保音频不中断
+                if timbre_overload_frames == 0 {
+                    log::warn!(
+                        "输入缓冲积压 ({} / {} 帧)，暂时跳过音色修复以避免丢帧",
+                        backlog,
+                        input_capacity_frames
+                    );
+                }
+                timbre_overload_frames = timbre_overload_frames.max(32);
+                timbre_stride = (timbre_stride + 1).min(4);
+                timbre_skip_idx = 0;
+            } else if timbre_overload_frames > 0 {
+                // 在积压缓解后逐步恢复
+                if backlog * 4 <= input_capacity_frames {
+                    timbre_overload_frames = timbre_overload_frames.saturating_sub(1);
+                }
             }
             if let Some((ref mut r, ref mut buf)) = input_resampler.as_mut() {
                 let mut filled = 0usize;
@@ -1023,6 +1105,8 @@ fn get_worker_fn(
                     continue 'processing;
                 }
             };
+            // 包含输入填充在内的全链路计时
+            let frame_start = Instant::now();
             // 录音原始信号（设备采样率或重采样后），在任何处理前
             if let Some(ref rec) = recording {
                 if let Some(buffer) = inframe.as_slice() {
@@ -1039,6 +1123,13 @@ fn get_worker_fn(
                     }
                 }
                 sanitize_samples("输入信号", buffer);
+                if aec_enabled {
+                    aec.process_capture(buffer);
+                    if !aec.is_active() {
+                        log::warn!("AEC3 未激活（检查帧长/初始化），当前旁路");
+                        aec_enabled = false;
+                    }
+                }
             }
             if highpass_enabled {
                 if let Some(buffer) = inframe.as_slice_mut() {
@@ -1060,32 +1151,36 @@ fn get_worker_fn(
                 };
                 if let Some(buffer) = outframe.as_slice_mut() {
                     sanitize_samples("降噪输出", buffer);
-                    // 降噪后先做安全头间距，避免后级/重采样 clipping
-                    apply_peak_guard(buffer, 0.90);
-                    // 冲击/呼吸持有期间额外削峰，避免瞬态泄露
-                    if impact_hold > 0 || breath_hold > 0 {
-                        apply_peak_guard(buffer, 0.65);
-                    }
                 }
             }
             if env_auto_enabled && !bypass_enabled {
                 // 环境噪声特征估计与自适应参数：噪声地板 + SNR 连续映射
-                let feats = compute_noise_features(df.get_spec_noisy());
                 let (rms_db, update_alpha) = if let Some(buf) = inframe.as_slice() {
                     let rms = df::rms(buf.iter());
                     let db = 20.0 * rms.max(1e-9).log10();
+                    // 提高自适应平滑系数，缩短响应但避免突变
                     let alpha = if db < -50.0 {
-                        0.35
+                        0.55
                     } else if db < -30.0 {
-                        0.25
+                        0.45
                     } else if db < -20.0 {
-                        0.18
+                        0.35
                     } else {
-                        0.12
+                        0.25
                     };
                     (db, alpha)
                 } else {
-                    (-60.0, 0.2)
+                    (-60.0, 0.3)
+                };
+                // 环境特征节流：每 2 帧计算一次，其余使用缓存
+                feature_counter = feature_counter.wrapping_add(1);
+                const FEATURE_INTERVAL: usize = 2;
+                let feats = if feature_counter % FEATURE_INTERVAL == 0 {
+                    let new_feats = compute_noise_features(df.get_spec_noisy());
+                    cached_feats = new_feats;
+                    new_feats
+                } else {
+                    cached_feats
                 };
                 smoothed_energy = smooth_value(smoothed_energy, feats.energy_db, update_alpha);
                 smoothed_flatness =
@@ -1093,27 +1188,132 @@ fn get_worker_fn(
                 smoothed_centroid =
                     smooth_value(smoothed_centroid, feats.spectral_centroid, update_alpha);
 
-                // WebRTC VAD 判定（优先）+ 简易备份
-                if let Some(buf) = inframe.as_slice() {
-                    // 聚合到 20ms 窗口，使用 VecDeque 保持 O(1) 进出
-                    for &v in buf {
-                        vad_buf.push_back(v);
-                        if vad_buf.len() > vad_frame_len * 2 && vad_frame_len > 0 {
-                            vad_buf.pop_front();
+                // Silero VAD 判定（30ms @16k），仅在开启时运行，重采样懒加载
+                if vad_enabled {
+                    if let Some(buf) = inframe.as_slice() {
+                        let cap = vad_source_frame.saturating_mul(3).max(1);
+                        // 根据采样率决定是否重采样
+                        let mut push_sample = |v: f32| {
+                            if vad_buf_raw.len() >= cap {
+                                vad_buf_raw.pop_front();
+                                vad_drop_count = vad_drop_count.saturating_add(1);
+                            }
+                            vad_buf_raw.push_back(v);
+                        };
+                        if df.sr == vad_target_sr {
+                            for &v in buf {
+                                push_sample(v);
+                            }
+                        } else {
+                            if vad_resampler.is_none() {
+                                match FftFixedIn::<f32>::new(df.sr, vad_target_sr, df.hop_size, 1, 1) {
+                                    Ok(r) => {
+                                        let buf_rs = r.input_buffer_allocate(true);
+                                        vad_resampler = Some((r, buf_rs));
+                                    }
+                                    Err(err) => {
+                                        log::warn!("VAD 重采样初始化失败，VAD 将旁路: {}", err);
+                                        vad_enabled = false;
+                                    }
+                                }
+                            }
+                            if let Some((rs, rs_buf)) = vad_resampler.as_mut() {
+                                if rs_buf.len() >= 1 && rs_buf[0].len() >= buf.len() {
+                                    rs_buf[0][..buf.len()].copy_from_slice(buf);
+                                    match rs.process(rs_buf, None) {
+                                        Ok(out) => {
+                                            if let Some(out_ch) = out.get(0) {
+                                                let samples_to_process =
+                                                    out_ch.len().min(vad_source_frame);
+                                                for &v in out_ch.iter().take(samples_to_process) {
+                                                    push_sample(v);
+                                                }
+                                                if out_ch.len() > samples_to_process
+                                                    && vad_oversample_warn_last.elapsed()
+                                                        > Duration::from_secs(5)
+                                                {
+                                                    log::warn!(
+                                                        "VAD 重采样输出过多 ({} > {}), 已截断",
+                                                        out_ch.len(),
+                                                        samples_to_process
+                                                    );
+                                                    vad_oversample_warn_last = Instant::now();
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            vad_resample_error_count =
+                                                vad_resample_error_count.saturating_add(1);
+                                            if vad_resample_error_last_log.elapsed()
+                                                > Duration::from_secs(5)
+                                            {
+                                                log::warn!(
+                                                    "VAD 重采样失败: {:?}，该帧数据丢失 (累计 {})",
+                                                    err,
+                                                    vad_resample_error_count
+                                                );
+                                                vad_resample_error_last_log = Instant::now();
+                                            }
+                                            if vad_resample_error_count > 10 {
+                                                log::error!(
+                                                    "VAD 重采样连续失败 {} 次，禁用 VAD",
+                                                    vad_resample_error_count
+                                                );
+                                                vad_enabled = false;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if vad_drop_count > 0 && vad_drop_last_log.elapsed() > Duration::from_secs(5) {
+                            log::warn!(
+                                "VAD 缓冲溢出，已丢弃 {} 样本（cap={}）。请检查处理负载或提升缓冲。",
+                                vad_drop_count,
+                                cap
+                            );
+                            vad_drop_count = 0;
+                            vad_drop_last_log = Instant::now();
                         }
                     }
                 }
                 let guard_active = Instant::now() < startup_guard_until;
-                let vad_voice = if vad_enabled && vad_frame_len > 0 && vad_buf.len() >= vad_frame_len {
-                    if let Some(ref mut v) = vad {
-                        let buf = vad_buf.make_contiguous();
-                        run_webrtc_vad(v, &buf[buf.len() - vad_frame_len..], vad_frame_len).unwrap_or(false)
-                    } else {
-                        false
+                let mut vad_voice = false;
+                if vad_enabled && vad_source_frame > 0 && vad_buf_raw.len() >= vad_source_frame {
+                    if vad.is_none() {
+                        if PathBuf::from(SILERO_VAD_MODEL).exists() {
+                            vad = SileroVad::new(SILERO_VAD_MODEL, SileroVadConfig::default()).ok();
+                            if vad.is_none() {
+                                log::warn!("Silero VAD 初始化失败，VAD 旁路");
+                            }
+                        } else {
+                            log::warn!("Silero VAD 模型缺失: {}", SILERO_VAD_MODEL);
+                            vad_enabled = false;
+                        }
                     }
-                } else {
-                    false
-                };
+                    // 每帧最多处理一帧 VAD，只有填满完整帧才送入模型，复用缓冲避免分配
+                    if let Some(ref mut v) = vad {
+                        let mut filled = 0usize;
+                        for i in 0..vad_source_frame {
+                            if let Some(s) = vad_buf_raw.pop_front() {
+                                vad_frame_buf[i] = s;
+                                filled += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if filled == vad_source_frame {
+                            if let Ok(_) = v.process(&vad_frame_buf[..vad_source_frame]) {
+                                vad_voice = v.is_speaking();
+                            }
+                        } else {
+                            // 未填满，放回队列等待下一帧
+                            for j in (0..filled).rev() {
+                                vad_buf_raw.push_front(vad_frame_buf[j]);
+                            }
+                        }
+                    }
+                }
                 let heuristic_voice = rms_db > -55.0
                     && smoothed_flatness < 0.40
                     && smoothed_centroid < 0.65;
@@ -1247,7 +1447,6 @@ fn get_worker_fn(
                 } else if impact_hold > 0 {
                     impact_hold = impact_hold.saturating_sub(1);
                 }
-                last_impact_hold = impact_hold;
 
                 // 急促呼吸/衣物摩擦：低重心、低平坦度但能量突增
                 if !is_voice
@@ -1260,23 +1459,24 @@ fn get_worker_fn(
                     breath_hold = breath_hold.saturating_sub(1);
                 }
 
+                // 自适应目标初始化（允许保留当前 DF/HP 状态，避免跳变）
                 // “办公区(嘈杂) ↔ 会议室(高混响)” 双锚点线性插值
                 let office_anchor = SnrParams {
-                    atten: 100.0,
-                    min_thresh: -5.0,
-                    max_thresh: 8.0,
-                    hp_cut: 120.0,
-                    exciter_mix: 0.05,
+                    atten: 70.0,
+                    min_thresh: -8.0,
+                    max_thresh: 10.0,
+                    hp_cut: 80.0,
+                    exciter_mix: 0.08,
                 };
                 let conf_anchor = SnrParams {
-                    atten: 50.0,
-                    min_thresh: -15.0,
-                    max_thresh: 12.0,
-                    hp_cut: 60.0,
-                    exciter_mix: 0.12,
+                    atten: 40.0,
+                    min_thresh: -18.0,
+                    max_thresh: 14.0,
+                    hp_cut: 50.0,
+                    exciter_mix: 0.15,
                 };
                 // SNR 低则强行偏向办公区；否则根据 RT60 判断混响权重
-                let mut target_office = if snr_db < 10.0 {
+                let target_office = if snr_db < 10.0 {
                     1.0
                 } else {
                     1.0 - ((smoothed_rt60 - 0.2) / 0.3).clamp(0.0, 1.0)
@@ -1395,14 +1595,19 @@ fn get_worker_fn(
                 // 全湿，避免干湿并行导致相位/冲击泄露
                 _df_mix = 1.0;
                 let current_atten = df.atten_lim.unwrap_or(target_atten);
-                let alpha_fast = 0.35;
+                // 更快的参数平滑，兼顾响应与平顺
+                let alpha_fast = 0.5;
                 let alpha_hp = 0.15; // 高通调节更平滑，避免可闻跳变
                 let new_atten = smooth_value(current_atten, target_atten, alpha_fast);
                 df.set_atten_lim(new_atten);
                 df.min_db_thresh = smooth_value(df.min_db_thresh, target_min_thresh, alpha_fast);
                 df.max_db_df_thresh = smooth_value(df.max_db_df_thresh, target_max_thresh, alpha_fast);
                 df.max_db_erb_thresh = smooth_value(df.max_db_erb_thresh, target_max_thresh, alpha_fast);
-                highpass_cutoff = smooth_value(highpass_cutoff, target_hp, alpha_hp);
+                // 限制高通截止频率的单步变化，避免可闻跳变
+                let hp_target = smooth_value(highpass_cutoff, target_hp, alpha_hp);
+                let max_step = 15.0; // Hz per frame
+                let delta = (hp_target - highpass_cutoff).clamp(-max_step, max_step);
+                highpass_cutoff += delta;
                 highpass.set_cutoff(highpass_cutoff);
                 // 动态 EQ 全湿，避免干/湿并行带来的相位梳状
                 dynamic_eq.set_dry_wet(1.0);
@@ -1417,7 +1622,76 @@ fn get_worker_fn(
                 }
             }
 
-            // 音色修复改为离线执行（保存时处理），实时链路不做音色修复以避免卡顿。
+            let mut skip_timbre = false;
+            if _timbre_enabled && !bypass_enabled && timbre_overload_frames == 0 {
+                if timbre_stride > 1 {
+                    timbre_skip_idx = (timbre_skip_idx + 1) % timbre_stride;
+                    if timbre_skip_idx != 0 {
+                        skip_timbre = true;
+                    }
+                }
+                if timbre_restore.is_none() && !timbre_load_failed {
+                    if !PathBuf::from(TIMBRE_MODEL).exists() {
+                        timbre_load_failed = true;
+                        log::warn!("音色修复模型缺失: {}", TIMBRE_MODEL);
+                    } else {
+                    match TimbreRestore::new(
+                        TIMBRE_MODEL,
+                        TIMBRE_CONTEXT,
+                        TIMBRE_HIDDEN,
+                        TIMBRE_LAYERS,
+                    ) {
+                        Ok(p) => {
+                            log::info!("音色修复模型已加载用于实时处理");
+                            timbre_restore = Some(p);
+                        }
+                        Err(err) => {
+                            timbre_load_failed = true;
+                            log::warn!("音色修复模型加载失败: {}", err);
+                        }
+                    }
+                    }
+                }
+                if !skip_timbre {
+                    if let Some(ref mut tr) = timbre_restore {
+                        if let Some(buffer) = outframe.as_slice_mut() {
+                            let t0 = Instant::now();
+                            if let Err(err) = tr.process_frame(buffer) {
+                                log::warn!("音色修复处理失败，已重置状态: {}", err);
+                                tr.reset();
+                            } else if let Some(ref rec) = recording {
+                                rec.append_timbre(buffer);
+                            }
+                            let elapsed = t0.elapsed().as_secs_f32();
+                            if elapsed > block_duration * 0.8 {
+                                timbre_overload_frames = timbre_overload_frames.max(16);
+                                timbre_stride = (timbre_stride + 1).min(4);
+                                timbre_skip_idx = 0;
+                                log::warn!(
+                                    "音色修复耗时 {:.1} ms，提升节流至每 {} 帧处理一次",
+                                    elapsed * 1000.0,
+                                    timbre_stride
+                                );
+                            } else {
+                                timbre_last_good = Instant::now();
+                            }
+                        }
+                    }
+                }
+            } else if _timbre_enabled && timbre_overload_frames > 0 {
+                timbre_overload_frames = timbre_overload_frames.saturating_sub(1);
+                timbre_skip_idx = 0;
+            }
+            if _timbre_enabled
+                && timbre_stride > 1
+                && timbre_overload_frames == 0
+                && timbre_last_good.elapsed() > Duration::from_millis(400)
+            {
+                timbre_stride -= 1;
+                timbre_skip_idx = 0;
+                log::info!("音色修复恢复至每 {} 帧处理一次", timbre_stride);
+                timbre_last_good = Instant::now();
+            }
 
             // STFT 静态 EQ 已移除，不再处理
             let bypass_post = bypass_enabled
@@ -1429,40 +1703,48 @@ fn get_worker_fn(
             let (eq_gain_db, eq_enabled_flag) = if bypass_post {
                 ([0.0; MAX_EQ_BANDS], false)
             } else {
-                // 动态 EQ 优先，后接瞬态/色彩处理
-                let mut metrics = if let Some(buffer) = outframe.as_slice_mut() {
+                // 瞬态塑形放在动态 EQ 前，保护起音
+                if transient_enabled {
+                    if let Some(buffer) = outframe.as_slice_mut() {
+                        transient_shaper.process(buffer);
+                    }
+                }
+                // 动态 EQ
+                let metrics = if let Some(buffer) = outframe.as_slice_mut() {
                     dynamic_eq.set_dry_wet(1.0);
                     dynamic_eq.process_block(buffer)
                 } else {
                     log::error!("输出帧内存布局异常，跳过动态 EQ");
                     EqProcessMetrics::default()
                 };
-                // 饱和/谐波（可选，放在 AGC 前）
+                // 饱和/谐波（放在 AGC 前）
                 if saturation_enabled {
                     if let Some(buffer) = outframe.as_slice_mut() {
                         saturation.process(buffer);
                     }
                 }
-                // 高频激励（放在 AGC 前，轻混合）
                 if exciter_enabled {
                     if let Some(buffer) = outframe.as_slice_mut() {
                         exciter.process(buffer);
                     }
                 }
+                // 输出增益在 AGC 前统一设置，然后交给 AGC 控制最终电平
                 if let Some(buffer) = outframe.as_slice_mut() {
-                    if agc_enabled {
-                        agc.process(buffer);
+                    let mut out_gain = post_trim_gain * headroom_gain;
+                    if out_gain > 1.0 {
+                        log::warn!(
+                            "输出增益 {:.2} 超过 0 dB，已限制为 1.0（请调低 Post-trim 或 Headroom）",
+                            out_gain
+                        );
+                        out_gain = 1.0;
                     }
-                    // 输出增益（Post-trim + Headroom），统一放在 AGC 之后
-                    let out_gain = post_trim_gain * headroom_gain;
-                    if out_gain < 0.9999 || out_gain > 1.0001 {
+                    if (out_gain - 1.0).abs() > 1e-6 {
                         for v in buffer.iter_mut() {
                             *v *= out_gain;
                         }
                     }
-                    // AGC 之后轻微瞬态还原
-                    if transient_enabled {
-                        transient_shaper.process(buffer);
+                    if agc_enabled {
+                        agc.process(buffer);
                     }
                 } else {
                     log::error!("输出帧内存布局异常，跳过后级处理");
@@ -1564,9 +1846,60 @@ fn get_worker_fn(
                     let _ = sender.try_send(status);
                 }
             }
-            // 最终限幅一次，避免多级限幅导致音色压缩
             if let Some(buffer) = outframe.as_slice_mut() {
+                // 一次遍历检测异常峰值并记录峰值
+                let mut peak = 0.0f32;
+                for v in buffer.iter() {
+                    peak = peak.max(v.abs());
+                }
+                if peak > 2.0 {
+                    log::warn!(
+                        "检测到异常峰值 {:.2}，将限幅保护（可能某处理节点异常增益）",
+                        peak
+                    );
+                    for v in buffer.iter_mut() {
+                        *v = v.clamp(-1.2, 1.2);
+                    }
+                    peak = 1.2;
+                }
+                if aec_enabled {
+                    aec.process_render(buffer);
+                    if !aec.is_active() {
+                        log::warn!("AEC3 未激活（检查帧长/初始化），当前旁路");
+                        aec_enabled = false;
+                    }
+                }
+                // 最终限幅一次，避免多级限幅导致音色压缩
                 apply_final_limiter(buffer);
+                if peak > 0.99 && perf_last_log.elapsed() > Duration::from_secs(2) {
+                    log::warn!("输出峰值 {:.3}，接近裁剪，请下调增益/饱和/激励", peak);
+                }
+                // 处理耗时监测
+                let elapsed_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+                let smooth = 0.08f32;
+                proc_time_avg_ms = proc_time_avg_ms * (1.0 - smooth) + elapsed_ms * smooth;
+                proc_time_peak_ms = proc_time_peak_ms.max(elapsed_ms);
+                // 预算=DF hop + 重采样延迟（设备与模型采样率不一致时），下限 30ms 以适配 24k↔16k
+                let budget_ms = (block_duration * 1000.0 + resample_latency_ms).max(30.0);
+                if perf_last_log.elapsed() > Duration::from_secs(5) {
+                    log::info!(
+                        "帧耗时 avg/peak {:.2}/{:.2} ms（预算 {:.2} ms，重采样 {:.2} ms）",
+                        proc_time_avg_ms,
+                        proc_time_peak_ms,
+                        budget_ms,
+                        resample_latency_ms
+                    );
+                    proc_time_peak_ms *= 0.5; // 简单衰减记录
+                    perf_last_log = Instant::now();
+                }
+                // 留出 50% 容错，避免设备采样率不可调导致的常驻告警
+                if elapsed_ms > budget_ms * 1.5 && perf_last_log.elapsed() > Duration::from_millis(500) {
+                    log::warn!(
+                        "单帧耗时 {:.2} ms 超预算 {:.2} ms，可能导致掉帧",
+                        elapsed_ms,
+                        budget_ms
+                    );
+                }
             }
             // 录音最终输出（限幅后）
             if let Some(ref rec) = recording {
@@ -1594,8 +1927,7 @@ fn get_worker_fn(
                         log::error!("输出帧内存布局异常，跳过输出");
                     }
                 } else if let Some(buf) = outframe.as_slice() {
-                    let temp = buf[..n_out].to_vec();
-                    push_output_block(&should_stop, &mut rb_out, &temp[..], n_out);
+                    push_output_block(&should_stop, &mut rb_out, &buf[..n_out], n_out);
                 } else {
                     log::error!("输出帧内存布局异常，跳过输出");
                 }
@@ -1605,16 +1937,20 @@ fn get_worker_fn(
                     log::warn!("Failed to send LSNR value: {}", err);
                 }
             }
-            if let Some((ref mut s_noisy, ref mut s_enh)) = s_spec.as_mut() {
-                push_spec(df.get_spec_noisy(), s_noisy);
-                push_spec(df.get_spec_enh(), s_enh);
+            // 频谱推送节流：默认每 3 帧一次
+            spec_push_counter = spec_push_counter.wrapping_add(1);
+            const SPEC_PUSH_INTERVAL: usize = 3;
+            if spec_push_counter % SPEC_PUSH_INTERVAL == 0 {
+                if let Some((ref mut s_noisy, ref mut s_enh)) = s_spec.as_mut() {
+                    push_spec(df.get_spec_noisy(), s_noisy);
+                    push_spec(df.get_spec_enh(), s_enh);
+                }
             }
             if let Some(ref mut r_opt) = r_opt.as_mut() {
                 while let Ok(message) = r_opt.try_recv() {
                     match message {
                         ControlMessage::DeepFilter(control, value) => match control {
                             DfControl::AttenLim => {
-                                manual_atten = value;
                                 df.set_atten_lim(value);
                             }
                             DfControl::PostFilterBeta => df.set_pf_beta(value),
@@ -1724,7 +2060,7 @@ fn get_worker_fn(
                         }
                         ControlMessage::VadEnabled(enabled) => {
                             vad_enabled = enabled;
-                            log::warn!("WebRTC VAD: {}", if enabled { "开启" } else { "关闭" });
+                            log::warn!("Silero VAD: {}", if enabled { "开启" } else { "关闭" });
                         }
                         ControlMessage::TransientGain(db) => {
                             transient_attack_db = db;
@@ -1761,6 +2097,22 @@ fn get_worker_fn(
                             agc.set_attack_release(attack_ms, release_ms);
                             log::info!("AGC 攻击/释放: {:.0} / {:.0} ms", attack_ms, release_ms);
                         }
+                        ControlMessage::AecEnabled(enabled) => {
+                            aec_enabled = enabled;
+                            aec.set_enabled(enabled);
+                            log::info!("AEC3: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::AecDelayMs(v) => {
+                            aec_delay_ms = v;
+                            aec.set_delay_ms(v);
+                            pipeline_delay_ms =
+                                block_duration * 1000.0 + aec_delay_ms as f32 + resample_latency_ms;
+                            log::info!(
+                                "AEC3 延迟补偿: {} ms，总链路估算 {:.2} ms",
+                                v,
+                                pipeline_delay_ms
+                            );
+                        }
                         ControlMessage::SysAutoVolumeEnabled(_) => {
                             auto_sys_volume = false;
                             log::warn!("系统音量保护已禁用（使用 WebRTC AGC），忽略 UI 设置");
@@ -1788,6 +2140,14 @@ fn get_worker_fn(
                         }
                         ControlMessage::TimbreEnabled(enabled) => {
                             _timbre_enabled = enabled;
+                            if enabled {
+                                timbre_load_failed = false;
+                                if let Some(ref mut tr) = timbre_restore {
+                                    tr.reset();
+                                }
+                            } else if let Some(ref mut tr) = timbre_restore {
+                                tr.reset();
+                            }
                             log::info!("音色修复: {}", if enabled { "开启" } else { "关闭" });
                         }
                     }
@@ -1807,7 +2167,6 @@ fn get_worker_fn(
                     match message {
                         ControlMessage::DeepFilter(control, value) => match control {
                             DfControl::AttenLim => {
-                                manual_atten = value;
                                 df.set_atten_lim(value);
                             }
                             DfControl::PostFilterBeta => df.set_pf_beta(value),
@@ -1917,7 +2276,7 @@ fn get_worker_fn(
                         }
                         ControlMessage::VadEnabled(enabled) => {
                             vad_enabled = enabled;
-                            log::warn!("WebRTC VAD: {}", if enabled { "开启" } else { "关闭" });
+                            log::warn!("Silero VAD: {}", if enabled { "开启" } else { "关闭" });
                         }
                         ControlMessage::TransientGain(db) => {
                             transient_shaper.set_attack_gain(db);
@@ -1953,6 +2312,22 @@ fn get_worker_fn(
                             agc.set_attack_release(attack_ms, release_ms);
                             log::info!("AGC 攻击/释放: {:.0} / {:.0} ms", attack_ms, release_ms);
                         }
+                        ControlMessage::AecEnabled(enabled) => {
+                            aec_enabled = enabled;
+                            aec.set_enabled(enabled);
+                            log::info!("AEC3: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::AecDelayMs(v) => {
+                            aec_delay_ms = v;
+                            aec.set_delay_ms(v);
+                            pipeline_delay_ms =
+                                block_duration * 1000.0 + aec_delay_ms as f32 + resample_latency_ms;
+                            log::info!(
+                                "AEC3 延迟补偿: {} ms，总链路估算 {:.2} ms",
+                                v,
+                                pipeline_delay_ms
+                            );
+                        }
                         ControlMessage::SysAutoVolumeEnabled(_) => {
                             auto_sys_volume = false;
                             log::warn!("系统音量保护已禁用（使用 WebRTC AGC），忽略 UI 设置");
@@ -1984,6 +2359,14 @@ fn get_worker_fn(
                         }
                         ControlMessage::TimbreEnabled(enabled) => {
                             _timbre_enabled = enabled;
+                            if enabled {
+                                timbre_load_failed = false;
+                                if let Some(ref mut tr) = timbre_restore {
+                                    tr.reset();
+                                }
+                            } else if let Some(ref mut tr) = timbre_restore {
+                                tr.reset();
+                            }
                             log::info!("音色修复: {}", if enabled { "开启" } else { "关闭" });
                         }
                     }
@@ -1995,10 +2378,24 @@ fn get_worker_fn(
 
 fn push_spec(spec: ArrayView2<Complex32>, sender: &SendSpec) {
     debug_assert_eq!(spec.len_of(Axis(0)), 1); // only single channel for now
-    let out = spec.iter().map(|x| x.norm_sqr().max(1e-10).log10() * 10.).collect::<Vec<f32>>();
-    if let Err(err) = sender.send(out.into_boxed_slice()) {
-        log::warn!("Failed to send spectrogram data: {}", err);
+    thread_local! {
+        static SPEC_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
     }
+    SPEC_BUF.with(|buf_cell| {
+        let mut buf = buf_cell.borrow_mut();
+        let needed = spec.len();
+        if buf.len() < needed {
+            buf.resize(needed, 0.0);
+        }
+        for (dst, src) in buf.iter_mut().zip(spec.iter()) {
+            *dst = src.norm_sqr().max(1e-10).log10() * 10.0;
+        }
+        // 仍需为发送拥有所有权，保留一次拷贝
+        let out = buf[..needed].to_vec().into_boxed_slice();
+        if let Err(err) = sender.send(out) {
+            log::warn!("Failed to send spectrogram data: {}", err);
+        }
+    });
 }
 
 fn push_output_block(
@@ -2130,25 +2527,13 @@ fn apply_final_limiter(data: &mut [f32]) {
 }
 
 /// 简单峰值防护，避免链路后级触顶。
-fn apply_peak_guard(data: &mut [f32], ceiling: f32) {
-    let mut peak = 0.0f32;
-    for &v in data.iter() {
-        peak = peak.max(v.abs());
-    }
-    if peak > ceiling && peak.is_finite() {
-        let scale = ceiling / peak;
-        for v in data.iter_mut() {
-            *v *= scale;
-        }
-    }
-}
-
 pub struct SysVolMonitorHandle {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl SysVolMonitorHandle {
+    #[allow(dead_code)]
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
@@ -2169,12 +2554,14 @@ impl Drop for SysVolMonitorHandle {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 pub fn start_sys_volume_monitor(_selected_input: Option<String>) -> Option<SysVolMonitorHandle> {
     log::info!("自动系统音量后台监测仅在 macOS 可用");
     None
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 pub fn start_sys_volume_monitor(selected_input: Option<String>) -> Option<SysVolMonitorHandle> {
     use cpal::traits::DeviceTrait;
     use cpal::SampleFormat;
@@ -2434,25 +2821,6 @@ fn sanitize_samples(tag: &str, samples: &mut [f32]) -> bool {
     dirty
 }
 
-fn run_webrtc_vad(vad: &mut Vad, frame: &[f32], frame_len: usize) -> Option<bool> {
-    if frame_len == 0 || frame.len() < frame_len {
-        return None;
-    }
-    let mut buf = Vec::with_capacity(frame_len);
-    for &v in frame.iter().rev().take(frame_len).rev() {
-        let clamped = v.clamp(-1.0, 1.0);
-        buf.push((clamped * 32767.0) as i16);
-    }
-    vad.is_voice_segment(&buf).ok()
-}
-
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_millis(0))
-        .as_millis()
-}
-
 fn compute_noise_features(spec: ArrayView2<Complex32>) -> NoiseFeatures {
     let (_, freq_len) = spec.dim();
     let freq_len_f32 = freq_len.max(1) as f32;
@@ -2501,7 +2869,7 @@ fn estimate_rt60_from_energy(history: &VecDeque<f32>, block_duration: f32) -> Op
         return None;
     }
     let slope = (end_mean - start_mean) / duration; // dB/s，衰减应为负值
-    if slope >= -10.0 {
+    if slope >= -10.0 || slope.abs() < 1e-6 {
         return None;
     }
     let rt60 = (-60.0 / slope).clamp(0.2, 1.2);
@@ -2585,7 +2953,8 @@ impl DeepFilterCapture {
         let sr = metadata.sr;
         let frame_size = metadata.frame_size;
         let freq_size = metadata.freq_size;
-        let in_rb = HeapRb::<f32>::new(frame_size * 400);
+        let input_capacity_frames = frame_size * 800; // 扩大输入缓冲，容忍瞬时负载
+        let in_rb = HeapRb::<f32>::new(input_capacity_frames);
         let out_rb = HeapRb::<f32>::new(frame_size * 100);
         let (in_prod, in_cons) = in_rb.split();
         let (out_prod, out_cons) = out_rb.split();
@@ -2635,6 +3004,7 @@ impl DeepFilterCapture {
             Some(recording.clone()),
             df_params,
             ch,
+            input_capacity_frames,
         )));
         while !has_init.load(Ordering::Relaxed) {
             sleep(Duration::from_secs_f32(0.01));
@@ -2655,10 +3025,12 @@ impl DeepFilterCapture {
         })
     }
 
+    #[allow(dead_code)]
     pub fn recording(&self) -> RecordingHandle {
         self.recording.clone()
     }
 
+    #[allow(dead_code)]
     pub fn should_stop(&mut self) -> Result<()> {
         self.should_stop.swap(true, Ordering::Relaxed);
         sleep(Duration::from_millis(150));
