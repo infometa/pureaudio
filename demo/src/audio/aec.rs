@@ -11,6 +11,7 @@ pub struct EchoCanceller {
     enabled: bool,
     active: bool,
     delay_ms: i32,
+    aggressive: bool,
 }
 
 impl EchoCanceller {
@@ -22,6 +23,7 @@ impl EchoCanceller {
             num_render_channels: 1,
             ..InitializationConfig::default()
         };
+        let aggressive = true;
         let processor = if frame_ok {
             match Processor::new(&init) {
                 Ok(mut p) => {
@@ -51,7 +53,15 @@ impl EchoCanceller {
             None
         };
         let active = frame_ok && processor.is_some();
-        Self { processor, frame_size, scratch: vec![0.0; frame_size], enabled: frame_ok, active, delay_ms }
+        Self {
+            processor,
+            frame_size,
+            scratch: vec![0.0; frame_size],
+            enabled: frame_ok,
+            active,
+            delay_ms,
+            aggressive,
+        }
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
@@ -66,10 +76,32 @@ impl EchoCanceller {
         self.delay_ms = delay_ms.max(0);
         if let Some(proc) = self.processor.as_mut() {
             let ec = EchoCancellation {
-                suppression_level: EchoCancellationSuppressionLevel::High,
+                suppression_level: if self.aggressive {
+                    EchoCancellationSuppressionLevel::High
+                } else {
+                    EchoCancellationSuppressionLevel::Moderate
+                },
                 stream_delay_ms: Some(self.delay_ms),
                 enable_delay_agnostic: true,
-                enable_extended_filter: true,
+                enable_extended_filter: self.aggressive,
+            };
+            let cfg = Config { echo_cancellation: Some(ec), enable_high_pass_filter: true, ..Config::default() };
+            proc.set_config(cfg);
+        }
+    }
+
+    pub fn set_aggressive(&mut self, aggressive: bool) {
+        self.aggressive = aggressive;
+        if let Some(proc) = self.processor.as_mut() {
+            let ec = EchoCancellation {
+                suppression_level: if self.aggressive {
+                    EchoCancellationSuppressionLevel::High
+                } else {
+                    EchoCancellationSuppressionLevel::Moderate
+                },
+                stream_delay_ms: Some(self.delay_ms.max(0)),
+                enable_delay_agnostic: true,
+                enable_extended_filter: self.aggressive,
             };
             let cfg = Config { echo_cancellation: Some(ec), enable_high_pass_filter: true, ..Config::default() };
             proc.set_config(cfg);

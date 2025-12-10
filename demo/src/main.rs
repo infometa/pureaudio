@@ -174,6 +174,9 @@ struct SpecView {
     max_dfthreshdb: f32,
     df_mix: f32,
     headroom_gain: f32,
+    show_spectrum: bool,
+    rt60_enabled: bool,
+    final_limiter_enabled: bool,
     post_trim_gain: f32,
     noisy_img: image::Handle,
     enh_img: image::Handle,
@@ -230,6 +233,7 @@ struct SpecView {
     agc_attack_ms: f32,
     agc_release_ms: f32,
     show_agc_advanced: bool,
+    aec_aggressive: bool,
     aec_enabled: bool,
     aec_delay_ms: f32,
     sys_auto_volume: bool,
@@ -277,6 +281,7 @@ pub enum SliderTarget {
     TransientGain,
     TransientSustain,
     TransientMix,
+    HeadroomGain,
     AecDelay,
     AgcTarget,
     AgcMaxGain,
@@ -293,6 +298,10 @@ pub enum Message {
     LsnrChanged(f32),
     NoisyChanged,
     EnhChanged,
+    HeadroomChanged(f32),
+    SpectrumToggled(bool),
+    Rt60Toggled(bool),
+    FinalLimiterToggled(bool),
     AttenLimChanged(f32),
     PostFilterChanged(f32),
     MinThreshDbChanged(f32),
@@ -367,6 +376,7 @@ pub enum Message {
     ExciterMixChanged(f32),
     AecToggled(bool),
     AecDelayChanged(f32),
+    AecAggressiveToggled(bool),
     TimbreToggled(bool),
     EnvStatusUpdated(EnvStatus),
     StartProcessing,
@@ -389,7 +399,6 @@ pub struct UserConfig {
     max_erbthreshdb: f32,
     max_dfthreshdb: f32,
     df_mix: f32,
-    headroom_gain: f32,
     post_trim_gain: f32,
     eq_enabled: bool,
     eq_preset: EqPresetKind,
@@ -427,6 +436,16 @@ pub struct UserConfig {
     transient_sustain: f32,
     transient_mix: f32,
     show_transient_advanced: bool,
+    // 输出头间距，默认 0.9，UI 控制
+    headroom_gain: f32,
+    // UI: 是否显示/推送频谱，降低性能占用
+    #[serde(default = "default_true")]
+    show_spectrum: bool,
+    // UI: 是否计算/显示 RT60（仅自适应时），可关掉减少计算
+    #[serde(default = "default_true")]
+    rt60_enabled: bool,
+    #[serde(default = "default_true")]
+    final_limiter_enabled: bool,
     agc_enabled: bool,
     #[serde(default)]
     timbre_enabled: bool,
@@ -441,6 +460,8 @@ pub struct UserConfig {
     aec_enabled: bool,
     #[serde(default)]
     aec_delay_ms: f32,
+    #[serde(default = "default_true")]
+    aec_aggressive: bool,
     #[serde(default)]
     sys_auto_volume: bool,
     #[serde(default = "default_false")]
@@ -663,6 +684,10 @@ impl Application for SpecView {
                 max_dfthreshdb: 20.,
                 df_mix: 1.0,
                 headroom_gain: 0.9,
+                show_spectrum: true,
+                rt60_enabled: true,
+                final_limiter_enabled: false,
+                aec_aggressive: true,
                 post_trim_gain: 1.0,
                 noisy_img,
                 enh_img,
@@ -991,6 +1016,25 @@ impl Application for SpecView {
                 self.highpass_cutoff = freq;
                 self.send_control_message(ControlMessage::HighpassCutoff(freq));
             }
+            Message::HeadroomChanged(v) => {
+                self.headroom_gain = v;
+                self.send_control_message(ControlMessage::HeadroomGain(v));
+            }
+            Message::SpectrumToggled(enabled) => {
+                self.show_spectrum = enabled;
+                if !enabled {
+                    self.reset_spec_images();
+                }
+                self.send_control_message(ControlMessage::SpecEnabled(enabled));
+            }
+            Message::Rt60Toggled(enabled) => {
+                self.rt60_enabled = enabled;
+                self.send_control_message(ControlMessage::Rt60Enabled(enabled));
+            }
+            Message::FinalLimiterToggled(enabled) => {
+                self.final_limiter_enabled = enabled;
+                self.send_control_message(ControlMessage::FinalLimiterEnabled(enabled));
+            }
             Message::SaturationToggled(enabled) => {
                 self.saturation_enabled = enabled;
                 self.send_control_message(ControlMessage::SaturationEnabled(enabled));
@@ -1095,6 +1139,10 @@ impl Application for SpecView {
             Message::AecToggled(enabled) => {
                 self.aec_enabled = enabled;
                 self.send_control_message(ControlMessage::AecEnabled(enabled));
+            }
+            Message::AecAggressiveToggled(enabled) => {
+                self.aec_aggressive = enabled;
+                self.send_control_message(ControlMessage::AecAggressive(enabled));
             }
             Message::AecDelayChanged(v) => {
                 self.aec_delay_ms = v;
@@ -1416,11 +1464,19 @@ impl SpecView {
             let trimmed = self.output_device_filter.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         });
+        let spec_channels = if self.show_spectrum {
+            Some((s_noisy, s_enh))
+        } else {
+            None
+        };
+        let r_noisy = if self.show_spectrum { Some(r_noisy) } else { None };
+        let r_enh = if self.show_spectrum { Some(r_enh) } else { None };
+
         let df_worker = match DeepFilterCapture::new(
             model_path,
             Some(s_lsnr),
-            Some(s_noisy),
-            Some(s_enh),
+            spec_channels.as_ref().map(|(n, _)| n.clone()),
+            spec_channels.as_ref().map(|(_, e)| e.clone()),
             Some(r_controls),
             Some(s_eq_status),
             Some(s_env_status),
@@ -1438,8 +1494,8 @@ impl SpecView {
         self.recording = Some(recording);
         self.df_worker = Some(df_worker);
         self.r_lsnr = Some(r_lsnr);
-        self.r_noisy = Some(r_noisy);
-        self.r_enh = Some(r_enh);
+        self.r_noisy = r_noisy;
+        self.r_enh = r_enh;
         self.r_eq_status = Some(r_eq_status);
         self.r_env_status = Some(r_env_status);
         self.s_controls = Some(s_controls);
@@ -1475,6 +1531,13 @@ impl SpecView {
         self.send_control_message(ControlMessage::TransientGain(self.transient_gain));
         self.send_control_message(ControlMessage::TransientSustain(self.transient_sustain));
         self.send_control_message(ControlMessage::TransientMix(self.transient_mix));
+        self.send_control_message(ControlMessage::HeadroomGain(self.headroom_gain));
+        self.send_control_message(ControlMessage::FinalLimiterEnabled(
+            self.final_limiter_enabled,
+        ));
+        self.send_control_message(ControlMessage::SpecEnabled(self.show_spectrum));
+        self.send_control_message(ControlMessage::Rt60Enabled(self.rt60_enabled));
+        self.send_control_message(ControlMessage::AecAggressive(self.aec_aggressive));
         self.send_control_message(ControlMessage::AgcTargetLevel(self.agc_target_db));
         self.send_control_message(ControlMessage::AgcMaxGain(self.agc_max_gain_db));
         self.send_control_message(ControlMessage::AgcMaxAttenuation(self.agc_max_atten_db));
@@ -1835,6 +1898,8 @@ impl SpecView {
         self.send_control_message(ControlMessage::HighpassCutoff(self.highpass_cutoff));
         self.send_control_message(ControlMessage::DfMix(self.df_mix));
         self.send_control_message(ControlMessage::HeadroomGain(self.headroom_gain));
+        self.send_control_message(ControlMessage::SpecEnabled(self.show_spectrum));
+        self.send_control_message(ControlMessage::Rt60Enabled(self.rt60_enabled));
         self.send_control_message(ControlMessage::PostTrimGain(self.post_trim_gain));
         self.send_control_message(ControlMessage::SaturationEnabled(self.saturation_enabled));
         self.send_control_message(ControlMessage::SaturationDrive(self.saturation_drive));
@@ -1939,6 +2004,10 @@ impl SpecView {
             max_dfthreshdb: self.max_dfthreshdb,
             df_mix: 1.0,
             headroom_gain: self.headroom_gain,
+            show_spectrum: self.show_spectrum,
+            rt60_enabled: self.rt60_enabled,
+            final_limiter_enabled: self.final_limiter_enabled,
+            aec_aggressive: self.aec_aggressive,
             post_trim_gain: self.post_trim_gain,
             eq_enabled: self.eq_enabled,
             eq_preset: self.eq_preset,
@@ -2000,6 +2069,10 @@ impl SpecView {
         self.max_dfthreshdb = cfg.max_dfthreshdb;
         self.df_mix = 1.0;
         self.headroom_gain = cfg.headroom_gain;
+        self.show_spectrum = cfg.show_spectrum;
+        self.rt60_enabled = cfg.rt60_enabled;
+        self.final_limiter_enabled = cfg.final_limiter_enabled;
+        self.aec_aggressive = cfg.aec_aggressive;
         self.post_trim_gain = cfg.post_trim_gain;
         self.eq_enabled = cfg.eq_enabled;
         self.eq_preset = cfg.eq_preset;
@@ -2305,6 +2378,8 @@ impl SpecView {
         let aec_row = row![
             toggler(String::new(), self.aec_enabled, Message::AecToggled),
             text("AEC3 回声消除").size(14),
+            toggler(String::new(), self.aec_aggressive, Message::AecAggressiveToggled),
+            text("强力模式").size(13),
         ]
         .spacing(10)
         .align_items(Alignment::Center);
@@ -2577,6 +2652,20 @@ impl SpecView {
             widget::Column::new().into()
         };
 
+        let headroom_row = self.create_slider_row(
+            "Headroom (线性倍率)",
+            Some("headroom_gain"),
+            self.headroom_gain,
+            0.6,
+            1.05,
+            0.01,
+            2,
+            Some(SliderTarget::HeadroomGain),
+            Message::HeadroomChanged,
+            |v| format!("{:.0}%", v * 100.0),
+            "输出前置头间距，降低可减少啸叫/削顶，升高可提高响度（默认 90%）",
+        );
+
         let sys_auto_volume_toggle = apply_tooltip(
             row![
                 toggler(
@@ -2623,6 +2712,7 @@ impl SpecView {
                 highpass_row,
                 highpass_controls,
                 aec_row,
+                aec_delay_slider,
                 saturation_toggle,
                 saturation_controls,
                 exciter_toggle,
@@ -2632,6 +2722,17 @@ impl SpecView {
                 transient_controls,
                 agc_row,
                 agc_controls,
+                headroom_row,
+                row![
+                    toggler(
+                        String::new(),
+                        self.final_limiter_enabled,
+                        |v| Message::FinalLimiterToggled(v)
+                    ),
+                    text("最终限幅器（保护用，可关闭做纯降噪对比）").size(14)
+                ]
+                .spacing(10)
+                .align_items(Alignment::Center),
                 sys_auto_volume_toggle,
                 env_auto_toggle,
                 vad_toggle
@@ -2644,21 +2745,38 @@ impl SpecView {
     }
 
     fn create_spectrum_panel(&self) -> Element<'_, Message> {
-        let spectrums = column![
-            spec_view(
-                "拾音频谱",
-                self.noisy_img.clone(),
-                SPEC_DISPLAY_WIDTH,
-                SPEC_DISPLAY_HEIGHT,
-            ),
-            spec_view(
-                "降噪后频谱",
-                self.enh_img.clone(),
-                SPEC_DISPLAY_WIDTH,
-                SPEC_DISPLAY_HEIGHT,
-            ),
+        let toggles = row![
+            toggler(String::new(), self.show_spectrum, Message::SpectrumToggled),
+            text("显示频谱/RT60").size(14),
+            toggler(String::new(), self.rt60_enabled, Message::Rt60Toggled),
+            text("RT60 估计").size(14),
         ]
-        .spacing(20);
+        .spacing(12)
+        .align_items(Alignment::Center);
+
+        let spectrums: Element<'_, Message> = if self.show_spectrum {
+            column![
+                spec_view(
+                    "拾音频谱",
+                    self.noisy_img.clone(),
+                    SPEC_DISPLAY_WIDTH,
+                    SPEC_DISPLAY_HEIGHT,
+                ),
+                spec_view(
+                    "降噪后频谱",
+                    self.enh_img.clone(),
+                    SPEC_DISPLAY_WIDTH,
+                    SPEC_DISPLAY_HEIGHT,
+                ),
+            ]
+            .spacing(20)
+            .into()
+        } else {
+            text("频谱/RT60 显示已关闭（可在左侧开关恢复）")
+                .size(14)
+                .width(Length::Fill)
+                .into()
+        };
 
         let info = column![
             row![
@@ -2681,7 +2799,10 @@ impl SpecView {
         ]
         .spacing(10);
 
-        column![spectrums, info].spacing(20).width(Length::Fill).into()
+        column![toggles, spectrums, info]
+            .spacing(16)
+            .width(Length::Fill)
+            .into()
     }
 
     fn create_band_panel(&self, idx: usize) -> Element<'_, Message> {
@@ -2977,6 +3098,10 @@ impl SpecView {
             SliderTarget::TransientMix => {
                 self.transient_mix = value;
                 self.send_control_message(ControlMessage::TransientMix(value));
+            }
+            SliderTarget::HeadroomGain => {
+                self.headroom_gain = value;
+                self.send_control_message(ControlMessage::HeadroomGain(value));
             }
             SliderTarget::AecDelay => {
                 self.aec_delay_ms = value;

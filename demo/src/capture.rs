@@ -40,6 +40,9 @@ const TIMBRE_CONTEXT: usize = 256;
 const TIMBRE_HIDDEN: usize = 384;
 const TIMBRE_LAYERS: usize = 2;
 const SILERO_VAD_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/silero_vad.onnx");
+// 内部处理采样率/帧长固定为 48 kHz / 10 ms，只在 IO 边界做重采样，保持 AEC/DF/VAD 对齐
+const PROCESS_SR: usize = 48_000;
+const PROCESS_HOP: usize = PROCESS_SR / 100;
 const AEC_DEFAULT_DELAY_MS: i32 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +331,10 @@ pub enum ControlMessage {
     TimbreEnabled(bool),
     AecEnabled(bool),
     AecDelayMs(i32),
+    AecAggressive(bool),
+    SpecEnabled(bool),
+    Rt60Enabled(bool),
+    FinalLimiterEnabled(bool),
 }
 
 #[allow(dead_code)]
@@ -511,22 +518,14 @@ fn fill_output_buffer(rb: &mut RbCons, data: &mut [f32], ch: u16, needs_upmix: b
                 filled += 1;
             }
             if filled == 0 {
+                // 环形缓冲欠载：用上一帧值保持，不再衰减到 0，避免音量忽高忽低
                 let prev: Vec<f32> = if n > 0 {
-                    data[(n * ch as usize - ch as usize)..(n * ch as usize)]
-                        .to_vec()
+                    data[(n * ch as usize - ch as usize)..(n * ch as usize)].to_vec()
                 } else {
                     vec![0.0; ch as usize]
                 };
-                let remain = frames.saturating_sub(n);
-                for (i, frame) in data.chunks_mut(ch as usize).skip(n).enumerate() {
-                    let gain = if remain > 1 {
-                        (remain - 1 - i) as f32 / (remain - 1) as f32
-                    } else {
-                        0.0
-                    };
-                    for (s, p) in frame.iter_mut().zip(prev.iter()) {
-                        *s = *p * gain;
-                    }
+                for frame in data.chunks_mut(ch as usize).skip(n) {
+                    frame.clone_from_slice(&prev);
                     n += 1;
                 }
                 OUTPUT_UNDERRUNS.fetch_add(1, Ordering::Relaxed);
@@ -537,28 +536,19 @@ fn fill_output_buffer(rb: &mut RbCons, data: &mut [f32], ch: u16, needs_upmix: b
         while n < frames {
             let popped = rb.pop_slice(&mut data[n..]);
             if popped == 0 {
+                let prev = if n > 0 {
+                    data[(n - 1)..n].to_vec()
+                } else {
+                    vec![0.0; 1]
+                };
                 let remain = frames.saturating_sub(n);
-                if remain > 0 {
-                    let ch_len = ch as usize;
-                    let prev = if n > 0 {
-                        data[(n * ch_len - ch_len)..(n * ch_len)].to_vec()
-                    } else {
-                        vec![0.0; ch_len]
-                    };
-                    for i in 0..remain {
-                        let gain = if remain > 1 {
-                            (remain - 1 - i) as f32 / (remain - 1) as f32
-                        } else {
-                            0.0
-                        };
-                        let start = (n + i) * ch_len;
-                        let end = start + ch_len;
-                        for (s, p) in data[start..end].iter_mut().zip(prev.iter()) {
-                            *s = *p * gain;
-                        }
-                    }
-                    OUTPUT_UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+                for i in 0..remain {
+                    let idx = n + i;
+                    let start = idx;
+                    let end = start + 1;
+                    data[start..end].clone_from_slice(&prev[..]);
                 }
+                OUTPUT_UNDERRUNS.fetch_add(1, Ordering::Relaxed);
                 n = frames;
                 break;
             }
@@ -877,16 +867,17 @@ fn get_worker_fn(
         let mut timbre_stride = 1usize;
         let mut timbre_skip_idx = 0usize;
         let mut timbre_last_good = Instant::now();
-        let mut highpass_enabled = true;
+        let mut highpass_enabled = false;
         let mut highpass_cutoff = 50.0f32;
         let mut manual_highpass = highpass_cutoff;
         highpass.set_cutoff(highpass_cutoff);
-        let mut transient_enabled = true;
-        let mut saturation_enabled = true;
-        let mut agc_enabled = true;
+        let mut transient_enabled = false;
+        let mut saturation_enabled = false;
+        let mut agc_enabled = false;
         let mut aec_enabled = false;
         let mut aec_delay_ms: i32;
-        let mut exciter_enabled = true;
+        let mut _aec_aggressive = true;
+        let mut exciter_enabled = false;
         let mut _timbre_enabled = false;
         let mut bypass_enabled = false;
         let mut mute_playback = false;
@@ -894,6 +885,9 @@ fn get_worker_fn(
         // 耳机场景：预留更多头间距，减少 clipping
         let mut headroom_gain = 0.92f32;
         let mut post_trim_gain = 1.0f32;
+        let mut spec_enabled = true;
+        let mut rt60_enabled = true;
+        let mut final_limiter_enabled = false;
         // 自适应环境/设备状态（默认关闭，通过 UI 控制开启）
         let mut env_class = EnvClass::Noisy;
         let mut smoothed_energy = -80.0f32;
@@ -934,8 +928,8 @@ fn get_worker_fn(
         let mut soft_mode_hold = 0usize;
         const SOFT_MODE_HOLD_FRAMES: usize = 160; // 约 2s（取决于 hop）
         // 启动保护期，前 1s 禁止 gate/瞬态强抑制，避免开口被吞
-        // 启动保护期：首 3s 保护起音，不做重度抑制
-        let startup_guard_until = Instant::now() + Duration::from_millis(3000);
+        // 启动保护期：预热后直接进入正常处理
+        let startup_guard_until = Instant::now();
         let mut _auto_gain_scale = 1.0f32;
         has_init.store(true, Ordering::Relaxed);
         log::info!("Worker init");
@@ -947,11 +941,51 @@ fn get_worker_fn(
         let mut perf_last_log = Instant::now();
         // 连续低峰值检测阈值（约 3 秒）
         let low_peak_required = ((3.0 / block_duration).ceil() as usize).max(30);
+        // 预热：在不触碰 IO 的情况下跑几帧静音，暖机模型/重采样状态，避免首句被吞
+        if let (Some(inbuf), Some(outbuf)) = (inframe.as_slice_mut(), outframe.as_slice_mut()) {
+            inbuf.fill(0.0);
+            outbuf.fill(0.0);
+            let warmup = 6usize;
+            for _ in 0..warmup {
+                if highpass_enabled {
+                    highpass.process(inbuf);
+                }
+                // 使用原始数组视图，避免同时持有 &mut 并再借用
+                let mut out_view = ArrayViewMut2::from_shape((df.ch, df.hop_size), outbuf)
+                    .expect("outframe shape");
+                let in_view = ArrayView2::from_shape((df.ch, df.hop_size), inbuf).expect("inframe shape");
+                let _ = df.process(in_view, out_view.view_mut());
+                if transient_enabled {
+                    transient_shaper.process(outbuf);
+                }
+                if saturation_enabled {
+                    saturation.process(outbuf);
+                }
+                if exciter_enabled {
+                    exciter.process(outbuf);
+                }
+                if agc_enabled {
+                    agc.process(outbuf);
+                }
+                if final_limiter_enabled {
+                    apply_final_limiter(outbuf);
+                }
+                outbuf.fill(0.0);
+                inbuf.fill(0.0);
+            }
+            log::info!("预热完成（{} 帧静音）", warmup);
+        }
         let (mut input_resampler, n_in) = if input_sr != df.sr {
             match FftFixedOut::<f32>::new(input_sr, df.sr, df.hop_size, 1, 1) {
                 Ok(r) => {
                     let n_in = r.input_frames_max();
                     let buf = r.input_buffer_allocate(true);
+                    log::info!(
+                        "输入重采样: 设备 {} Hz -> 内部 {} Hz，块长 {}",
+                        input_sr,
+                        df.sr,
+                        n_in
+                    );
                     (Some((r, buf)), n_in)
                 }
                 Err(err) => {
@@ -967,6 +1001,12 @@ fn get_worker_fn(
                 Ok(r) => {
                     let n_out = r.output_frames_max();
                     let buf = r.output_buffer_allocate(true);
+                    log::info!(
+                        "输出重采样: 内部 {} Hz -> 设备 {} Hz，块长 {}",
+                        df.sr,
+                        output_sr,
+                        n_out
+                    );
                     (Some((r, buf)), n_out)
                 }
                 Err(err) => {
@@ -1013,10 +1053,8 @@ fn get_worker_fn(
         let mut env_auto_enabled = false;
         'processing: while !should_stop.load(Ordering::Relaxed) {
             if rb_in.len() < n_in {
-                // Sleep for half a hop size
-                sleep(Duration::from_secs_f32(
-                    df.hop_size as f32 / df.sr as f32 / 2.,
-                ));
+                // 更快轮询，减少初始等待导致的起音丢失
+                sleep(Duration::from_millis(1));
                 continue;
             }
             let backlog = rb_in.len();
@@ -1050,19 +1088,19 @@ fn get_worker_fn(
                         }
                         if start_fill.elapsed() > input_timeout {
                             log::warn!(
-                                "等待输入数据超时（需要 {}，已获取 {}），丢弃该帧",
+                                "等待输入数据超时（需要 {}，已获取 {}），用静音补齐",
                                 n_in,
                                 filled
                             );
-                            continue 'processing;
+                            for s in buf[0][filled..n_in].iter_mut() {
+                                *s = 0.0;
+                            }
+                            break;
                         }
                         sleep(input_retry_delay);
                         continue;
                     }
                     filled += pulled;
-                }
-                if filled != n_in {
-                    continue 'processing;
                 }
                 if let Some(slice) = inframe.as_slice_mut() {
                     if let Err(err) = r.process_into_buffer(buf, &mut [slice], None) {
@@ -1086,19 +1124,19 @@ fn get_worker_fn(
                             }
                             if start_fill.elapsed() > input_timeout {
                                 log::warn!(
-                                    "等待输入数据超时（需要 {}，已获取 {}），丢弃该帧",
+                                    "等待输入数据超时（需要 {}，已获取 {}），用静音补齐",
                                     n_in,
                                     filled
                                 );
-                                continue 'processing;
+                                for s in buffer[filled..n_in].iter_mut() {
+                                    *s = 0.0;
+                                }
+                                break;
                             }
                             sleep(input_retry_delay);
                             continue;
                         }
                         filled += pulled;
-                    }
-                    if filled != n_in {
-                        continue 'processing;
                     }
                 } else {
                     log::error!("输入帧内存布局异常，跳过本帧");
@@ -1359,7 +1397,7 @@ fn get_worker_fn(
                 }
 
                 // 噪声地板跟踪：仅在非语音段更新，下降快，上升慢；启动期更快适配环境
-                if !is_voice {
+                if !is_voice && rt60_enabled {
                     let nf_fast = if guard_active { 0.7 } else { 0.45 };
                     let nf_slow = if guard_active { 0.10 } else { 0.03 };
                     if rms_db < noise_floor_db {
@@ -1870,7 +1908,9 @@ fn get_worker_fn(
                     }
                 }
                 // 最终限幅一次，避免多级限幅导致音色压缩
-                apply_final_limiter(buffer);
+                if final_limiter_enabled {
+                    apply_final_limiter(buffer);
+                }
                 if peak > 0.99 && perf_last_log.elapsed() > Duration::from_secs(2) {
                     log::warn!("输出峰值 {:.3}，接近裁剪，请下调增益/饱和/激励", peak);
                 }
@@ -1940,7 +1980,7 @@ fn get_worker_fn(
             // 频谱推送节流：默认每 3 帧一次
             spec_push_counter = spec_push_counter.wrapping_add(1);
             const SPEC_PUSH_INTERVAL: usize = 3;
-            if spec_push_counter % SPEC_PUSH_INTERVAL == 0 {
+            if spec_enabled && spec_push_counter % SPEC_PUSH_INTERVAL == 0 {
                 if let Some((ref mut s_noisy, ref mut s_enh)) = s_spec.as_mut() {
                     push_spec(df.get_spec_noisy(), s_noisy);
                     push_spec(df.get_spec_enh(), s_enh);
@@ -2102,6 +2142,11 @@ fn get_worker_fn(
                             aec.set_enabled(enabled);
                             log::info!("AEC3: {}", if enabled { "开启" } else { "关闭" });
                         }
+                        ControlMessage::AecAggressive(enabled) => {
+                            _aec_aggressive = enabled;
+                            aec.set_aggressive(enabled);
+                            log::info!("AEC3 强力模式: {}", if enabled { "开启" } else { "关闭" });
+                        }
                         ControlMessage::AecDelayMs(v) => {
                             aec_delay_ms = v;
                             aec.set_delay_ms(v);
@@ -2129,6 +2174,21 @@ fn get_worker_fn(
                                     let _ = sender.try_send(EnvStatus::Normal);
                                 }
                             }
+                        }
+                        ControlMessage::SpecEnabled(enabled) => {
+                            spec_enabled = enabled;
+                            log::info!("频谱/RT60 推送: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::Rt60Enabled(enabled) => {
+                            rt60_enabled = enabled;
+                            if !enabled {
+                                rt60_history.clear();
+                            }
+                            log::info!("RT60 估计: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::FinalLimiterEnabled(enabled) => {
+                            final_limiter_enabled = enabled;
+                            log::info!("最终限幅器: {}", if enabled { "开启" } else { "关闭" });
                         }
                         ControlMessage::ExciterEnabled(enabled) => {
                             exciter_enabled = enabled;
@@ -2317,6 +2377,11 @@ fn get_worker_fn(
                             aec.set_enabled(enabled);
                             log::info!("AEC3: {}", if enabled { "开启" } else { "关闭" });
                         }
+                        ControlMessage::AecAggressive(enabled) => {
+                            _aec_aggressive = enabled;
+                            aec.set_aggressive(enabled);
+                            log::info!("AEC3 强力模式: {}", if enabled { "开启" } else { "关闭" });
+                        }
                         ControlMessage::AecDelayMs(v) => {
                             aec_delay_ms = v;
                             aec.set_delay_ms(v);
@@ -2344,6 +2409,21 @@ fn get_worker_fn(
                                     let _ = sender.try_send(EnvStatus::Normal);
                                 }
                             }
+                        }
+                        ControlMessage::SpecEnabled(enabled) => {
+                            spec_enabled = enabled;
+                            log::info!("频谱/RT60 推送: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::Rt60Enabled(enabled) => {
+                            rt60_enabled = enabled;
+                            if !enabled {
+                                rt60_history.clear();
+                            }
+                            log::info!("RT60 估计: {}", if enabled { "开启" } else { "关闭" });
+                        }
+                        ControlMessage::FinalLimiterEnabled(enabled) => {
+                            final_limiter_enabled = enabled;
+                            log::info!("最终限幅器: {}", if enabled { "开启" } else { "关闭" });
                         }
                         ControlMessage::ExciterEnabled(enabled) => {
                             exciter_enabled = enabled;
@@ -2513,15 +2593,15 @@ impl BusLimiter {
 }
 
 fn apply_final_limiter(data: &mut [f32]) {
-    let mut peak = 0.0f32;
-    for sample in data.iter() {
-        peak = peak.max(sample.abs());
-    }
-    const CEILING: f32 = 0.92;
-    if peak > CEILING && peak.is_finite() {
-        let scale = CEILING / peak;
-        for sample in data.iter_mut() {
-            *sample *= scale;
+    // 简单逐样本限幅，避免整帧缩放带来的“忽高忽低”抽吸
+    const CEILING: f32 = 0.98;
+    for sample in data.iter_mut() {
+        if !sample.is_finite() {
+            *sample = 0.0;
+        } else if *sample > CEILING {
+            *sample = CEILING;
+        } else if *sample < -CEILING {
+            *sample = -CEILING;
         }
     }
 }
@@ -2952,10 +3032,19 @@ impl DeepFilterCapture {
         let df_params = metadata.params.clone();
         let sr = metadata.sr;
         let frame_size = metadata.frame_size;
+        if sr != PROCESS_SR || frame_size != PROCESS_HOP {
+            return Err(anyhow!(
+                "模型采样率/帧长为 {} Hz / {}，但内部处理要求 48 kHz / {}，请使用 48k 模型以保证仅在 IO 边界重采样",
+                sr,
+                frame_size,
+                PROCESS_HOP
+            ));
+        }
         let freq_size = metadata.freq_size;
         let input_capacity_frames = frame_size * 800; // 扩大输入缓冲，容忍瞬时负载
         let in_rb = HeapRb::<f32>::new(input_capacity_frames);
-        let out_rb = HeapRb::<f32>::new(frame_size * 100);
+        // 扩大输出缓冲，容忍处理抖动，避免欠载导致的音量波动
+        let out_rb = HeapRb::<f32>::new(frame_size * 800);
         let (in_prod, in_cons) = in_rb.split();
         let (out_prod, out_cons) = out_rb.split();
         let in_prod = in_prod.into_postponed();
@@ -2976,6 +3065,21 @@ impl DeepFilterCapture {
 
         let mut source = AudioSource::new(sr as u32, frame_size, input_device)?;
         let mut sink = AudioSink::new(sr as u32, frame_size, output_device)?;
+        // 打印实际设备采样率，方便确认是否需要边界重采样
+        let in_name = source.device.name().unwrap_or_else(|_| "unknown input".into());
+        let out_name = sink.device.name().unwrap_or_else(|_| "unknown output".into());
+        log::info!(
+            "Input device '{}' @ {} Hz (internal processing {} Hz)",
+            in_name,
+            source.sr(),
+            PROCESS_SR
+        );
+        log::info!(
+            "Output device '{}' @ {} Hz (internal processing {} Hz)",
+            out_name,
+            sink.sr(),
+            PROCESS_SR
+        );
         let should_stop = Arc::new(AtomicBool::new(false));
         let has_init = Arc::new(AtomicBool::new(false));
         let s_spec = match (s_noisy, s_enh) {
