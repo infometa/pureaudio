@@ -82,60 +82,66 @@ fn calculate_rms_db(buffer: &[f32]) -> f32 {
 /// 2. 能量对比判断：
 ///    - 如果近端能量 >> 远端能量（差距>15dB）
 ///      → 近端占绝对优势，不算双讲
-///    - 如果远端能量 >> 近端能量（差距<-15dB）
-///      → 远端占绝对优势，不算双讲
-///    - 如果能量相当（差距±15dB内）
-///      → 真正的双讲 ✅
+/// 智能双讲检测：多特征融合 + 自适应保护
 /// 
-/// # 参数
-/// - `vad_state`: VAD检测状态
-/// - `render_active`: 远端音频是否活跃
-/// - `near_db`: 近端信号能量（dB）
-/// - `far_db`: 远端信号能量（dB）
+/// ## 核心设计原则
+/// 1. **优先保护近端语音，宁可误保护不吞音**
+/// 2. **VAD 是主要判断依据，能量是辅助**
+/// 3. **滞后保护：检测到语音后继续保护一段时间**
 /// 
-/// # 返回
-/// - `true`: 确定是双讲，应该保护近端
-/// - `false`: 单讲或能量差距过大
+/// ## 检测特征
+/// 1. VAD 检测状态（主要特征）
+/// 2. 能量对比（辅助特征）
+/// 3. 绝对能量阈值
+/// 
+/// ## 返回
+/// - `true`: 检测到双讲，使用 Low suppression 保护近端
+/// - `false`: 单讲或静音，使用 High suppression 消除回声
 fn is_true_double_talk(
     vad_state: bool,
     render_active: bool,
     near_db: f32,
     far_db: f32,
 ) -> bool {
-    // ⚠️ 关键修复：只有远端播放场景，强制单讲模式
-    // 原因：麦克风录到的主要是回声，near_db 会接近 far_db，导致误判为双讲
-    // 必须依赖 VAD 来区分"真实语音"和"回声"
-    
-    // 1. 如果 VAD 没检测到语音，肯定不是双讲（即使有能量也是回声）
-    if !vad_state {
-        return false;
-    }
-    
-    // 2. 如果没有远端播放，不存在双讲
+    // 如果没有远端播放，不存在双讲问题
     if !render_active {
         return false;
     }
     
-    // 3. 绝对能量检查：近端能量必须足够高，才可能是真实语音
-    // 回声通常 < -25dB，真实语音通常 > -20dB
-    if near_db < -25.0 {
-        return false;  // 能量太低，肯定是回声/底噪
+    // === 核心检测逻辑 ===
+    
+    // 1. VAD + 能量联合判断（主要特征）
+    // VAD 检测到语音时，需要额外检查能量是否合理
+    // 防止 VAD 误检回声的情况
+    if vad_state {
+        let energy_diff = near_db - far_db;
+        
+        // VAD 检测到语音 + 两个条件之一：
+        // a) 近端能量合理（> -35dB）且 比远端强（diff > 0）
+        // b) 近端能量较高（> -25dB），即使比远端弱也保护
+        if (near_db > -35.0 && energy_diff > 0.0) || near_db > -25.0 {
+            return true;  // 保护近端语音
+        }
     }
     
-    // 4. 近端必须明显强于远端，才认为是双讲
-    // 如果只是回声，near_db 不会比 far_db 高太多
+    // 2. 能量对比检测（VAD 可能漏检的情况）
+    // 如果近端明显比远端强，可能是真实语音
     let energy_diff = near_db - far_db;
     
-    // 双讲判定（阈值从 10dB 降低到 6dB，更好地保护正常对话）：
-    // - 近端比远端强 6dB 以上，认为是双讲，保护近端
-    // - 其他情况使用 High suppression 消除回声
-    if energy_diff > 6.0 {
-        // 近端比远端强 6dB 以上，可能是真实语音
+    // 放宽到 3dB，更积极地保护近端
+    // 原理：回声的能量通常不会超过远端，真实语音则可能更强
+    if near_db > -30.0 && energy_diff > 3.0 {
         return true;
-    } else {
-        // 能量相近或近端更弱 → 主要是回声，不保护
-        return false;
     }
+    
+    // 3. 绝对能量检测（大声说话的情况）
+    // 如果近端能量非常高，即使 VAD 没检测到也保护
+    if near_db > -15.0 {
+        return true;
+    }
+    
+    // 其他情况：认为是回声，使用强力抑制
+    false
 }
 
 // ==================== 辅助函数结束 ====================
@@ -1077,6 +1083,10 @@ fn get_worker_fn(
         let mut vad_state = false;  // ⚠️ 修复：初始状态为false，避免单播放被误判为双讲
         let mut vad_voice_count = 0usize;   // 需要检测到真实语音才激活
         let mut vad_noise_count = 0usize;
+        
+        // 双讲滞后保护：检测到语音后继续保护一段时间，避免尾音被吞
+        let mut dt_holdoff_frames = 0u16;  // 滞后保护帧数
+        const DT_HOLDOFF_MAX: u16 = 20;    // 最大滞后保护帧数（约200ms）
         // 噪声门控已禁用（交给 WebRTC AGC/DF 处理），固定全通
         let mut _gate_gain = 1.0f32;
         // 噪声地板 & SNR 跟踪
@@ -1520,12 +1530,27 @@ fn get_worker_fn(
                     volume_monitor.update_output(far_db);
                     
                     // 智能双讲检测
-                    let is_double_talk = is_true_double_talk(
+                    let raw_double_talk = is_true_double_talk(
                         vad_state,
                         render_active,
                         near_energy_db,
                         far_db,
                     );
+                    
+                    // 滞后保护机制：检测到双讲后继续保护一段时间
+                    // 避免语音尾音被截断，减少断断续续的吞音
+                    let is_double_talk = if raw_double_talk {
+                        // 检测到双讲，重置/刷新保护计数器
+                        dt_holdoff_frames = DT_HOLDOFF_MAX;
+                        true
+                    } else if dt_holdoff_frames > 0 {
+                        // 在滞后保护期内，继续保护
+                        dt_holdoff_frames -= 1;
+                        true  // 继续使用低抑制来保护可能的尾音
+                    } else {
+                        false
+                    };
+                    
                     aec.set_double_talk(is_double_talk);
                     
                     // 诊断日志（强制 WARN 级别确保可见）
