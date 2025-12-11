@@ -1,4 +1,5 @@
 use log::warn;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct HighpassFilter {
     cutoff_hz: f32,
@@ -57,7 +58,9 @@ impl HighpassFilter {
 
     #[allow(dead_code)]
     pub fn set_q(&mut self, q: f32) {
-        self.q = q.clamp(0.5, 2.5);
+        // 限制Q值范围以避免高通滤波器产生过强共振峰
+        // 专业音频建议：Q=0.707 (Butterworth), 最大不超过1.5
+        self.q = q.clamp(0.5, 1.5);
         self.update_coefficients();
     }
 
@@ -78,6 +81,15 @@ impl HighpassFilter {
             self.x1 = input;
             self.y2 = self.y1;
             self.y1 = output;
+            
+            // 状态防护：防止次正规数累积导致性能下降
+            // 阈值设为1e-10，比原来的1e-25更合理（f32精度约7位有效数字）
+            if self.y1.abs() < 1e-10 {
+                self.y1 = 0.0;
+            }
+            if self.y2.abs() < 1e-10 {
+                self.y2 = 0.0;
+            }
 
             *sample = output;
         }
@@ -118,21 +130,32 @@ impl HighpassFilter {
         self.b0 = b0 / a0;
         self.b1 = b1 / a0;
         self.b2 = b2 / a0;
-        // 标准 IIR 稳定性防护：|a1|<2, |a2|<1
-        if na1.abs() >= 1.999 || na2.abs() >= 0.999 {
-            warn!(
-                "HighpassFilter 系数接近不稳定 (cutoff {:.1} Hz @ {:.0} Hz sr)，已钳制",
-                self.cutoff_hz, self.sample_rate
-            );
-            na1 = na1.clamp(-1.999, 1.999);
-            na2 = na2.clamp(-0.999, 0.999);
+        
+        // 严格的IIR稳定性检查：除了|a1|<2, |a2|<1外，还需满足极点在单位圆内
+        // 标准条件：|a2| < 1 且 |a1| < 1 + a2
+        let is_unstable = na2.abs() >= 0.999 || na1.abs() >= (1.0 + na2 - 0.001);
+        
+        if is_unstable {
+            static HP_UNSTABLE_COUNT: AtomicUsize = AtomicUsize::new(0);
+            let count = HP_UNSTABLE_COUNT.fetch_add(1, Ordering::Relaxed);
+            
+            // 使用限流日志：每100次警告一次，避免阻塞音频线程
+            if count % 100 == 0 {
+                warn!(
+                    "HighpassFilter 系数不稳定 (第{}次): cutoff={:.1}Hz, Q={:.2}, a1={:.3}, a2={:.3}",
+                    count, self.cutoff_hz, self.q, na1, na2
+                );
+            }
+            
+            na1 = na1.clamp(-1.998, 1.998);
+            na2 = na2.clamp(-0.998, 0.998);
         }
         self.a1 = na1;
         self.a2 = na2;
     }
 }
 
-fn sanitize_samples(tag: &str, samples: &mut [f32]) -> bool {
+fn sanitize_samples(_tag: &str, samples: &mut [f32]) -> bool {
     let mut found = false;
     for sample in samples.iter_mut() {
         if !sample.is_finite() {
@@ -141,7 +164,9 @@ fn sanitize_samples(tag: &str, samples: &mut [f32]) -> bool {
         }
     }
     if found {
-        warn!("{tag} 检测到非法音频数据 (NaN/Inf)，已重置该帧");
+        HIGHPASS_SANITIZE_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     found
 }
+
+static HIGHPASS_SANITIZE_COUNT: AtomicUsize = AtomicUsize::new(0);

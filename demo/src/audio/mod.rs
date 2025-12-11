@@ -1,3 +1,4 @@
+pub mod adaptive;
 pub mod agc;
 pub mod aec;
 pub mod eq;

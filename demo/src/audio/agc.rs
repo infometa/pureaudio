@@ -1,4 +1,5 @@
 use log::{error, warn};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use webrtc_audio_processing::{Config, GainControl, GainControlMode, InitializationConfig, Processor};
 
 /// WebRTC 数字 AGC 封装，替换自研实现，减少开口/起音吞噪。
@@ -17,8 +18,8 @@ impl AutoGainControl {
         let init = InitializationConfig { num_capture_channels: 1, num_render_channels: 0, ..Default::default() };
         let cfg = GainControl {
             mode: GainControlMode::AdaptiveDigital,
-            target_level_dbfs: 6,      // -6 dBFS 目标，更响亮
-            compression_gain_db: 20,   // 更强补偿低音量
+            target_level_dbfs: 16,     // -16 dBFS 目标（更保守，避免啸叫）
+            compression_gain_db: 9,    // ✅ 降低到9dB（原15dB太大，会放大残留回声导致啸叫）
             enable_limiter: false,     // 内限幅关闭，交给最终限幅器
         };
         let frame_ok = frame_size > 0 && hop_size % frame_size == 0;
@@ -77,9 +78,10 @@ impl AutoGainControl {
         }
     }
 
-    pub fn current_gain_db(&self) -> f32 {
-        // WebRTC APM 未直接暴露当前增益，返回 0 仅作占位
-        0.0
+    /// 获取当前增益估算值（WebRTC APM 不直接暴露增益，返回None）
+    /// 调用者应通过监控输入/输出RMS来计算实际增益
+    pub fn current_gain_db(&self) -> Option<f32> {
+        None
     }
 
     pub fn reset(&mut self) {
@@ -99,16 +101,19 @@ impl AutoGainControl {
         self.apply_cfg();
     }
 
+    /// WebRTC AGC 不支持最大衰减参数配置
     pub fn set_max_attenuation(&mut self, _db: f32) {
-        // WebRTC AGC 没有对应参数，留空
+        log::warn!("WebRTC AGC 不支持 max_attenuation 参数，调用被忽略");
     }
 
+    /// WebRTC AGC 内部窗口不可配置
     pub fn set_window_seconds(&mut self, _seconds: f32) {
-        // WebRTC AGC 内部窗口不可调，留空
+        log::warn!("WebRTC AGC 不支持 window_seconds 参数，调用被忽略");
     }
 
+    /// WebRTC AGC 使用内部自适应时间常数，不可配置
     pub fn set_attack_release(&mut self, _attack_ms: f32, _release_ms: f32) {
-        // WebRTC AGC 内部自适应，留空
+        log::warn!("WebRTC AGC 不支持 attack/release 参数，调用被忽略");
     }
 
     fn apply_cfg(&mut self) {
@@ -118,7 +123,7 @@ impl AutoGainControl {
     }
 }
 
-fn sanitize_samples(tag: &str, samples: &mut [f32]) -> bool {
+fn sanitize_samples(_tag: &str, samples: &mut [f32]) -> bool {
     let mut found = false;
     for sample in samples.iter_mut() {
         if !sample.is_finite() {
@@ -127,7 +132,9 @@ fn sanitize_samples(tag: &str, samples: &mut [f32]) -> bool {
         }
     }
     if found {
-        warn!("{tag} 检测到非法音频数据 (NaN/Inf)，已重置该帧");
+        AGC_SANITIZE_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     found
 }
+
+static AGC_SANITIZE_COUNT: AtomicUsize = AtomicUsize::new(0);

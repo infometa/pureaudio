@@ -101,7 +101,8 @@ pub fn main() -> iced::Result {
 const SPEC_DISPLAY_WIDTH: u16 = 1000;
 const SPEC_DISPLAY_HEIGHT: u16 = 250;
 const OUTPUT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/output");
-const TIMBRE_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/timbre_restore.onnx");
+const TIMBRE_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/timbre_restore_stream_new.onnx");
+const TIMBRE_LAYERS: usize = 2;
 const CONFIG_VERSION: u32 = 1;
 const UI_FONT: Font = Font::with_name("Source Han Sans CN");
 const UI_FONT_BYTES: &[u8] = include_bytes!("../fonts/SourceHanSansCN-Regular.ttf");
@@ -120,6 +121,67 @@ fn default_auto_play_file() -> Option<PathBuf> {
         env!("CARGO_MANIFEST_DIR"),
         "/audio/kh.wav"
     )))
+}
+
+fn load_wav_mono_48k(path: &Path) -> Result<Arc<Vec<f32>>, String> {
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|e| format!("打开测试音频失败 {}: {}", path.display(), e))?;
+    let spec = reader.spec();
+    if spec.sample_rate != 48_000 {
+        return Err(format!(
+            "仅支持 48 kHz WAV 自动播放（当前 {} Hz），请先转换再测试",
+            spec.sample_rate
+        ));
+    }
+    if spec.channels == 0 {
+        return Err("WAV 声道数异常".into());
+    }
+    let ch = spec.channels as usize;
+    let mut raw: Vec<f32> = Vec::new();
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            for s in reader
+                .samples::<f32>()
+                .map(|v| v.map_err(|e| format!("读取样本失败: {e}")))
+            {
+                raw.push(s?);
+            }
+        }
+        hound::SampleFormat::Int => {
+            let bits = spec.bits_per_sample;
+            if bits <= 16 {
+                for s in reader
+                    .samples::<i16>()
+                    .map(|v| v.map_err(|e| format!("读取样本失败: {e}")))
+                {
+                    raw.push(s? as f32 / i16::MAX as f32);
+                }
+            } else if bits <= 32 {
+                let max = ((1i64 << (bits - 1)) - 1) as f32;
+                for s in reader
+                    .samples::<i32>()
+                    .map(|v| v.map_err(|e| format!("读取样本失败: {e}")))
+                {
+                    raw.push(s? as f32 / max);
+                }
+            } else {
+                return Err(format!(
+                    "暂不支持 {} bit 整型 WAV，请转换为 16/24/32-bit 或 float WAV",
+                    spec.bits_per_sample
+                ));
+            }
+        }
+    }
+    if ch > 1 {
+        let mut mono: Vec<f32> = Vec::with_capacity(raw.len() / ch);
+        for frame in raw.chunks_exact(ch) {
+            let sum: f32 = frame.iter().copied().sum();
+            mono.push(sum / ch as f32);
+        }
+        Ok(Arc::new(mono))
+    } else {
+        Ok(Arc::new(raw))
+    }
 }
 
 fn list_audio_devices() -> (Vec<String>, Vec<String>, Option<String>, Option<String>) {
@@ -211,6 +273,7 @@ struct SpecView {
     auto_play_enabled: bool,
     auto_play_file: Option<PathBuf>,
     auto_play_pid: Option<u32>,
+    auto_play_buffer: Option<Arc<Vec<f32>>>,
     highpass_enabled: bool,
     highpass_cutoff: f32,
     transient_enabled: bool,
@@ -456,7 +519,7 @@ pub struct UserConfig {
     agc_attack_ms: f32,
     agc_release_ms: f32,
     show_agc_advanced: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     aec_enabled: bool,
     #[serde(default)]
     aec_delay_ms: f32,
@@ -686,7 +749,7 @@ impl Application for SpecView {
                 headroom_gain: 0.9,
                 show_spectrum: true,
                 rt60_enabled: true,
-                final_limiter_enabled: false,
+                final_limiter_enabled: true,    // ✅ 默认开启最终限幅器
                 aec_aggressive: true,
                 post_trim_gain: 1.0,
                 noisy_img,
@@ -720,23 +783,25 @@ impl Application for SpecView {
                 eq_band_expanded,
                 eq_band_show_advanced,
                 mute_playback: false,
-                auto_play_enabled: false,
+                auto_play_enabled: true,            // ✅ 默认开启自动播放测试音频（双讲测试）
                 auto_play_file: default_auto_play_file(),
                 auto_play_pid: None,
-                highpass_enabled: true,
-                highpass_cutoff: 60.0,
-                transient_enabled: false,
+                auto_play_buffer: None,
+                // ========== 开箱即用配置（与后端保持一致）==========
+                highpass_enabled: true,         // ✅ 默认开启高通滤波器
+                highpass_cutoff: 80.0,          // ✅ 80Hz截止频率
+                transient_enabled: false,       // 瞬态整形器（可选）
                 transient_gain: 3.5,
                 transient_sustain: 0.0,
                 transient_mix: 100.0,
                 show_transient_advanced: false,
-                saturation_enabled: false,
+                saturation_enabled: false,      // 饱和度（可选）
                 saturation_drive: 1.2,
                 saturation_makeup: -0.5,
                 saturation_mix: 100.0,
                 show_saturation_advanced: false,
-                agc_enabled: true,
-                timbre_enabled: false,
+                agc_enabled: true,              // ✅ 默认开启AGC
+                timbre_enabled: false,          // 音色修复（可选）
                 agc_current_gain: 0.0,
                 agc_target_db: -16.0,
                 agc_max_gain_db: 12.0,
@@ -745,12 +810,12 @@ impl Application for SpecView {
                 agc_attack_ms: 500.0,
                 agc_release_ms: 2000.0,
                 show_agc_advanced: false,
-                aec_enabled: false,
+                aec_enabled: true,              // ✅ 默认开启AEC
                 aec_delay_ms: 60.0,
                 sys_auto_volume: false,
                 env_auto_enabled: false,
-                vad_enabled: false,
-                exciter_enabled: false,
+                vad_enabled: true,              // ✅ 默认开启VAD
+                exciter_enabled: false,         // 谐波激励器（可选）
                 exciter_mix: 0.0,
                 bypass_enabled: false,
                 user_selected_input: false,
@@ -1235,6 +1300,10 @@ impl Application for SpecView {
                     log::warn!("播放测试音频失败: {}", err);
                 }
                 self.auto_play_pid = None;
+                // 播放结束仅停播放，不结束降噪
+                self.auto_play_buffer = None;
+                self.send_control_message(ControlMessage::AutoPlayBuffer(None));
+                self.status_text = "测试音频播放结束".to_string();
                 if self.is_running {
                     return self.stop_processing();
                 }
@@ -1554,7 +1623,38 @@ impl SpecView {
         self.send_control_message(ControlMessage::EnvAutoEnabled(self.env_auto_enabled));
         self.send_control_message(ControlMessage::VadEnabled(self.vad_enabled));
         let mut cmds: Vec<Command<Message>> = Vec::new();
+        let mut auto_play_handled = false;
         if self.auto_play_enabled {
+            if let Some(path) = self.auto_play_file.clone() {
+                if path.exists() {
+                    match load_wav_mono_48k(&path) {
+                        Ok(buf) => {
+                            self.auto_play_buffer = Some(buf.clone());
+                            self.send_control_message(ControlMessage::AutoPlayBuffer(Some(buf)));
+                            let name = path
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| path.display().to_string());
+                            self.status_text =
+                                format!("自动播放测试音频（内部链路）: {}", name);
+                            auto_play_handled = true;
+                        }
+                        Err(err) => {
+                            log::warn!("内置自动播放失败，回退系统播放: {}", err);
+                        }
+                    }
+                } else {
+                    log::warn!("自动播放文件不存在: {}", path.display());
+                }
+            } else {
+                log::warn!("已启用自动播放测试音频，但未选择文件");
+            }
+        }
+        if !auto_play_handled {
+            self.auto_play_buffer = None;
+            self.send_control_message(ControlMessage::AutoPlayBuffer(None));
+        }
+        if self.auto_play_enabled && !auto_play_handled {
             if let Some(path) = self.auto_play_file.clone() {
                 if path.exists() {
                     match StdCommand::new("afplay").arg(&path).spawn() {
@@ -1579,8 +1679,6 @@ impl SpecView {
                 } else {
                     log::warn!("自动播放文件不存在: {}", path.display());
                 }
-            } else {
-                log::warn!("已启用自动播放测试音频，但未选择文件");
             }
         }
         Command::batch(cmds)
@@ -1590,6 +1688,7 @@ impl SpecView {
         if !self.is_running {
             return Command::none();
         }
+        self.send_control_message(ControlMessage::AutoPlayBuffer(None));
         if let Some(pid) = self.auto_play_pid.take() {
             kill_pid(pid);
         }
@@ -2101,6 +2200,7 @@ impl SpecView {
         self.auto_play_enabled = cfg.auto_play_enabled;
         self.auto_play_file = cfg.auto_play_file.or_else(default_auto_play_file);
         self.auto_play_pid = None;
+        self.auto_play_buffer = None;
         self.highpass_enabled = cfg.highpass_enabled;
         self.highpass_cutoff = cfg.highpass_cutoff;
         self.saturation_enabled = cfg.saturation_enabled;

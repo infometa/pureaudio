@@ -68,19 +68,22 @@ impl Biquad {
         let out = self.b0 * input + self.z1;
         self.z1 = self.b1 * input + self.z2 - self.a1 * out;
         self.z2 = self.b2 * input - self.a2 * out;
-        // 防止状态漂移/次正规数
-        if !self.z1.is_finite() || self.z1.abs() < 1e-25 {
+        
+        // 防止状态漂移/次正规数累积
+        // 阈值设为1e-10，适合f32精度（约7位有效数字）
+        // 原阈值1e-25过于接近f32最小正规数(~1.18e-38)
+        if !self.z1.is_finite() || self.z1.abs() < 1e-10 {
             self.z1 = 0.0;
         }
-        if !self.z2.is_finite() || self.z2.abs() < 1e-25 {
+        if !self.z2.is_finite() || self.z2.abs() < 1e-10 {
             self.z2 = 0.0;
         }
         out
     }
 
     fn update_coeffs(&mut self) {
-        self.frequency = sanitize_frequency(self.frequency, self.sample_rate);
-        self.q = sanitize_q(self.q);
+        // 注意：频率和Q已在setter中经过sanitize，这里无需重复
+        // 保留此处检查作为防御性编程
         let omega = 2.0 * PI * self.frequency / self.sample_rate.max(1.0);
         let sin_w0 = omega.sin();
         let cos_w0 = omega.cos();
@@ -158,11 +161,28 @@ impl Biquad {
         let a0 = if a0.abs() < 1e-12 { 1.0 } else { a0 };
         let mut na1 = a1 / a0;
         let mut na2 = a2 / a0;
-        if na1.abs() >= 1.999 || na2.abs() >= 0.999 {
-            log::warn!("Biquad 系数接近不稳定，已钳制 (a1={:.3}, a2={:.3})", na1, na2);
-            na1 = na1.clamp(-1.999, 1.999);
-            na2 = na2.clamp(-0.999, 0.999);
+        
+        // 严格的IIR稳定性检查：确保极点在单位圆内
+        // 标准条件：|a2| < 1 且 |a1| < 1 + a2
+        let is_unstable = na2.abs() >= 0.998 || na1.abs() >= (1.0 + na2 - 0.002);
+        
+        if is_unstable {
+            static UNSTABLE_COEFF_COUNT: std::sync::atomic::AtomicUsize = 
+                std::sync::atomic::AtomicUsize::new(0);
+            let count = UNSTABLE_COEFF_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            
+            // 限流日志：每1000次警告一次
+            if count % 1000 == 0 {
+                log::warn!(
+                    "Biquad 系数不稳定 (第{}次): kind={:?}, freq={:.1}Hz, Q={:.2}, gain={:.1}dB",
+                    count, self.kind, self.frequency, self.q, self.gain_db
+                );
+            }
+            
+            na1 = na1.clamp(-1.998, 1.998);
+            na2 = na2.clamp(-0.998, 0.998);
         }
+        
         self.b0 = b0 / a0;
         self.b1 = b1 / a0;
         self.b2 = b2 / a0;

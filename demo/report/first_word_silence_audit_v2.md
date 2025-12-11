@@ -477,3 +477,5 @@ if Instant::now() < startup_guard_until {
 **报告版本**: 2.0 (VAD关闭情况)
 
 
+
+

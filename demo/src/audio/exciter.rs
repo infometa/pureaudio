@@ -38,6 +38,12 @@ impl HarmonicExciter {
         if samples.is_empty() || self.mix <= 0.0 {
             return;
         }
+        // 输入验证：防止NaN/Inf传播
+        if sanitize_samples(samples) {
+            log::warn!("HarmonicExciter: 检测到非有限值输入，已清零");
+            return;
+        }
+        
         let wet = self.mix;
         let drive = self.drive;
         let alpha = self.alpha;
@@ -47,11 +53,23 @@ impl HarmonicExciter {
             let hp = alpha * (self.prev_hp + *sample - self.prev_in);
             self.prev_in = *sample;
             self.prev_hp = hp;
+            
+            // 状态防护：防止次正规数累积
+            if !self.prev_hp.is_finite() || self.prev_hp.abs() < 1e-10 {
+                self.prev_hp = 0.0;
+            }
+            
             // Gentle saturation on high band only
             let excited = (hp * drive).tanh() / drive;
             // Mix: 只叠加高频激励，避免重复增强低频
             *sample = *sample + excited * wet;
         }
+    }
+
+    /// 重置内部状态，用于音频流切换或停止时
+    pub fn reset(&mut self) {
+        self.prev_in = 0.0;
+        self.prev_hp = 0.0;
     }
 
     fn update_coeff(&mut self) {
@@ -60,4 +78,16 @@ impl HarmonicExciter {
         let dt = 1.0 / self.sample_rate.max(1.0);
         self.alpha = rc / (rc + dt);
     }
+}
+
+/// 清理非有限值（NaN, Inf），返回是否发现问题
+fn sanitize_samples(samples: &mut [f32]) -> bool {
+    let mut found = false;
+    for sample in samples.iter_mut() {
+        if !sample.is_finite() {
+            *sample = 0.0;
+            found = true;
+        }
+    }
+    found
 }
