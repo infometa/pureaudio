@@ -1278,12 +1278,18 @@ fn get_worker_fn(
         let mut clip_counter = 0usize;
         let mut low_peak_counter = 0usize;
         // 仅记录一次的链路日志，避免刷屏
-        let mut pipeline_logged = false;
-        let mut last_render_time = Instant::now(); // AEC Hangover timer
-        let mut near_energy_db = -80.0f32; // 保存近端能量，用于智能双讲检测
-        
-        // [FIX] 延迟估计专用：保存 AEC 处理前的原始 capture 信号
-        let mut raw_capture_buf = [0.0f32; 2048];
+	        let mut pipeline_logged = false;
+	        let mut last_render_time = Instant::now(); // AEC Hangover timer
+	        let mut near_energy_db = -80.0f32; // 保存近端能量，用于智能双讲检测
+	        // 远端能量跟踪（用于首秒加速与 VAD/双讲安全门控）
+	        let mut last_far_db_play = -200.0f32; // 实际播放电平（不含参考增益）
+	        let mut last_far_db_ref = -200.0f32;  // AEC 参考电平（含 render_ref_gain）
+	        let mut last_far_active_play = false;
+	        let mut prev_far_active_play = false;
+	        let mut far_startup_frames: u16 = 0; // 远端从静默→活跃后的快速收敛窗口（帧）
+	        
+	        // [FIX] 延迟估计专用：保存 AEC 处理前的原始 capture 信号
+	        let mut raw_capture_buf = [0.0f32; 2048];
         
         // [CRITICAL FIX] AEC 参考信号缓冲：必须在 capture 处理前准备好
         // 其中 render_play_buf 用于实际播放（保持用户听感），render_ref_buf 用于 AEC 参考（可自适应增益）
@@ -1576,31 +1582,53 @@ fn get_worker_fn(
                 // [FIX] 保存 AEC 处理前的原始 capture 信号（用于延迟估计）
                 // 必须在 AEC.process_capture() 之前保存，否则回声被消除后互相关消失
                 let copy_len = buffer.len().min(raw_capture_buf.len());
-                raw_capture_buf[..copy_len].copy_from_slice(&buffer[..copy_len]);
-                
-                // ⚠️ 关键：现在调用 capture 处理（render 信号已经提前送入）
-	                if aec_enabled {
-	                    // 计算远端能量（用于双讲检测）
-	                    let far_db = calculate_rms_db(&render_ref_buf[..copy_len]);
-	                    volume_monitor.update_output(far_db);
-	                    let far_active = far_db > -55.0;
+	                raw_capture_buf[..copy_len].copy_from_slice(&buffer[..copy_len]);
+	                
+	                // 远端能量：分为实际播放电平(play)与 AEC 参考电平(ref)
+	                // - play 用于判断远端是否“真实活跃”（避免参考增益未对齐导致 far_active=false）
+	                // - ref 用于与近端对比/双讲判定（已通过 render_ref_gain 对齐到回声幅度）
+	                let far_db_play = calculate_rms_db(&render_play_buf[..copy_len]);
+	                let far_db_ref = calculate_rms_db(&render_ref_buf[..copy_len]);
+	                const FAR_ACTIVE_PLAY_DB: f32 = -60.0;
+	                let far_active_play = far_db_play > FAR_ACTIVE_PLAY_DB;
+	                last_far_db_play = far_db_play;
+	                last_far_db_ref = far_db_ref;
+	                last_far_active_play = far_active_play;
+	                
+	                // 远端从静默→活跃的上升沿：开启 600ms 快速收敛窗口
+	                if far_active_play && !prev_far_active_play {
+	                    far_startup_frames = 60;
+	                } else if !far_active_play {
+	                    far_startup_frames = 0;
+	                }
+	                prev_far_active_play = far_active_play;
+	                
+	                // ⚠️ 关键：现在调用 capture 处理（render 信号已经提前送入）
+		                if aec_enabled {
+		                    // 实际播放电平用于音量监控与 far_active 判断
+		                    volume_monitor.update_output(far_db_play);
+		                    let far_active = far_active_play;
 
-	                    // 根据混响自适应 holdoff（RT60 越长，尾音越长）
-	                    let rt60_factor =
-	                        ((smoothed_rt60 - 0.2) / 0.6).clamp(0.0, 1.0);
+		                    // 根据混响自适应 holdoff（RT60 越长，尾音越长）
+		                    let rt60_factor =
+		                        ((smoothed_rt60 - 0.2) / 0.6).clamp(0.0, 1.0);
 	                    dt_holdoff_max =
 	                        (20.0 + rt60_factor * 20.0).round() as u16; // 200ms → 400ms
 
-	                    // 智能双讲检测
-	                    let raw_double_talk = is_true_double_talk(
-	                        vad_state,
-	                        render_active,
-	                        near_energy_db,
-	                        far_db,
-	                    );
-	                    
-	                    // 滞后保护机制（修复版）：
-                    // - 只有 VAD 检测到语音时才启动/维持滞后保护
+		                    // 智能双讲检测
+		                    let raw_double_talk = if far_active_play {
+		                        is_true_double_talk(
+		                            vad_state,
+		                            render_active,
+		                            near_energy_db,
+		                            far_db_ref,
+		                        )
+		                    } else {
+		                        false
+		                    };
+		                    
+		                    // 滞后保护机制（修复版）：
+	                    // - 只有 VAD 检测到语音时才启动/维持滞后保护
                     // - 如果 VAD 没有检测到语音，快速退出保护
                     // - 避免在没有真实语音时过度保护导致回声无法消除
 	                    let is_double_talk = if raw_double_talk {
@@ -1619,19 +1647,19 @@ fn get_worker_fn(
 	                    
 	                    aec.set_double_talk(is_double_talk);
                     
-                    // 诊断日志（强制 WARN 级别确保可见）
-	                    if spec_push_counter % 100 == 0 {
-	                        let energy_diff = near_energy_db - far_db;
-	                        log::warn!(
-	                            "🎙️ AEC诊断 | DT:{} VAD:{} Near={:.1}dB Far={:.1}dB Δ={:+.1}dB RefGain={:.2} | {}",
-	                            is_double_talk,
-	                            vad_state,
-	                            near_energy_db,
-	                            far_db,
-	                            energy_diff,
-	                            render_ref_gain,
-	                            aec.get_diagnostics()
-	                        );
+		                    // 诊断日志（强制 WARN 级别确保可见）
+		                    if spec_push_counter % 100 == 0 {
+		                        let energy_diff = near_energy_db - far_db_ref;
+		                        log::warn!(
+		                            "🎙️ AEC诊断 | DT:{} VAD:{} Near={:.1}dB Far={:.1}dB Δ={:+.1}dB RefGain={:.2} | {}",
+		                            is_double_talk,
+		                            vad_state,
+		                            near_energy_db,
+		                            far_db_ref,
+		                            energy_diff,
+		                            render_ref_gain,
+		                            aec.get_diagnostics()
+		                        );
 	                    }
                     
                     // 执行 AEC capture 处理（消除回声）
@@ -1644,34 +1672,40 @@ fn get_worker_fn(
                     
 	                    aec.process_capture(buffer);
 	                    // 残余回声二次抑制（只在单讲远端活跃时工作）
-	                    residual_echo.process(
-	                        buffer,
-	                        &render_ref_buf[..copy_len],
-	                        far_active,
-	                        is_double_talk,
-	                    );
+		                    residual_echo.process(
+		                        buffer,
+		                        &render_ref_buf[..copy_len],
+		                        far_active,
+		                        is_double_talk,
+		                    );
 
-	                    // 参考增益自适应：在远端单讲（无近端语音）时对齐 render/capture 能量
-	                    if far_active && !vad_state {
-	                        let err_db = (near_energy_db - far_db).clamp(-18.0, 18.0);
-	                        // 每 100ms 调一次；误差越大收敛越快，确保会议场景首秒对齐
-	                        if spec_push_counter % 10 == 0 {
-	                            let abs_err = err_db.abs();
-	                            let step = if abs_err > 12.0 {
-	                                0.18
-	                            } else if abs_err > 6.0 {
-	                                0.10
-	                            } else {
-	                                0.05
-	                            };
-	                            let adjust_db = err_db * step;
-	                            let adjust = 10.0f32.powf(adjust_db / 20.0);
-	                            render_ref_gain = (render_ref_gain * adjust).clamp(0.3, 4.0);
-	                        }
-	                    }
-                    
-                    if spec_push_counter % 100 == 0 {
-                        let after_rms = calculate_rms_db(buffer);
+		                    // 参考增益自适应：在远端单讲（无近端语音）时对齐 render/capture 能量
+		                    if far_active_play && !vad_state {
+		                        let err_db = (near_energy_db - far_db_ref).clamp(-18.0, 18.0);
+		                        // 远端刚起音的 600ms 内加速对齐（50ms 一次），其余保持 100ms
+		                        let interval = if far_startup_frames > 0 { 5 } else { 10 };
+		                        if spec_push_counter % interval == 0 {
+		                            let abs_err = err_db.abs();
+		                            let step = if abs_err > 12.0 {
+		                                0.22
+		                            } else if abs_err > 6.0 {
+		                                0.12
+		                            } else {
+		                                0.06
+		                            };
+		                            let adjust_db = err_db * step;
+		                            let adjust = 10.0f32.powf(adjust_db / 20.0);
+		                            render_ref_gain = (render_ref_gain * adjust).clamp(0.3, 4.0);
+		                        }
+		                    }
+		                    
+		                    // 快速收敛窗口倒计时（仅在远端活跃时递减）
+		                    if far_startup_frames > 0 && far_active_play {
+		                        far_startup_frames = far_startup_frames.saturating_sub(1);
+		                    }
+	                    
+	                    if spec_push_counter % 100 == 0 {
+	                        let after_rms = calculate_rms_db(buffer);
                         let suppression = before_rms - after_rms;
                         log::warn!(
                             "🔧 AEC处理 | Before={:.1}dB After={:.1}dB 抑制={:.1}dB | BufLen={}",
@@ -1921,20 +1955,29 @@ fn get_worker_fn(
                     is_voice = true;
                 }
                 // 启动保护期：快速响应真实语音，但不会误判单播放
-                if guard_active {
-                    if is_voice {
-                        vad_state = true;
-                        vad_voice_count = 3;
-                        vad_noise_count = 0;
-                    } else {
-                        // ⚠️ 修复：提高阈值，避免把回声误判为语音
-                        // 近端能量必须 >-30dB 且 能量差>10dB 才认为是真实语音
-                        if energy_gap > 10.0 && rms_db > -30.0 {
-                            vad_state = true;
-                            vad_voice_count = 1;
-                        }
-                    }
-                } else {
+	                if guard_active {
+	                    if is_voice {
+	                        vad_state = true;
+	                        vad_voice_count = 3;
+	                        vad_noise_count = 0;
+	                    } else {
+	                        // 启动期兜底：只有在“明显是近端说话”时才快速置真。
+	                        // 当远端正在播放时，echo 残留也可能很强，因此必须额外要求
+	                        // 近端显著强于远端参考，避免误把回声当语音 → 触发双讲保护。
+	                        if !last_far_active_play {
+	                            if energy_gap > 10.0 && rms_db > -30.0 {
+	                                vad_state = true;
+	                                vad_voice_count = 1;
+	                            }
+	                        } else {
+	                            let near_over_far = rms_db - last_far_db_ref;
+	                            if energy_gap > 12.0 && rms_db > -25.0 && near_over_far > 6.0 {
+	                                vad_state = true;
+	                                vad_voice_count = 1;
+	                            }
+	                        }
+	                    }
+	                } else {
                     // 滞后：累积计数防抖，语音判定更快，噪声判定更慢
                     if is_voice {
                         vad_voice_count = vad_voice_count.saturating_add(1).min(50);
