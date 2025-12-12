@@ -13,9 +13,10 @@ use std::sync::{
 use std::thread::{self, sleep, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::audio::adaptive::{DeviceDetector, VolumeMonitor, DelayEstimator, NoiseAnalyzer};
+use crate::audio::adaptive::{DeviceDetector, DeviceType, VolumeMonitor, DelayEstimator, NoiseAnalyzer};
 use crate::audio::agc::AutoGainControl;
 use crate::audio::aec::EchoCanceller;
+use crate::audio::residual_echo::ResidualEchoSuppressor;
 use crate::audio::eq::{DynamicEq, EqControl, EqPresetKind, EqProcessMetrics, MAX_EQ_BANDS};
 use crate::audio::exciter::HarmonicExciter;
 use crate::audio::highpass::HighpassFilter;
@@ -107,40 +108,40 @@ fn is_true_double_talk(
     if !render_active {
         return false;
     }
-    
-    // === 核心检测逻辑 ===
-    
-    // 1. VAD + 能量联合判断（主要特征）
-    // VAD 检测到语音时，需要额外检查能量是否合理
-    // 防止 VAD 误检回声的情况
+
+    // 远端能量过低时，不进入双讲保护（避免 hangover / 静音误保护）
+    const FAR_ACTIVE_DB: f32 = -55.0;
+    if far_db < FAR_ACTIVE_DB {
+        return false;
+    }
+
+    // === 核心检测逻辑（远端单讲优先消回声）===
+    // 关键原则：在“远端播放、近端静默”时，绝不因 VAD 误判而降抑制。
+    // 因此：VAD 为真时也必须满足“近端不明显弱于远端”才算双讲。
     if vad_state {
         let energy_diff = near_db - far_db;
-        
-        // VAD 检测到语音 + 两个条件之一：
-        // a) 近端能量合理（> -35dB）且 比远端强（diff > 0）
-        // b) 近端能量较高（> -25dB），即使比远端弱也保护
-        if (near_db > -35.0 && energy_diff > 0.0) || near_db > -25.0 {
-            return true;  // 保护近端语音
+
+        // 近端比远端弱很多（<-6dB）时，大概率是回声 → 不触发双讲保护
+        if energy_diff < -6.0 {
+            return false;
+        }
+
+        // 近端接近/略强于远端（>-3dB）且能量不太低 → 认为是真双讲
+        if energy_diff > -3.0 && near_db > -40.0 {
+            return true;
+        }
+
+        // 近端极强（贴麦大声）也保护
+        if near_db > -15.0 {
+            return true;
         }
     }
-    
-    // 2. 能量对比检测（VAD 可能漏检的情况）
-    // 如果近端明显比远端强，可能是真实语音
-    let energy_diff = near_db - far_db;
-    
-    // 放宽到 3dB，更积极地保护近端
-    // 原理：回声的能量通常不会超过远端，真实语音则可能更强
-    if near_db > -30.0 && energy_diff > 3.0 {
+
+    // 绝对能量兜底（非常大声说话）
+    if near_db > -10.0 {
         return true;
     }
-    
-    // 3. 绝对能量检测（大声说话的情况）
-    // 如果近端能量非常高，即使 VAD 没检测到也保护
-    if near_db > -15.0 {
-        return true;
-    }
-    
-    // 其他情况：认为是回声，使用强力抑制
+
     false
 }
 
@@ -965,18 +966,23 @@ fn get_worker_fn(
             + resample_latency_ms
             + df_proc_delay_ms;
             
-        // 默认总延迟 = 基础延迟 + 默认裕量(80ms) -> 约110ms，适合未识别的USB设备
-        let mut final_aec_delay = base_delay + 80.0;
-        
-        // [FIX] 默认 AGC 增益设为 3dB，优先防止啸叫（用户必须先降低扬声器音量）
-        let mut agc_max_gain = 3.0;
-        let mut hp_freq = 80.0;
-        
-        // 尝试根据设备名称优化配置
-        if let (Some(in_name), Some(out_name)) = (&input_device_name, &output_device_name) {
-             let in_type = DeviceDetector::detect_device_type(in_name);
-             let out_type = DeviceDetector::detect_device_type(out_name);
-             let config = DeviceDetector::recommend_config(in_type, out_type, true);
+	        // 默认总延迟 = 基础延迟 + 默认裕量(80ms) -> 约110ms，适合未识别的USB设备
+	        let mut final_aec_delay = base_delay + 80.0;
+	        
+	        // [FIX] 默认 AGC 增益设为 3dB，优先防止啸叫（用户必须先降低扬声器音量）
+	        let mut agc_max_gain = 3.0;
+	        let mut hp_freq = 80.0;
+	        // 设备推荐：是否允许软件 AEC、以及内部参考播放的安全增益
+	        let mut recommended_enable_aec = true;
+	        let mut far_end_gain = 1.0f32;
+	        // 本地近端监听（Mic -> Speaker）默认开启，但在内置扬声器等高风险设备上自动关闭
+	        let mut local_monitor_enabled = true;
+	        
+	        // 尝试根据设备名称优化配置
+	        if let (Some(in_name), Some(out_name)) = (&input_device_name, &output_device_name) {
+	             let in_type = DeviceDetector::detect_device_type(in_name);
+	             let out_type = DeviceDetector::detect_device_type(out_name);
+	             let config = DeviceDetector::recommend_config(in_type, out_type, true);
              
              log::info!("🔍 设备自适应配置: {} + {}", in_name, out_name);
              log::info!("   -> 推荐延迟: {}ms, AGC增益: {}dB, HP: {}Hz", 
@@ -984,12 +990,29 @@ fn get_worker_fn(
              log::info!("   -> 原因: {}", config.reason);
              
              // [FIX] 逻辑修正：推荐值即为总延迟目标值
-             if config.aec_delay_ms > 0 {
-                 final_aec_delay = config.aec_delay_ms as f32;
-             }
-             agc_max_gain = config.agc_max_gain_db;
-             hp_freq = config.highpass_freq;
-        }
+	             if config.aec_delay_ms > 0 {
+	                 final_aec_delay = config.aec_delay_ms as f32;
+	             }
+	             agc_max_gain = config.agc_max_gain_db;
+	             hp_freq = config.highpass_freq;
+	             recommended_enable_aec = config.enable_aec;
+	             far_end_gain = config.output_volume.clamp(0.05, 1.0);
+	             if !recommended_enable_aec {
+	                 log::warn!("🔒 设备策略：检测到可能带硬件AEC的设备，默认禁用软件 AEC");
+	             }
+
+	             // 内置扬声器 + 内置麦克风极易形成声学回授，会议场景默认关闭本地监听
+	             let out_lower = out_name.to_lowercase();
+	             let is_builtin_out = out_lower.contains("built-in")
+	                 || out_lower.contains("internal")
+	                 || out_lower.contains("内置")
+	                 || out_lower.contains("macbook")
+	                 || out_lower.contains("imac");
+	             if is_builtin_out && in_type == DeviceType::BuiltinMicrophone {
+	                 local_monitor_enabled = false;
+	                 log::warn!("🔇 检测到内置扬声器输出，已默认关闭本地近端监听以防啸叫（远端播放仍正常输出）");
+	             }
+	        }
 
         let auto_aec_delay = final_aec_delay.round().clamp(0.0, 500.0);
         
@@ -1006,10 +1029,12 @@ fn get_worker_fn(
         let mut agc = AutoGainControl::new(df.sr as f32, df.hop_size);
         agc.set_max_gain(agc_max_gain); // ✅ 立即应用正确增益
         
-        let mut aec = EchoCanceller::new(df.sr as f32, df.hop_size, init_aec_delay_ms); // ✅ 立即应用正确延迟
-        let mut aec_delay_ms = init_aec_delay_ms; // 同步变量
+	        let mut aec = EchoCanceller::new(df.sr as f32, df.hop_size, init_aec_delay_ms); // ✅ 立即应用正确延迟
+	        let mut aec_delay_ms = init_aec_delay_ms; // 同步变量
+	        // Residual Echo Suppressor：AEC 后二次抑制
+	        let mut residual_echo = ResidualEchoSuppressor::new(df.sr as f32, df.hop_size);
 
-        highpass.set_cutoff(hp_freq); // ✅ 立即应用正确高通
+	        highpass.set_cutoff(hp_freq); // ✅ 立即应用正确高通
 
         // ========== 自适应模块初始化 ==========
         let mut volume_monitor = VolumeMonitor::new(500); // 5秒历史
@@ -1084,18 +1109,19 @@ fn get_worker_fn(
         let mut vad_voice_count = 0usize;   // 需要检测到真实语音才激活
         let mut vad_noise_count = 0usize;
         
-        // 双讲滞后保护：检测到语音后继续保护一段时间，避免尾音被吞
-        let mut dt_holdoff_frames = 0u16;  // 滞后保护帧数
-        const DT_HOLDOFF_MAX: u16 = 20;    // 最大滞后保护帧数（约200ms）
+	        // 双讲滞后保护：根据 RT60 自适应调整保护时长
+	        let mut dt_holdoff_frames: u16 = 0;
+	        let mut dt_holdoff_max: u16 = 20; // 基准 200ms，运行中随混响调整
         // 噪声门控已禁用（交给 WebRTC AGC/DF 处理），固定全通
         let mut _gate_gain = 1.0f32;
         // 噪声地板 & SNR 跟踪
         let mut noise_floor_db = -60.0f32;
         let mut snr_db = 10.0f32;
-        let mut auto_play_buffer: Option<Arc<Vec<f32>>> = None;
-        let mut auto_play_pos: usize = 0;
-        let mut aec_user_enabled = true;  // ✅ AEC默认启用（有远端信号时自动工作）
-        // aec_current_aggressive removed (unused)
+	        let mut auto_play_buffer: Option<Arc<Vec<f32>>> = None;
+	        let mut auto_play_pos: usize = 0;
+	        let aec_allowed = recommended_enable_aec;
+	        let mut aec_user_enabled = aec_allowed;  // 设备策略决定默认是否启用 AEC
+	        // aec_current_aggressive removed (unused)
         let mut target_atten;
         let mut target_min_thresh;
         let mut target_max_thresh;
@@ -1260,7 +1286,10 @@ fn get_worker_fn(
         let mut raw_capture_buf = [0.0f32; 2048];
         
         // [CRITICAL FIX] AEC 参考信号缓冲：必须在 capture 处理前准备好
-        let mut aec_ref_buf = [0.0f32; 2048];
+        // 其中 render_play_buf 用于实际播放（保持用户听感），render_ref_buf 用于 AEC 参考（可自适应增益）
+        let mut render_play_buf = [0.0f32; 2048];
+        let mut render_ref_buf = [0.0f32; 2048];
+        let mut render_ref_gain = 1.0f32; // 参考增益自适应（不影响实际播放）
         let mut render_active = false;
         
         'processing: while !should_stop.load(Ordering::Relaxed) {
@@ -1419,44 +1448,62 @@ fn get_worker_fn(
             // 原因：inframe 固定是 480 样本，AEC capture 会处理 480 样本
             // 如果 render 用 n_in（如 441），会导致长度不匹配，AEC 完全失效
             
-            // 清空上一帧的参考信号
-            aec_ref_buf.fill(0.0);
-            render_active = false;
-            
-            if !mute_playback {
-                if let Some(ref pcm) = auto_play_buffer {
-                    let plen = pcm.len();
-                    if plen > 0 && auto_play_pos < plen {
-                        let remain = plen - auto_play_pos;
-                        // ✅ 修复：必须使用 df.hop_size，确保与 capture 长度一致
-                        let copy_len = remain.min(df.hop_size).min(aec_ref_buf.len());
-                        
-                        // 填充 AEC 参考信号（使用原始远端信号，不衰减）
-                        // 注意：衰减会降低 AEC 的匹配精度
-                        for i in 0..copy_len {
-                            aec_ref_buf[i] = pcm[auto_play_pos + i];
-                        }
-                        
-                        render_active = true;
-                        last_render_time = Instant::now();
-                    }
-                } else {
-                    // Hangover: 播放停止后保持 300ms
-                    if last_render_time.elapsed().as_micros() < AEC_HANGOVER_DURATION_US {
-                        render_active = true;
-                    }
-                }
-            }
-            
-            // 自动启用/禁用 AEC
-            let target_aec = aec_user_enabled && render_active;
+	            render_active = false;
+	            let mut has_new_render = false;
+	            
+	            if !mute_playback {
+	                if let Some(ref pcm) = auto_play_buffer {
+	                    let plen = pcm.len();
+	                    if plen > 0 && auto_play_pos < plen {
+	                        let remain = plen - auto_play_pos;
+	                        let copy_len = remain.min(df.hop_size).min(render_ref_buf.len());
+	                        for i in 0..copy_len {
+	                            let v = pcm[auto_play_pos + i];
+	                            render_play_buf[i] = v * far_end_gain;
+	                            render_ref_buf[i] = v * far_end_gain * render_ref_gain;
+	                        }
+	                        if copy_len < df.hop_size {
+	                            render_play_buf[copy_len..df.hop_size].fill(0.0);
+	                            render_ref_buf[copy_len..df.hop_size].fill(0.0);
+	                        }
+	                        render_active = true;
+	                        has_new_render = true;
+	                        last_render_time = Instant::now();
+	                    }
+	                }
+	            }
+
+	            if !has_new_render {
+	                // Hangover：保留上一帧真实参考并指数衰减，帮助消除混响尾音
+	                if !mute_playback
+	                    && last_render_time.elapsed().as_micros() < AEC_HANGOVER_DURATION_US
+	                {
+	                    render_active = true;
+	                    let decay = 0.96f32;
+	                    for v in render_play_buf[..df.hop_size].iter_mut() {
+	                        *v *= decay;
+	                    }
+	                    for v in render_ref_buf[..df.hop_size].iter_mut() {
+	                        *v *= decay;
+	                    }
+	                } else {
+	                    render_play_buf[..df.hop_size].fill(0.0);
+	                    render_ref_buf[..df.hop_size].fill(0.0);
+	                }
+	            }
+	            
+	            // 自动启用/禁用 AEC
+	            let target_aec = aec_allowed && aec_user_enabled && render_active;
             
             // [DEBUG] 强制诊断日志（每秒一次）
             if spec_push_counter % 100 == 0 {
-                log::warn!(
-                    "🔍 AEC状态检查 | UserEnabled={} RenderActive={} → AEC={} | RefBuf[0]={:.6}",
-                    aec_user_enabled, render_active, target_aec, aec_ref_buf[0]
-                );
+	                log::warn!(
+	                    "🔍 AEC状态检查 | UserEnabled={} RenderActive={} → AEC={} | RefBuf[0]={:.6}",
+	                    aec_user_enabled,
+	                    render_active,
+	                    target_aec,
+	                    render_ref_buf[0]
+	                );
             }
             
             if target_aec != aec_enabled {
@@ -1467,9 +1514,17 @@ fn get_worker_fn(
             
             // ⚠️ 关键：先送入 render 参考信号（WebRTC 要求顺序：render → capture）
             // ✅ 修复：必须使用 df.hop_size（480），确保与 capture 长度完全一致
-            if aec_enabled {
-                aec.process_render(&aec_ref_buf[..df.hop_size]);
-            }
+	            if aec_enabled {
+	                // 让 render 参考尽量贴近真实输出（最终限幅后）
+	                let mut peak = 0.0f32;
+	                for v in render_ref_buf[..df.hop_size].iter() {
+	                    peak = peak.max(v.abs());
+	                }
+	                if peak > 0.98 {
+	                    apply_final_limiter(&mut render_ref_buf[..df.hop_size]);
+	                }
+	                aec.process_render(&render_ref_buf[..df.hop_size]);
+	            }
             
             // =================================================================================
             // 步骤2: 录音原始信号（设备采样率或重采样后），在任何处理前
@@ -1524,43 +1579,60 @@ fn get_worker_fn(
                 raw_capture_buf[..copy_len].copy_from_slice(&buffer[..copy_len]);
                 
                 // ⚠️ 关键：现在调用 capture 处理（render 信号已经提前送入）
-                if aec_enabled {
-                    // 计算远端能量（用于双讲检测）
-                    let far_db = calculate_rms_db(&aec_ref_buf[..copy_len]);
-                    volume_monitor.update_output(far_db);
-                    
-                    // 智能双讲检测
-                    let raw_double_talk = is_true_double_talk(
-                        vad_state,
-                        render_active,
-                        near_energy_db,
-                        far_db,
-                    );
-                    
-                    // 滞后保护机制：检测到双讲后继续保护一段时间
-                    // 避免语音尾音被截断，减少断断续续的吞音
-                    let is_double_talk = if raw_double_talk {
-                        // 检测到双讲，重置/刷新保护计数器
-                        dt_holdoff_frames = DT_HOLDOFF_MAX;
+	                if aec_enabled {
+	                    // 计算远端能量（用于双讲检测）
+	                    let far_db = calculate_rms_db(&render_ref_buf[..copy_len]);
+	                    volume_monitor.update_output(far_db);
+	                    let far_active = far_db > -55.0;
+
+	                    // 根据混响自适应 holdoff（RT60 越长，尾音越长）
+	                    let rt60_factor =
+	                        ((smoothed_rt60 - 0.2) / 0.6).clamp(0.0, 1.0);
+	                    dt_holdoff_max =
+	                        (20.0 + rt60_factor * 20.0).round() as u16; // 200ms → 400ms
+
+	                    // 智能双讲检测
+	                    let raw_double_talk = is_true_double_talk(
+	                        vad_state,
+	                        render_active,
+	                        near_energy_db,
+	                        far_db,
+	                    );
+	                    
+	                    // 滞后保护机制（修复版）：
+                    // - 只有 VAD 检测到语音时才启动/维持滞后保护
+                    // - 如果 VAD 没有检测到语音，快速退出保护
+                    // - 避免在没有真实语音时过度保护导致回声无法消除
+	                    let is_double_talk = if raw_double_talk {
+	                        // 检测到双讲，重置保护计数器
+	                        dt_holdoff_frames = dt_holdoff_max;
+	                        true
+	                    } else if dt_holdoff_frames > 0 && vad_state {
+                        // 滞后保护：VAD 仍检测到语音 → 继续保护
+                        dt_holdoff_frames = dt_holdoff_frames.saturating_sub(1);
                         true
-                    } else if dt_holdoff_frames > 0 {
-                        // 在滞后保护期内，继续保护
-                        dt_holdoff_frames -= 1;
-                        true  // 继续使用低抑制来保护可能的尾音
                     } else {
+                        // VAD 没检测到语音 → 快速退出保护，恢复强力抑制
+                        dt_holdoff_frames = 0;  // 立即清零
                         false
                     };
-                    
-                    aec.set_double_talk(is_double_talk);
+	                    
+	                    aec.set_double_talk(is_double_talk);
                     
                     // 诊断日志（强制 WARN 级别确保可见）
-                    if spec_push_counter % 100 == 0 {
-                        let energy_diff = near_energy_db - far_db;
-                        log::warn!(
-                            "🎙️ AEC诊断 | DT:{} VAD:{} Near={:.1}dB Far={:.1}dB Δ={:+.1}dB | {}",
-                            is_double_talk, vad_state, near_energy_db, far_db, energy_diff, aec.get_diagnostics()
-                        );
-                    }
+	                    if spec_push_counter % 100 == 0 {
+	                        let energy_diff = near_energy_db - far_db;
+	                        log::warn!(
+	                            "🎙️ AEC诊断 | DT:{} VAD:{} Near={:.1}dB Far={:.1}dB Δ={:+.1}dB RefGain={:.2} | {}",
+	                            is_double_talk,
+	                            vad_state,
+	                            near_energy_db,
+	                            far_db,
+	                            energy_diff,
+	                            render_ref_gain,
+	                            aec.get_diagnostics()
+	                        );
+	                    }
                     
                     // 执行 AEC capture 处理（消除回声）
                     // [DEBUG] 记录处理前后的能量变化
@@ -1570,7 +1642,33 @@ fn get_worker_fn(
                         0.0
                     };
                     
-                    aec.process_capture(buffer);
+	                    aec.process_capture(buffer);
+	                    // 残余回声二次抑制（只在单讲远端活跃时工作）
+	                    residual_echo.process(
+	                        buffer,
+	                        &render_ref_buf[..copy_len],
+	                        far_active,
+	                        is_double_talk,
+	                    );
+
+	                    // 参考增益自适应：在远端单讲（无近端语音）时对齐 render/capture 能量
+	                    if far_active && !vad_state {
+	                        let err_db = (near_energy_db - far_db).clamp(-18.0, 18.0);
+	                        // 每 100ms 调一次；误差越大收敛越快，确保会议场景首秒对齐
+	                        if spec_push_counter % 10 == 0 {
+	                            let abs_err = err_db.abs();
+	                            let step = if abs_err > 12.0 {
+	                                0.18
+	                            } else if abs_err > 6.0 {
+	                                0.10
+	                            } else {
+	                                0.05
+	                            };
+	                            let adjust_db = err_db * step;
+	                            let adjust = 10.0f32.powf(adjust_db / 20.0);
+	                            render_ref_gain = (render_ref_gain * adjust).clamp(0.3, 4.0);
+	                        }
+	                    }
                     
                     if spec_push_counter % 100 == 0 {
                         let after_rms = calculate_rms_db(buffer);
@@ -1589,7 +1687,7 @@ fn get_worker_fn(
                     // [DISABLED] 自动延迟估计已禁用
                     // 原因：我们使用 delay_agnostic=true，让 WebRTC AEC 内部自动处理延迟
                     // 频繁调用 set_delay_ms 会扰动 AEC 内部滤波器状态，导致效果不稳定
-                    // delay_estimator.add_samples(&raw_capture_buf[..copy_len], &aec_ref_buf[..copy_len]);
+	                    // delay_estimator.add_samples(&raw_capture_buf[..copy_len], &render_ref_buf[..copy_len]);
                     // if let Some(estimated_delay) = delay_estimator.estimate_delay() { ... }
                 }
             }
@@ -2355,9 +2453,16 @@ fn get_worker_fn(
                      rec.append_processed(buffer);
                 }
 
-                // =================================================================================
-                // 混合远端音频到输出（render线程）
-                // =================================================================================
+	                // =================================================================================
+	                // 混合远端音频到输出（render线程）
+	                // =================================================================================
+	                
+	                // 会议/外放场景：默认不把近端回放到本地扬声器，避免声学回授（啸叫）
+	                let far_playing_now =
+	                    !mute_playback && render_active && auto_play_buffer.is_some();
+	                if !local_monitor_enabled && !far_playing_now {
+	                    buffer.fill(0.0);
+	                }
                 
                 if !mute_playback && render_active {
                     if let Some(ref pcm) = auto_play_buffer {
@@ -2370,9 +2475,9 @@ fn get_worker_fn(
                             // [Safety] 强制静音近端麦克风信号，防止声学回授（啸叫）!
                             // 在单机测试时，如果 Speaker 播放了 Mic 的声音，会立刻形成 Mic->Speaker->Mic 的正反馈。
                             // 所以必须丢弃 buffer 中的 Mic 信号，只播放测试音频 (Far-end)。
-                            for (i, dst) in buffer.iter_mut().take(copy_len).enumerate() {
-                                *dst = aec_ref_buf[i];  // 直接覆盖 (Overwrite)，丢弃 Mic 监听
-                            }
+	                            for (i, dst) in buffer.iter_mut().take(copy_len).enumerate() {
+	                                *dst = render_play_buf[i]; // 实际播放信号
+	                            }
                             
                             auto_play_pos += copy_len;
                             if auto_play_pos >= plen {
@@ -2547,13 +2652,15 @@ fn get_worker_fn(
                             bypass_enabled = enabled;
                             log::info!("旁路: {}", if enabled { "开启" } else { "关闭" });
                         }
-                        ControlMessage::HighpassEnabled(enabled) => {
-                            highpass_enabled = enabled;
-                            if !enabled {
-                                highpass.reset();
-                            }
-                            log::info!("高通滤波: {}", if enabled { "开启" } else { "关闭" });
-                        }
+	                        ControlMessage::HighpassEnabled(enabled) => {
+	                            highpass_enabled = enabled;
+	                            if !enabled {
+	                                highpass.reset();
+	                            }
+	                            // 外部高通关闭时开启 WebRTC 内置高通，避免无高通
+	                            aec.set_internal_highpass(!enabled);
+	                            log::info!("高通滤波: {}", if enabled { "开启" } else { "关闭" });
+	                        }
                         ControlMessage::HighpassCutoff(freq) => {
                             manual_highpass = freq;
                             highpass_cutoff = freq;
@@ -2636,10 +2743,17 @@ fn get_worker_fn(
                             agc.set_attack_release(attack_ms, release_ms);
                             log::info!("AGC 攻击/释放: {:.0} / {:.0} ms", attack_ms, release_ms);
                         }
-                        ControlMessage::AecEnabled(enabled) => {
-                            aec_user_enabled = enabled;
-                            aec_enabled = enabled;
-                            aec.set_enabled(enabled);
+	                        ControlMessage::AecEnabled(enabled) => {
+	                            if enabled && !aec_allowed {
+	                                aec_user_enabled = false;
+	                                aec_enabled = false;
+	                                aec.set_enabled(false);
+	                                log::warn!("AEC3 被设备策略禁用（可能硬件AEC设备），忽略启用请求");
+	                                continue;
+	                            }
+	                            aec_user_enabled = enabled;
+	                            aec_enabled = enabled;
+	                            aec.set_enabled(enabled);
                             
                             // 自动联动：启用AEC时同时启用VAD，用于双讲检测
                             if enabled && !vad_enabled {
@@ -2805,13 +2919,14 @@ fn get_worker_fn(
                             mute_playback = muted;
                             log::info!("播放静音: {}", if mute_playback { "开启" } else { "关闭" });
                         }
-                        ControlMessage::HighpassEnabled(enabled) => {
-                            highpass_enabled = enabled;
-                            if !enabled {
-                                highpass.reset();
-                            }
-                            log::info!("高通滤波: {}", if enabled { "开启" } else { "关闭" });
-                        }
+	                        ControlMessage::HighpassEnabled(enabled) => {
+	                            highpass_enabled = enabled;
+	                            if !enabled {
+	                                highpass.reset();
+	                            }
+	                            aec.set_internal_highpass(!enabled);
+	                            log::info!("高通滤波: {}", if enabled { "开启" } else { "关闭" });
+	                        }
                         ControlMessage::HighpassCutoff(freq) => {
                             manual_highpass = freq;
                             highpass_cutoff = freq;
@@ -2893,9 +3008,15 @@ fn get_worker_fn(
                             agc.set_attack_release(attack_ms, release_ms);
                             log::info!("AGC 攻击/释放: {:.0} / {:.0} ms", attack_ms, release_ms);
                         }
-                        ControlMessage::AecEnabled(enabled) => {
-                            aec_enabled = enabled;
-                            aec.set_enabled(enabled);
+	                        ControlMessage::AecEnabled(enabled) => {
+	                            if enabled && !aec_allowed {
+	                                aec_enabled = false;
+	                                aec.set_enabled(false);
+	                                log::warn!("AEC3 被设备策略禁用（可能硬件AEC设备），忽略启用请求");
+	                                continue;
+	                            }
+	                            aec_enabled = enabled;
+	                            aec.set_enabled(enabled);
                             
                             // 自动联动：启用AEC时同时启用VAD，用于双讲检测
                             if enabled && !vad_enabled {

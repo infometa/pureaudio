@@ -6,5 +6,6 @@ pub mod exciter;
 pub mod highpass;
 pub mod saturation;
 pub mod silero;
+pub mod residual_echo;
 pub mod transient_shaper;
 pub mod timbre_restore;

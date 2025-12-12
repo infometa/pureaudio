@@ -12,12 +12,20 @@ pub struct EchoCanceller {
     enabled: bool,
     active: bool,
     delay_ms: i32,
+    delay_agnostic: bool,
+    internal_highpass: bool,
     aggressive_base: bool,
     double_talk: bool,
     dt_exit_frames: u16,
     // 优化1.3：自适应过渡时间
     dt_start_time: Option<Instant>,  // 双讲开始时间
     dt_duration_ms: u32,              // 双讲持续时间（毫秒）
+    // 配置节流：缓存上一次真正下发给 WebRTC 的参数
+    last_suppression: Option<EchoCancellationSuppressionLevel>,
+    last_delay_agnostic: bool,
+    last_internal_highpass: bool,
+    last_aggressive_base: bool,
+    last_delay_ms: i32,
 }
 
 impl EchoCanceller {
@@ -41,11 +49,18 @@ impl EchoCanceller {
                         enabled: frame_ok,
                         active: frame_ok,
                         delay_ms,
+                        delay_agnostic: true,
+                        internal_highpass: false, // 外部已有高通，默认关闭 WebRTC 内置高通避免双高通
                         aggressive_base: aggressive,
                         double_talk: false,
                         dt_exit_frames: 0,
                         dt_start_time: None,
                         dt_duration_ms: 0,
+                        last_suppression: None,
+                        last_delay_agnostic: true,
+                        last_internal_highpass: false,
+                        last_aggressive_base: aggressive,
+                        last_delay_ms: delay_ms.max(0),
                     };
                     aec.apply_config();
                     aec.processor
@@ -70,11 +85,18 @@ impl EchoCanceller {
             enabled: frame_ok,
             active,
             delay_ms,
+            delay_agnostic: true,
+            internal_highpass: false,
             aggressive_base: aggressive,
             double_talk: false,
             dt_exit_frames: 0,
             dt_start_time: None,
             dt_duration_ms: 0,
+            last_suppression: None,
+            last_delay_agnostic: true,
+            last_internal_highpass: false,
+            last_aggressive_base: aggressive,
+            last_delay_ms: delay_ms.max(0),
         }
     }
 
@@ -105,25 +127,53 @@ impl EchoCanceller {
             // 备用：中等抑制
             EchoCancellationSuppressionLevel::Moderate
         };
-        
-        // 每次配置变化时记录日志（限流：仅在状态变化时）
+        let delay_ms = self.delay_ms.max(0);
+
+        // === 配置节流 ===
+        // 只有在 suppression / delay 模式 / 高通开关 / aggressive / delay_ms 真正变化时才下发配置，
+        // 避免每帧 set_config 扰动 AEC3 内部滤波器并浪费 CPU。
+        if self.last_suppression == Some(suppression)
+            && self.last_delay_agnostic == self.delay_agnostic
+            && self.last_internal_highpass == self.internal_highpass
+            && self.last_aggressive_base == self.aggressive_base
+            && self.last_delay_ms == delay_ms
+        {
+            return;
+        }
+
+        // 配置变化时记录日志
         log::debug!(
-            "AEC配置: suppression={:?}, delay={}ms, double_talk={}, exit_frames={}, dt_duration={}ms",
-            suppression, self.delay_ms, self.double_talk, self.dt_exit_frames, self.dt_duration_ms
+            "AEC配置更新: suppression={:?}, delay={}ms, delay_agnostic={}, internal_hp={}, double_talk={}, exit_frames={}, dt_duration={}ms",
+            suppression,
+            delay_ms,
+            self.delay_agnostic,
+            self.internal_highpass,
+            self.double_talk,
+            self.dt_exit_frames,
+            self.dt_duration_ms
         );
-        
+
+        // 提供初始延迟提示能显著缩短 AEC3 初始收敛时间；
+        // delay_agnostic=true 时该值仅作为“初始对齐提示”，后续仍由 AEC3 自适应。
+        let delay_hint = if delay_ms > 0 { Some(delay_ms) } else { None };
         let ec = EchoCancellation {
             suppression_level: suppression,
-            stream_delay_ms: None,  // 不手动设置，完全依赖 delay_agnostic 自动估计
-            enable_delay_agnostic: true,  // 自适应延迟估计
+            stream_delay_ms: delay_hint,
+            enable_delay_agnostic: self.delay_agnostic,  // 自适应/固定延迟模式切换
             enable_extended_filter: true, // 启用扩展滤波，增强对复杂回声路径的处理
         };
         let cfg = Config { 
             echo_cancellation: Some(ec), 
-            enable_high_pass_filter: true,  // 启用内置高通
+            enable_high_pass_filter: self.internal_highpass,  // 避免双高通
             ..Config::default() 
         };
         proc.set_config(cfg);
+
+        self.last_suppression = Some(suppression);
+        self.last_delay_agnostic = self.delay_agnostic;
+        self.last_internal_highpass = self.internal_highpass;
+        self.last_aggressive_base = self.aggressive_base;
+        self.last_delay_ms = delay_ms;
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
@@ -136,11 +186,26 @@ impl EchoCanceller {
 
     pub fn set_delay_ms(&mut self, delay_ms: i32) {
         self.delay_ms = delay_ms.max(0);
-        self.apply_config();
+        // delay_agnostic 模式下 delay_ms 仅作为初始提示，不频繁重配
+        if !self.delay_agnostic {
+            self.apply_config();
+        }
     }
 
     pub fn set_aggressive(&mut self, aggressive: bool) {
         self.aggressive_base = aggressive;
+        self.apply_config();
+    }
+
+    /// 切换延迟模式：true=自适应延迟（默认），false=固定延迟
+    pub fn set_delay_agnostic(&mut self, enabled: bool) {
+        self.delay_agnostic = enabled;
+        self.apply_config();
+    }
+
+    /// 控制 WebRTC 内置高通开关（外部已高通时建议关闭）
+    pub fn set_internal_highpass(&mut self, enabled: bool) {
+        self.internal_highpass = enabled;
         self.apply_config();
     }
 
@@ -151,39 +216,30 @@ impl EchoCanceller {
     ///          false = 单讲或静音，使用High suppression消除回声
     pub fn set_double_talk(&mut self, active: bool) {
         let state_changed = self.double_talk != active;
-        
+        let mut config_dirty = false;
+
         if state_changed {
             log::debug!(
                 "AEC双讲状态切换: {} -> {}",
                 if self.double_talk { "双讲" } else { "单讲" },
                 if active { "双讲" } else { "单讲" }
             );
-            
+
             if active {
-                // 优化1.3：进入双讲，记录开始时间
+                // 进入双讲：记录开始时间并清空过渡计数
                 self.dt_start_time = Some(Instant::now());
+                self.dt_exit_frames = 0;
             } else if self.double_talk {
-                // 优化1.3：退出双讲，计算持续时间并自适应调整过渡期
+                // 退出双讲：计算持续时间并自适应设置过渡期帧数
                 if let Some(start) = self.dt_start_time {
                     self.dt_duration_ms = start.elapsed().as_millis() as u32;
-                    
-                    // 自适应过渡期策略（增强版，配合滞后保护使用）：
-                    // - 短暂打断（<200ms）：标准过渡 → 15帧(150ms)
-                    // - 正常对话（200-1000ms）：较长过渡 → 25帧(250ms)
-                    // - 长时间双讲（>1000ms）：最长过渡 → 35帧(350ms)
-                    // 
-                    // 原理：
-                    // 1. 短暂打断需要合理过渡，不要快速恢复
-                    // 2. 正常对话需要更长的平滑过渡
-                    // 3. 长对话后更谨慎，避免吞尾音
                     self.dt_exit_frames = if self.dt_duration_ms < 200 {
-                        15  // 标准过渡
+                        15
                     } else if self.dt_duration_ms < 1000 {
-                        25  // 较长过渡
+                        25
                     } else {
-                        35  // 最长过渡
+                        35
                     };
-                    
                     log::debug!(
                         "AEC双讲退出: 持续{}ms → 过渡期{}帧({}ms)",
                         self.dt_duration_ms,
@@ -191,25 +247,26 @@ impl EchoCanceller {
                         self.dt_exit_frames * 10
                     );
                 } else {
-                    // 没有记录开始时间，使用默认值
                     self.dt_exit_frames = 15;
                 }
                 self.dt_start_time = None;
             }
-            
+
             self.double_talk = active;
+            config_dirty = true;
         }
-        
-        // 过渡期倒计时
+
+        // 过渡期倒计时：只有在过渡真正结束那一刻才更新配置
         if !self.double_talk && self.dt_exit_frames > 0 {
+            let prev = self.dt_exit_frames;
             self.dt_exit_frames = self.dt_exit_frames.saturating_sub(1);
-            if self.dt_exit_frames == 0 {
+            if prev == 1 {
                 log::debug!("AEC过渡期结束，恢复强力抑制");
+                config_dirty = true;
             }
         }
-        
-        // 状态变化或过渡期结束时，更新配置
-        if state_changed || (self.dt_exit_frames == 0 && !self.double_talk) {
+
+        if config_dirty {
             self.apply_config();
         }
     }
